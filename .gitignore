@@ -1,0 +1,49 @@
+# Archives and transferred deliverables
+*.zip
+*.tar.gz
+
+# Local credentials and machine-specific configuration
+**/.env
+**/.env.*
+!**/.env.example
+ai_bot3/ai_bot3/config.yml
+ai_bot3/ai_bot3/config.yml.bak_*
+
+# Python / JavaScript build products
+**/__pycache__/
+**/*.py[cod]
+**/log.txt
+**/.pytest_cache/
+**/.ruff_cache/
+**/.venv/
+**/node_modules/
+
+# Large model, market-data and runtime outputs
+ai_bot3/ai_bot3/data/
+ai_bot3/ai_bot3/model_results/
+ai_bot3/ai_bot3/models/
+ai_bot3/ai_bot3/logs/
+ai_bot3/ai_bot3/err
+
+# Trading runtime state
+BybitContractBotV4/*.db
+BybitContractBotV4/*.db-*
+BybitContractBotV4/*.ini
+BybitContractBotV4/*.log
+
+# Historical bots are retained on disk but excluded from the first safe baseline.
+# The active migration target is v4_1 only.
+BybitContractBotV4/bot_threshold_super_v*.py
+!BybitContractBotV4/bot_threshold_super_v4_1.py
+BybitContractBotV4/loop_v*.sh
+!BybitContractBotV4/loop_v4_1.sh
+
+# Experimental database helpers currently contain machine-specific connection data.
+BybitContractBotV4/hot_db.py
+BybitContractBotV4/cloud_db.py
+
+# Local editor / operating-system noise
+.version-history/
+.DS_Store
+Thumbs.db
+*.swp
