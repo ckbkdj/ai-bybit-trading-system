@@ -9,7 +9,7 @@
 ```text
 内部/外部数据源
   -> Point-in-Time 特征与数据质量
-  -> 快预测 / 慢研究
+  -> LSTM 弱先验 + Brain 正式方向 + 在线校准/OOD
   -> ForecastEnvelope.v1
   -> 成本与操作票策略
   -> OperationTicket.v1 + SQLite WAL Outbox
@@ -43,7 +43,7 @@
 - ticket_events 和 execution_receipts 追加写；
 - 同 ID、不同内容触发冲突，不静默覆盖。
 
-交易执行库保存 tickets、ticket_events、execution_orders、execution_fills、position_snapshots、risk_runtime、receipt_outbox 和 consumer_cursors。`exec_id` 是成交去重主键，`order_link_id` 是订单幂等主键。
+交易执行库保存 tickets、ticket_events、execution_orders、execution_fills、position_snapshots、risk_runtime、equity_runtime、receipt_outbox 和 consumer_cursors。`exec_id` 是成交去重主键，`order_link_id` 是订单幂等主键。`equity_runtime` 持久保存账户净值高水位，用于跨重启回撤熔断。
 
 ## 执行状态机
 
@@ -61,7 +61,7 @@ REST 成功只表示异步受理，不表示成交。执行端通过私有订单
 
 ## 风控与保护
 
-交易端有最终否决权。票据时效、数据质量/年龄/源中断、事件封锁、实时价差和价格偏离、市场状态、账户权益、日亏损、保证金使用率、连续亏损冷静期、总杠杆、相关方向暴露、仓位版本、时钟漂移、私有 WebSocket 和 kill switch 都在下单前检查。
+交易端有最终否决权。票据时效、数据质量/年龄/源中断、事件封锁、实时价差和价格偏离、市场状态、账户权益、日亏损、净值高水位回撤、保证金使用率、连续亏损冷静期、总杠杆、相关方向暴露、仓位版本、时钟漂移、私有 WebSocket 和 kill switch 都在下单前检查。
 
 最终数量取以下约束的最小值并向下对齐数量步长：止损风险数量、票据名义上限、目标暴露、可用保证金和组合容量。价格按方向对齐 tick size。REDUCE/CLOSE 只从当前实际仓位计算，所有退出订单强制 `reduceOnly`。
 
@@ -79,7 +79,7 @@ Bybit 官方说明：下单响应是异步受理，需要 WebSocket 确认；`or
 
 ## 快慢双通道
 
-快通道保存预测并按校准、数据质量、OOD、方向概率和费用后安全边际决定是否出票。慢研究任务具有持久化状态、checkpoint、revision、来源分级、实体映射、情景归一化和结构化 EventImpactVector。仅经验证的 Tier A 来源可触发或解除事件封锁；Tier C 单独出现不能触发强交易动作。
+快通道保存预测并按 Brain 发布阶段/可交易信号、显式校准状态、数据质量、OOD、方向概率和费用后安全边际决定是否出票。默认只有 live Brain 可以出生产票；candidate 只有显式测试网策略可以出票。慢研究任务具有持久化状态、checkpoint、revision、来源分级、实体映射、情景归一化和结构化 EventImpactVector。仅经验证的 Tier A 来源可触发或解除事件封锁；Tier C 单独出现不能触发强交易动作。
 
 ## 评估协议
 

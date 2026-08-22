@@ -252,6 +252,7 @@ class OnlinePredictionCalibrator:
             "enabled": self.enabled,
         }
         adjusted = raw
+        calibration_status = "disabled" if not self.enabled else "insufficient_samples"
         if self.enabled and self._conn:
             samples = self._recent(symbol, timeframe, mode)
             if len(samples) >= self.min_samples:
@@ -260,6 +261,7 @@ class OnlinePredictionCalibrator:
                 info["adaptive_threshold"] = self._adaptive_threshold(stats)
                 # 校准：先减偏置，再按缩放调整
                 adjusted = (raw - info["bias"]) * info["scale"]
+                calibration_status = "valid"
         threshold = info["adaptive_threshold"]
         direction = "flat"
         if adjusted > threshold:
@@ -272,6 +274,7 @@ class OnlinePredictionCalibrator:
             "calibrated_predicted_return": adjusted,
             "calibrated_trend": direction,
             "direction_confidence": confidence,
+            "calibration_status": calibration_status,
             "online_learning": info,
         }
 

@@ -26,12 +26,23 @@
 | 18 | 测试不能触发真实订单 | PASS | ShadowExchange/no-private-network 测试及 E2E |
 | 19 | 日志不打印 key/secret/signature | PASS | `test_logger_redacts_credentials_and_signatures` |
 | 20 | 交易端不导入预测内部模块 | PASS | `test_execution_code_does_not_import_prediction_internals` |
+| 21 | LSTM holdout 从未参与 fit，窗口级 purge | PASS | `test_kline_only_training_anti_leakage`、`test_purged_model_validation` |
+| 22 | Brain 训练/验证间按 horizon purge | PASS | `test_purged_model_validation`、Brain governance tests |
+| 23 | 未显式校准/OOD/可靠来源失败关闭 | PASS | `test_model_monitoring`、ticket policy tests |
+| 24 | 默认只有 live Brain 可生成交易票 | PASS | `test_result_manager_ticket_gate` |
+| 25 | 研究试验追加写、重复试验计数、DSR | PASS | `test_statistical_governance` |
+| 26 | 历史成本复放去重叠并报告证据限制 | PASS | `test_historical_strategy_audit` |
+| 27 | 净值高水位跨重启且回撤熔断 | PASS | `test_equity_high_water_*` |
 
 额外已通过：claim lease、游标 outbox、不可变冲突、费用后门槛、REDUCE/CLOSE、CANCEL、cancel/fill 竞争、止损附带、幂等止盈子单、限流头、kill switch、研究 checkpoint/revision/Tier A blackout、PIT vintage、因子语义、walk-forward/purge/embargo、成本回测和因子组消融。
 
 本机 HTTP 影子 E2E 结果要求并已观测：`cursor=1`、`state=SUBMITTED`、`shadow_order_count=1`、`control_plane_receipt_count=1`。
 
-最终全量回归：预测端 `pytest` 为 **81 passed / 6 skipped / 0 failed**（跳过项均为原项目可选模型依赖路径）；交易端 `unittest` 为 **25 passed / 0 failed**。两个项目的 Python 文件均通过语法编译。
+最终全量回归：预测端 `pytest` 为 **99 passed / 0 skipped / 0 failed**；交易端 `pytest` 为 **27 passed / 0 failed**。两个项目及工作区脚本的 Python 文件均通过语法编译。
+
+历史策略证据：3,255 条 settled 预测在严格 live 门禁下因缺 recorded direction 而得到 0 笔合格交易，不能证明盈利。仅供诊断的旧方向推断得到 304 笔，计 11 bps 双边手续费与 6 bps 往返滑点后约 **-13.48%**，收盘到收盘最大回撤约 **13.48%**；没有 intrabar 和真实 fills，不能当作实盘回测。结论为 `profitability_not_demonstrated`。
+
+Brain 强制重训证据：25 组合得到 **20 shadow / 5 rejected / 0 candidate / 0 live**；没有任何模型达到真钱发布资格。
 
 ## 外部测试网门禁
 

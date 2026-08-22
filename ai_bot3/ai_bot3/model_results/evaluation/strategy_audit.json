@@ -1,0 +1,97 @@
+{
+  "generated_at": "2026-08-22T13:43:11.298228Z",
+  "source_db": "D:\\Money\\ai_bot3\\ai_bot3\\data\\online_learning.sqlite3",
+  "selection_bias_counts": {
+    "governed_actual_trials": 5,
+    "legacy_training_run_events": 15512,
+    "conservative_count_used_for_deflation": 15512,
+    "independent_trial_count_known": false
+  },
+  "strict_live_gate_replay": {
+    "configuration": {
+      "initial_equity_usdt": 100000.0,
+      "target_exposure_pct": 0.08,
+      "max_gross_exposure_pct": 0.24,
+      "minimum_signal_return": 0.0008,
+      "minimum_confidence": 0.58,
+      "round_trip_fee_bps": 11.0,
+      "round_trip_slippage_bps": 6.0,
+      "funding_bps": 0.0,
+      "require_recorded_direction": true,
+      "require_confidence": true,
+      "require_model_version": true
+    },
+    "records_seen": 3255,
+    "eligible_trades": 0,
+    "rejections": {
+      "missing_recorded_direction": 3255
+    },
+    "initial_equity_usdt": 100000.0,
+    "final_equity_usdt": 100000.0,
+    "net_profit_usdt": 0.0,
+    "total_return": 0.0,
+    "realized_close_to_close_max_drawdown": 0.0,
+    "intratrade_drawdown_available": false,
+    "win_rate_after_cost": null,
+    "profit_factor_after_cost": null,
+    "average_trade_return_after_cost": null,
+    "cost_model": {
+      "round_trip_fee_bps": 11.0,
+      "round_trip_slippage_bps": 6.0,
+      "funding_bps": 0.0
+    },
+    "evidence_limits": [
+      "settled prediction rows are not exchange fill receipts",
+      "no intrabar path is stored, so intratrade drawdown and stop execution cannot be reconstructed",
+      "legacy rows may not contain direction, confidence, model version, calibration, OOD, or source-quality gates"
+    ],
+    "observed_days": 0,
+    "annualized_sharpe": null,
+    "deflated_sharpe_probability": null
+  },
+  "legacy_direction_inference_diagnostic_only": {
+    "configuration": {
+      "initial_equity_usdt": 100000.0,
+      "target_exposure_pct": 0.08,
+      "max_gross_exposure_pct": 0.24,
+      "minimum_signal_return": 0.0,
+      "minimum_confidence": 0.58,
+      "round_trip_fee_bps": 11.0,
+      "round_trip_slippage_bps": 6.0,
+      "funding_bps": 0.0,
+      "require_recorded_direction": false,
+      "require_confidence": false,
+      "require_model_version": false
+    },
+    "records_seen": 3255,
+    "eligible_trades": 304,
+    "rejections": {
+      "flat_signal": 4,
+      "overlapping_same_signal": 244,
+      "portfolio_exposure_cap": 2703
+    },
+    "initial_equity_usdt": 100000.0,
+    "final_equity_usdt": 86519.78632502016,
+    "net_profit_usdt": -13480.213674979837,
+    "total_return": -0.13480213674979835,
+    "realized_close_to_close_max_drawdown": 0.13480213674979838,
+    "intratrade_drawdown_available": false,
+    "win_rate_after_cost": 0.13486842105263158,
+    "profit_factor_after_cost": 0.06476561031150903,
+    "average_trade_return_after_cost": -0.007393484008627798,
+    "cost_model": {
+      "round_trip_fee_bps": 11.0,
+      "round_trip_slippage_bps": 6.0,
+      "funding_bps": 0.0
+    },
+    "evidence_limits": [
+      "settled prediction rows are not exchange fill receipts",
+      "no intrabar path is stored, so intratrade drawdown and stop execution cannot be reconstructed",
+      "legacy rows may not contain direction, confidence, model version, calibration, OOD, or source-quality gates"
+    ],
+    "observed_days": 2,
+    "annualized_sharpe": -23.955190867061038,
+    "deflated_sharpe_probability": 4.68600773992911e-05
+  },
+  "conclusion": "profitability_not_demonstrated"
+}

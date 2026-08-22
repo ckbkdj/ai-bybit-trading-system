@@ -56,6 +56,7 @@ class TradingSettings:
     ticket_poll_seconds: float
     execution_db_path: str
     max_daily_loss_pct: float
+    max_equity_drawdown_pct: float
     max_gross_leverage: float
     max_correlated_exposure_pct: float
     max_margin_utilization: float
@@ -105,6 +106,7 @@ class TradingSettings:
             max_age = int(value("PREDICTION_MAX_AGE_SECONDS", "600"))
             ticket_poll = float(value("TICKET_POLL_SECONDS", "2"))
             max_daily_loss = float(value("MAX_DAILY_LOSS_PCT", "0.02"))
+            max_equity_drawdown = float(value("MAX_EQUITY_DRAWDOWN_PCT", "0.10"))
             max_gross_leverage = float(value("MAX_GROSS_LEVERAGE", "2"))
             max_correlated = float(value("MAX_CORRELATED_EXPOSURE_PCT", "0.35"))
             max_margin_utilization = float(value("MAX_MARGIN_UTILIZATION", "0.70"))
@@ -115,7 +117,7 @@ class TradingSettings:
             raise SettingsError("numeric runtime settings contain an invalid value") from exc
         if shadow_equity <= 0 or timeout <= 0 or max_age <= 0 or ticket_poll <= 0:
             raise SettingsError("shadow equity, prediction timeout and max age must be positive")
-        if not 0 < max_daily_loss <= 1 or max_gross_leverage <= 0:
+        if not 0 < max_daily_loss <= 1 or not 0 < max_equity_drawdown <= 1 or max_gross_leverage <= 0:
             raise SettingsError("risk loss/leverage limits contain invalid values")
         if not 0 < max_correlated <= 1 or not 0 < max_margin_utilization <= 1:
             raise SettingsError("risk exposure/margin limits must be in (0, 1]")
@@ -159,6 +161,7 @@ class TradingSettings:
                 "EXECUTION_DB_PATH", str(service_root / "execution_state.sqlite3")
             ),
             max_daily_loss_pct=max_daily_loss,
+            max_equity_drawdown_pct=max_equity_drawdown,
             max_gross_leverage=max_gross_leverage,
             max_correlated_exposure_pct=max_correlated,
             max_margin_utilization=max_margin_utilization,

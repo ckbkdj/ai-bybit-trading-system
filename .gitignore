@@ -22,6 +22,12 @@ ai_bot3/ai_bot3/config.yml.bak_*
 # Large model, market-data and runtime outputs
 ai_bot3/ai_bot3/data/
 ai_bot3/ai_bot3/model_results/
+!ai_bot3/ai_bot3/model_results/
+ai_bot3/ai_bot3/model_results/*
+!ai_bot3/ai_bot3/model_results/evaluation/
+ai_bot3/ai_bot3/model_results/evaluation/*
+!ai_bot3/ai_bot3/model_results/evaluation/strategy_audit.json
+!ai_bot3/ai_bot3/model_results/evaluation/brain_retrain_report.json
 ai_bot3/ai_bot3/models/
 ai_bot3/ai_bot3/logs/
 ai_bot3/ai_bot3/err

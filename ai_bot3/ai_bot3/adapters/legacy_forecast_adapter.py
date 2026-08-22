@@ -57,10 +57,30 @@ class LegacyForecastAdapter:
             data_cutoff = generated_at
         horizon = int(legacy.get("horizon_sec") or MODE_HORIZONS.get(mode, 3600))
 
-        trend = str(legacy.get("calibrated_trend") or legacy.get("trend") or "flat").lower()
+        brain = legacy.get("brain_prediction") if isinstance(legacy.get("brain_prediction"), Mapping) else {}
+        brain_direction = str(brain.get("direction") or "flat").lower()
+        brain_stage = str(brain.get("release_stage") or "unreviewed").lower()
+        brain_qualified = bool(brain.get("actionable")) and brain_stage in {"candidate", "live"}
+        brain_trend = "up" if brain_direction == "long" else "down" if brain_direction == "short" else "flat"
+        trend = str(
+            brain_trend
+            if brain_qualified
+            else legacy.get("calibrated_direction") or legacy.get("calibrated_trend") or legacy.get("trend") or "flat"
+        ).lower()
         if trend not in {"up", "down", "flat"}:
             trend = "flat"
-        confidence = max(0.0, min(1.0, _float(legacy.get("direction_confidence") or legacy.get("confidence"), 0.5)))
+        confidence = max(
+            0.0,
+            min(
+                1.0,
+                _float(
+                    brain.get("confidence")
+                    if brain_qualified
+                    else legacy.get("direction_confidence") or legacy.get("confidence"),
+                    0.5,
+                ),
+            ),
+        )
         directional = 0.34 + 0.46 * confidence
         flat_probability = max(0.05, 0.25 * (1 - confidence))
         opposite = 1.0 - directional - flat_probability
@@ -75,6 +95,9 @@ class LegacyForecastAdapter:
         predicted_return = legacy.get("calibrated_predicted_return")
         if predicted_return is None:
             predicted_return = legacy.get("predicted_return")
+        if brain_qualified:
+            brain_return = abs(_float(brain.get("expected_return"), 0.0))
+            predicted_return = brain_return if brain_direction == "long" else -brain_return
         expected_return_bps = _float(predicted_return) * 10_000 if predicted_return is not None else None
         source_status = str(legacy.get("data_source_status") or "degraded").lower()
         if source_status not in {"ok", "degraded", "missing", "error"}:
@@ -83,6 +106,8 @@ class LegacyForecastAdapter:
         quality = _float((legacy.get("context_completeness") or {}).get("score") if isinstance(legacy.get("context_completeness"), dict) else legacy.get("context_completeness"), 0.75 if reliable else 0.5)
         quality = max(0.0, min(1.0, quality))
         warnings = ["legacy_inferred_direction_distribution"]
+        if brain_qualified:
+            warnings.append(f"brain_model_signal:{brain_stage}")
         if not reliable:
             warnings.append(str(legacy.get("data_source_warning") or "legacy_source_not_verified"))
 
@@ -93,7 +118,14 @@ class LegacyForecastAdapter:
             generated_at.isoformat(),
             legacy.get("model_version"),
         )
-        model_bundle = str(legacy.get("model_version") or f"legacy-{mode}")
+        model_bundle = str(
+            brain.get("version") if brain_qualified else legacy.get("model_version") or f"legacy-{mode}"
+        )
+        calibration_status = str(legacy.get("calibration_status") or "unknown").lower()
+        if calibration_status not in {"valid", "degraded", "invalid", "unknown"}:
+            calibration_status = "degraded"
+        feature_age = legacy.get("current_price_age_seconds")
+        feature_age_sec = int(_float(feature_age, 2_147_483_647)) if feature_age is not None else 2_147_483_647
         return ForecastEnvelope.model_validate(
             {
                 "forecast_id": forecast_id,
@@ -122,9 +154,9 @@ class LegacyForecastAdapter:
                 "quality": {
                     "data_coverage": quality,
                     "data_quality": quality,
-                    "calibration_status": "valid" if legacy.get("calibrated_trend") else "unknown",
-                    "out_of_distribution_score": _float(legacy.get("out_of_distribution_score"), 0.5),
-                    "max_feature_age_sec": int(_float(legacy.get("current_price_age_seconds"), 0)),
+                    "calibration_status": calibration_status,
+                    "out_of_distribution_score": max(0.0, min(1.0, _float(legacy.get("out_of_distribution_score"), 1.0))),
+                    "max_feature_age_sec": max(0, feature_age_sec),
                     "source_status": source_status,
                 },
                 "factor_scores": dict(legacy.get("factor_scores") or {}),

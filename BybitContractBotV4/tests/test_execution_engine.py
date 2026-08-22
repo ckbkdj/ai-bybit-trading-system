@@ -176,6 +176,25 @@ class ExecutionEngineTests(unittest.TestCase):
         self.assertEqual(Decimal(params["stopLoss"]), Decimal("99000"))
         self.assertEqual(params["slTriggerBy"], "MarkPrice")
 
+    def test_equity_high_water_drawdown_blocks_new_risk(self):
+        ticket = OperationTicket.model_validate(ticket_payload("tk_drawdown_guard_001"))
+        self.context.account_snapshot = replace(
+            self.context.account_snapshot,
+            equity_high_water_usdt=12_000,
+        )
+        state = self.consumer.process(ticket, now=NOW)
+        self.assertEqual(state, ExecutionState.RISK_BLOCKED)
+        self.assertEqual(
+            self.store.ticket_record(ticket.ticket_id)["reason_code"],
+            "EQUITY_DRAWDOWN_LIMIT",
+        )
+
+    def test_equity_high_water_is_monotonic_and_persistent(self):
+        self.assertEqual(self.store.observe_equity(10_000), 10_000)
+        self.assertEqual(self.store.observe_equity(9_500), 10_000)
+        reopened = ExecutionStore(Path(self.temp.name) / "execution.sqlite3")
+        self.assertEqual(reopened.observe_equity(9_000), 10_000)
+
     def test_rest_success_does_not_mark_filled_and_fill_events_are_idempotent(self):
         ticket = OperationTicket.model_validate(ticket_payload())
         self.consumer.process(ticket, now=NOW)

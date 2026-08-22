@@ -41,8 +41,16 @@ def test_lstm_training_dataset_is_chronological_and_next_close_aligned():
     kwargs = {kw.arg: kw.value for kw in call.keywords}
     assert isinstance(kwargs.get("shuffle"), ast.Constant)
     assert kwargs["shuffle"].value is False
-    assert ast.unparse(kwargs["data"]) == "X_scaled[:-1]"
-    assert ast.unparse(kwargs["targets"]) == "y_scaled[window:]"
+    assert ast.unparse(kwargs["data"]) == "X_scaled[:boundary.train_end - 1]"
+    assert ast.unparse(kwargs["targets"]) == "y_scaled[window:boundary.train_end]"
+    fit_calls = [
+        n for n in calls
+        if isinstance(n.func, ast.Attribute) and n.func.attr == "fit"
+    ]
+    model_fit = next(n for n in fit_calls if isinstance(n.func.value, ast.Name) and n.func.value.id == "model")
+    assert ast.unparse(model_fit.args[0]) == "train_ds"
+    fit_kwargs = {kw.arg: kw.value for kw in model_fit.keywords}
+    assert ast.unparse(fit_kwargs["validation_data"]) == "validation_ds"
 
 
 def test_brain_features_are_shifted_for_training_to_avoid_future_leakage():

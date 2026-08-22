@@ -41,6 +41,7 @@ from .market_context import (
 )
 from .data_fetch import MarketDataUnavailable
 from .brain_model import predict_brain_from_df
+from .model_monitoring import factor_group_scores, scaled_feature_ood_score, source_is_reliable
 
 
 def _now_iso() -> str:
@@ -202,7 +203,7 @@ def _calculate_metrics(
         "trade_direction": trade_direction,
         "trade_predicted_return": trade_predicted_return,
         "display_trade_return": trade_predicted_return,
-        "model_version": "lstm_keras_v1",
+        "model_version": "lstm_keras_v2_purged_holdout",
     }
     if extras:
         out.update(extras)
@@ -232,6 +233,7 @@ def _calculate_metrics(
     out["confidence"] = min(1.0, abs(fused["fused_score"]))
     out["llm_signal"] = llm_signal
     out["openai_prediction"] = llm_payload or None
+    out["factor_scores"] = factor_group_scores(snapshot, bias["factor_bias"], llm_signal)
 
     # 在线学习校准（如有）：不覆盖 raw_predicted_return / predicted_return / calibrated_trend，
     # 仅写入独立的 calibrated_* 字段，保持价格展示字段与 pred/last 一致。
@@ -241,7 +243,10 @@ def _calculate_metrics(
         out["calibrated_return"] = cal.get("calibrated_predicted_return", predicted_return)
         out["calibrated_direction"] = cal.get("calibrated_trend", out.get("calibrated_trend"))
         out["direction_confidence"] = cal.get("direction_confidence", out["confidence"])
+        out["calibration_status"] = str(cal.get("calibration_status") or "unknown")
         out["online_learning"] = cal.get("online_learning")
+    else:
+        out["calibration_status"] = "unknown"
     return out
 
 def run_onnx_inference_in_process(prepared_data: Dict[str, Any]) -> Dict[str, Any] | None:
@@ -286,6 +291,16 @@ def run_onnx_inference_in_process(prepared_data: Dict[str, Any]) -> Dict[str, An
         "current_price_age_seconds": prepared_data.get("current_price_age_seconds"),
         "current_price_warning": prepared_data.get("current_price_warning"),
     }
+    loaded_model_metadata = prepared_data.get("loaded_model_metadata") or {}
+    validation_metadata = loaded_model_metadata.get("validation") or {}
+    verified_weak_prior = bool(
+        loaded_model_metadata.get("model_version") == "lstm_keras_v2_purged_holdout"
+        and validation_metadata.get("holdout_seen_during_fit") is False
+    )
+    extras["model_version"] = (
+        "lstm_keras_v2_purged_holdout" if verified_weak_prior else "legacy_unverified_lstm"
+    )
+    extras["loaded_model_metadata"] = loaded_model_metadata or None
     result = _calculate_metrics(y_pred_inverse, y_actual_inverse, last_price, sym, tf_code, extras=extras)
     for k in (
         "market_data_source",
@@ -326,9 +341,17 @@ def run_keras_inference_in_process(prepared_data: Dict[str, Any]) -> Dict[str, A
     with open(scaler_path_str, "rb") as f:
         bundle = pickle.load(f)
     if isinstance(bundle, tuple) and len(bundle) >= 2:
+        scaler_X = bundle[0]
         scaler_y = bundle[1]
     else:
+        scaler_X = None
         scaler_y = bundle
+
+    ood = scaled_feature_ood_score(X_seq[-1], scaler_X) if scaler_X is not None else None
+    source_reliable = source_is_reliable(
+        prepared_data.get("data_source_status"),
+        prepared_data.get("current_price_age_seconds"),
+    )
 
     y_pred_inverse = scaler_y.inverse_transform(y_pred_scaled)
     y_actual_inverse = scaler_y.inverse_transform(y_seq_scaled)
@@ -351,7 +374,28 @@ def run_keras_inference_in_process(prepared_data: Dict[str, Any]) -> Dict[str, A
         "current_price_mtime": prepared_data.get("current_price_mtime"),
         "current_price_age_seconds": prepared_data.get("current_price_age_seconds"),
         "current_price_warning": prepared_data.get("current_price_warning"),
+        "data_source_reliable": source_reliable,
+        "out_of_distribution_score": ood.score if ood is not None else 1.0,
+        "out_of_distribution_details": (
+            {
+                "method": ood.method,
+                "violation_fraction": ood.violation_fraction,
+                "maximum_excess": ood.maximum_excess,
+            }
+            if ood is not None
+            else {"method": "missing_feature_scaler"}
+        ),
     }
+    loaded_model_metadata = prepared_data.get("loaded_model_metadata") or {}
+    validation_metadata = loaded_model_metadata.get("validation") or {}
+    verified_weak_prior = bool(
+        loaded_model_metadata.get("model_version") == "lstm_keras_v2_purged_holdout"
+        and validation_metadata.get("holdout_seen_during_fit") is False
+    )
+    extras["model_version"] = (
+        "lstm_keras_v2_purged_holdout" if verified_weak_prior else "legacy_unverified_lstm"
+    )
+    extras["loaded_model_metadata"] = loaded_model_metadata or None
     result = _calculate_metrics(y_pred_inverse, y_actual_inverse, last_price, sym, tf_code, extras=extras)
     try:
         brain_df = prepared_data.get("brain_df")
@@ -359,7 +403,7 @@ def run_keras_inference_in_process(prepared_data: Dict[str, Any]) -> Dict[str, A
             brain_df, sym, mode,
             cfg=prepared_data.get("cfg") or {},
             market_snapshot=extras.get("market_snapshot") or {},
-            local_predicted_return=result.get("predicted_return"),
+            local_predicted_return=(result.get("predicted_return") if verified_weak_prior else None),
         ) if brain_df is not None else {"status": "missing_features", "direction": "flat", "actionable": False}
         result["brain_prediction"] = brain_pred
         result["trade_actionable"] = bool(brain_pred.get("actionable"))
@@ -646,6 +690,17 @@ class InferencerDataPreparer:
         if current_meta.get("current_price_warning") and current_meta.get("current_price") is None:
             self.log.warning(f"当前价不可用，回退K线收盘价: {current_meta.get('current_price_warning')}")
 
+        loaded_model_metadata: Dict[str, Any] = {}
+        try:
+            metadata_path = self.results_dir / f"{self.sym}_{self.mode}_training.json"
+            if metadata_path.exists():
+                import json as _json
+                candidate = _json.loads(metadata_path.read_text(encoding="utf-8"))
+                if isinstance(candidate, dict):
+                    loaded_model_metadata = candidate
+        except Exception as exc:
+            self.log.warning("模型训练元数据不可读，LSTM 仅作为未验证展示输出: %s", exc)
+
         return {
             "sym": self.sym,
             "tf_code": self.tf_code,
@@ -668,6 +723,7 @@ class InferencerDataPreparer:
             "context_completeness": completeness,
             "openai_prediction": openai_payload,
             "online_calibration": online_payload,
+            "loaded_model_metadata": loaded_model_metadata,
             "data_sources_generated_at": self._collect_source_times(),
             # 行情数据源溯源（由 data_fetch.get_ohlcv 写入 df.attrs）
             "market_data_source": df.attrs.get("data_source"),

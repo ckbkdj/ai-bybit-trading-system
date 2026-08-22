@@ -57,6 +57,7 @@ class BybitRuntimeContext:
         free = float(usdt.get("free") if usdt.get("free") is not None else equity)
         used = float(usdt.get("used") or max(0, equity - free))
         runtime = self.store.risk_runtime()
+        high_water = self.store.observe_equity(equity) if equity > 0 else None
         cooldown = parse_time(runtime["cooldown_until"]) if runtime.get("cooldown_until") else None
         return AccountSnapshot(
             equity_usdt=equity,
@@ -66,6 +67,7 @@ class BybitRuntimeContext:
             unrealised_pnl=float(runtime.get("unrealised_pnl") or 0),
             consecutive_losses=int(runtime.get("consecutive_losses") or 0),
             cooldown_until=cooldown,
+            equity_high_water_usdt=high_water,
         )
 
     def portfolio(self, ticket: OperationTicket) -> PortfolioSnapshot:

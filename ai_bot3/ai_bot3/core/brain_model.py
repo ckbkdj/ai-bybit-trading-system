@@ -4,6 +4,8 @@ import hashlib
 import json
 import logging
 import math
+import os
+import shutil
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -17,9 +19,15 @@ import pandas as pd
 import talib
 from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier, ExtraTreesClassifier
 from sklearn.metrics import precision_score
-from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+
+try:
+    from .evaluation.time_series_split import purged_holdout_boundary
+    from .evaluation.statistical_governance import TrialLedger, TrialRecord
+except ImportError:  # Direct file loading in governance tests and maintenance tools.
+    from core.evaluation.time_series_split import purged_holdout_boundary
+    from core.evaluation.statistical_governance import TrialLedger, TrialRecord
 
 log = logging.getLogger("BrainModel")
 
@@ -59,12 +67,14 @@ def _brain_cfg(cfg: Dict[str, Any] | None) -> Dict[str, Any]:
     out.setdefault("default_leverage", 75)
     out.setdefault("model_dir", "./models/brain")
     out.setdefault("history_db", "./data/brain_training_history.sqlite3")
+    out.setdefault("trial_ledger_db", "./data/research_trials.sqlite3")
     out.setdefault("min_samples", 600)
     out.setdefault("validation_fraction", 0.2)
     out.setdefault("min_confidence", 0.58)
     out.setdefault("volatility_multiplier", 1.2)
     out.setdefault("min_train_threshold", 0.0012)
     out.setdefault("horizons", DEFAULT_HORIZONS)
+    out.setdefault("inference_stage", os.environ.get("AI_BOT_BRAIN_INFERENCE_STAGE", "shadow"))
     return out
 
 
@@ -133,6 +143,17 @@ def brain_stage_paths(symbol: str, mode: str, cfg: Dict[str, Any] | None = None)
     return _ensure_brain_stage_dirs(model_dir)
 
 
+def brain_stage_artifact_paths(
+    symbol: str, mode: str, stage: str, cfg: Dict[str, Any] | None = None
+) -> Tuple[Path, Path]:
+    normalized = str(stage).lower()
+    if normalized not in BRAIN_STAGE_DIRS:
+        raise ValueError(f"unsupported brain stage: {stage}")
+    directory = brain_stage_paths(symbol, mode, cfg)[normalized]
+    tag = f"{symbol}_{mode}_brain"
+    return directory / f"{tag}.joblib", directory / f"{tag}_meta.json"
+
+
 def history_db_path(cfg: Dict[str, Any] | None = None) -> Path:
     return _resolve_path(_brain_cfg(cfg).get("history_db", "./data/brain_training_history.sqlite3"))
 
@@ -178,6 +199,39 @@ def _record_history(cfg: Dict[str, Any], symbol: str, mode: str, tf_code: str, d
             ),
         )
         con.commit(); con.close()
+        if status == "trained":
+            parameters = {
+                "classifier": "HistGradientBoostingClassifier",
+                "max_iter": 240,
+                "learning_rate": 0.045,
+                "max_leaf_nodes": 31,
+                "l2_regularization": 0.05,
+                "mode": mode,
+                "timeframe": tf_code,
+                "validation": metrics.get("validation"),
+            }
+            generated_at = str(metrics.get("generated_at") or _now_iso())
+            trial_id = hashlib.sha256(
+                f"{symbol}|{mode}|{signature}|{generated_at}".encode()
+            ).hexdigest()[:32]
+            ledger = TrialLedger(
+                _resolve_path(cfg.get("trial_ledger_db", "./data/research_trials.sqlite3"))
+            )
+            ledger.append(
+                TrialRecord(
+                    trial_id=trial_id,
+                    model_family="brain_hist_gradient_boosting",
+                    data_signature=signature,
+                    parameter_hash=TrialLedger.parameter_hash(parameters),
+                    code_commit=str(metrics.get("code_commit") or "unknown"),
+                    status=(
+                        "rejected"
+                        if str(metrics.get("promote_decision")) == "rejected"
+                        else "completed"
+                    ),
+                    metrics=metrics,
+                )
+            )
     except Exception as exc:
         log.warning("brain training history write failed: %s", exc)
 
@@ -448,18 +502,24 @@ def train_brain_from_df(df: pd.DataFrame, symbol: str, tf_code: str, mode: str, 
         meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False, default=str))
         _record_history(bc, symbol, mode, tf_code, df, signature, model_path, meta_path, meta["status"], meta)
         return meta
-    split = max(1, int(len(X) * (1 - float(bc.get("validation_fraction", 0.2)))))
-    split = min(split, len(X) - 1)
-    X_train, X_val = X.iloc[:split], X.iloc[split:]
-    y_train, y_val = y[:split], y[split:]
+    horizon = horizon_for_mode(mode, cfg)
+    validation_fraction = float(bc.get("validation_fraction", 0.2))
+    purge_rows = max(horizon, int(bc.get("validation_purge_bars", horizon)))
+    boundary = purged_holdout_boundary(
+        len(X),
+        validation_fraction=validation_fraction,
+        minimum_train_size=max(200, int(min_samples * (1.0 - validation_fraction)) - purge_rows),
+        minimum_validation_size=PROMOTE_MIN_VALIDATION_SAMPLES,
+        purge_size=purge_rows,
+    )
+    X_train = X.iloc[boundary.train_start : boundary.train_end]
+    X_val = X.iloc[boundary.validation_start : boundary.validation_end]
+    y_train = y[boundary.train_start : boundary.train_end]
+    y_val = y[boundary.validation_start : boundary.validation_end]
     clf = _model()
     sample_weight = np.where(y_train == LABEL_FLAT, 1.0, 1.6)
     clf.fit(X_train, y_train, clf__sample_weight=sample_weight)
     metrics = _evaluate(clf, X_val, y_val, float(ds_meta["strict_target_return"]), int(ds_meta["leverage"]))
-    bundle = {"model": clf, "feature_columns": list(X.columns), "meta": {**base_metrics, **metrics}}
-    tmp = model_path.with_suffix('.tmp.joblib')
-    joblib.dump(bundle, tmp)
-    tmp.replace(model_path)
     decision, reason, baseline = _decide_promotion(metrics, samples=int(len(X)), min_samples=int(min_samples))
     meta = {
         **base_metrics,
@@ -467,20 +527,47 @@ def train_brain_from_df(df: pd.DataFrame, symbol: str, tf_code: str, mode: str, 
         "status": "trained",
         "samples": int(len(X)),
         "train_samples": int(len(X_train)),
+        "validation": {
+            "kind": "purged_chronological_holdout",
+            "train_rows": int(boundary.train_size),
+            "validation_rows": int(boundary.validation_size),
+            "purge_rows": int(boundary.purge_size),
+            "holdout_seen_during_fit": False,
+        },
         "model_path": str(model_path),
         "meta_path": str(meta_path),
         "generated_at": _now_iso(),
         "promote_decision": decision,
+        "release_stage": decision,
         "promote_reason": reason,
         "baseline_comparison": baseline,
     }
+    # Persist the exact governance decision inside the model bundle as well as
+    # the sidecar. Inference must never infer a release stage from metrics.
+    bundle = {"model": clf, "feature_columns": list(X.columns), "meta": dict(meta)}
+    tmp = model_path.with_suffix('.tmp.joblib')
+    joblib.dump(bundle, tmp)
+    tmp.replace(model_path)
+    stage_model_path, stage_meta_path = brain_stage_artifact_paths(symbol, mode, decision, cfg)
+    stage_tmp = stage_model_path.with_suffix(".tmp.joblib")
+    shutil.copyfile(model_path, stage_tmp)
+    stage_tmp.replace(stage_model_path)
     meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False, default=str))
+    stage_meta_tmp = stage_meta_path.with_suffix(".tmp.json")
+    stage_meta_tmp.write_text(json.dumps(meta, indent=2, ensure_ascii=False, default=str))
+    stage_meta_tmp.replace(stage_meta_path)
     _record_history(bc, symbol, mode, tf_code, df, signature, model_path, meta_path, "trained", meta)
     return meta
 
 
 def load_brain_bundle(symbol: str, mode: str, cfg: Dict[str, Any] | None = None) -> Optional[Dict[str, Any]]:
     model_path, _ = brain_paths(symbol, mode, cfg)
+    inference_stage = str(_brain_cfg(cfg).get("inference_stage") or "shadow").lower()
+    if inference_stage in {"candidate", "live"}:
+        model_path, _ = brain_stage_artifact_paths(symbol, mode, inference_stage, cfg)
+    elif inference_stage != "shadow":
+        log.error("unsupported brain inference stage %s; refusing model load", inference_stage)
+        return None
     if not model_path.exists():
         return None
     try:
@@ -524,16 +611,26 @@ def predict_brain_from_df(df: pd.DataFrame, symbol: str, mode: str, cfg: Dict[st
     if direction == "long" and liq > 0.2: confidence = min(1.0, confidence + 0.04); reasons.append("爆仓/空头压力偏多，增强long信心")
     if direction == "short" and liq < -0.2: confidence = min(1.0, confidence + 0.04); reasons.append("爆仓/多头压力偏空，增强short信心")
     min_conf = float(bc.get("min_confidence", 0.58))
-    actionable = bool(direction != "flat" and confidence >= min_conf and expected_return >= strict)
+    model_meta = dict(bundle.get("meta") or {})
+    release_stage = str(
+        model_meta.get("release_stage")
+        or model_meta.get("promote_decision")
+        or "unreviewed"
+    ).lower()
+    signal_qualified = bool(direction != "flat" and confidence >= min_conf and expected_return >= strict)
+    actionable = bool(signal_qualified and release_stage in {"candidate", "live"})
     if not actionable:
         if direction == "flat": reasons.append("模型倾向观望")
         if confidence < min_conf: reasons.append(f"置信度{confidence:.3f}低于阈值{min_conf:.3f}")
         if expected_return < strict: reasons.append(f"预期收益{expected_return:.5f}未达到31%杠杆目标所需{strict:.5f}")
+        if release_stage not in {"candidate", "live"}: reasons.append(f"模型发布阶段{release_stage}不允许形成可交易信号")
     return {
         "version": BRAIN_VERSION,
         "status": "ok",
         "direction": direction,
         "actionable": actionable,
+        "signal_qualified": signal_qualified,
+        "release_stage": release_stage,
         "leverage": lev,
         "target_leveraged_profit": float(bc.get("target_leveraged_profit", DEFAULT_TARGET_LEVERAGED_PROFIT)),
         "target_raw_return": strict,
@@ -544,5 +641,5 @@ def predict_brain_from_df(df: pd.DataFrame, symbol: str, mode: str, cfg: Dict[st
         "proba_flat": p_flat,
         "proba_short": p_short,
         "reason": reasons,
-        "model_meta": bundle.get("meta", {}),
+        "model_meta": model_meta,
     }

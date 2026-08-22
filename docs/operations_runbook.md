@@ -21,6 +21,8 @@ CONTROL_PLANE_DB=D:\安全数据目录\control_plane.sqlite3
 RESEARCH_JOB_DB=D:\安全数据目录\research_jobs.sqlite3
 CONTROL_PLANE_API_TOKEN=部署时注入
 AI_BOT_TICKETS_ENABLED=true
+AI_BOT_BRAIN_INFERENCE_STAGE=shadow
+AI_BOT_REQUIRED_BRAIN_RELEASE_STAGE=live
 ```
 
 API key、secret、token 和 webhook 只在安全机器上通过环境或 `.env.local` 注入。任何曾写入旧源码或日志的凭证均按已泄露处理并轮换。
@@ -45,6 +47,8 @@ API key、secret、token 和 webhook 只在安全机器上通过环境或 `.env.
 - testnet/live 的私有 WebSocket 必须 connected；
 - incomplete ticket 数量不能持续增长；
 - last error、last poll 和 receipt outbox 是否滞留；
+- Brain inference/release stage、校准状态、OOD、数据质量和拒票原因；
+- 账户净值高水位、当前 drawdown、日亏损和保证金；
 - 机器 UTC 时间与 Bybit 时间漂移。
 
 主循环不把 REST accepted 当作 FILLED。短暂 `SUBMITTING` 是正常恢复窗口；超过窗口且按订单号/成交查不到时进入 FAILED，需要人工核对，不能手工“再按一次下单”。
@@ -71,6 +75,10 @@ testnet/live 禁止风险增加。先恢复 WebSocket，再执行 reconcile；�
 
 不要修改数据库绕过风控。确认账户快照、PnL 日界线和敞口后再决定是否进入新的交易日或结束冷静期。
 
+### 净值高水位回撤门槛
+
+`equity_runtime` 跨重启保存高水位。达到 `MAX_EQUITY_DRAWDOWN_PCT` 后所有风险增加票据失败关闭；只能继续风险降低动作。先核对 Bybit 权益、未实现盈亏和数据一致性，不得删除/回写高水位绕过门禁。
+
 ## 5. 备份与恢复
 
 停止写服务后，同时备份 SQLite 主文件、`-wal`、`-shm`。控制面、研究、PIT 和执行状态使用新数据库，不覆盖旧价格库、模型或结果 JSON。恢复时先复制数据库，再以 shadow 启动并运行 reconcile。
@@ -87,4 +95,4 @@ testnet/live 禁止风险增加。先恢复 WebSocket，再执行 reconcile；�
 
 ## 6. 模式升级
 
-升级顺序固定为 shadow → testnet → 小流量 live。testnet 至少验证限价、市场价、部分成交、撤单、重启恢复、止损、止盈子单、限流和 WebSocket 断线。live 必须完成 `docs/mainnet_go_live_checklist.md` 并获得人工批准；本方案不会自动切换 live。
+升级顺序固定为 shadow → candidate testnet → live-model shadow → 小流量 live。candidate 只有同时设置 `AI_BOT_BRAIN_INFERENCE_STAGE=candidate` 和 `AI_BOT_REQUIRED_BRAIN_RELEASE_STAGE=candidate` 才能出测试票。生产保持 required stage 为 `live`。testnet 至少验证限价、市场价、部分成交、撤单、重启恢复、止损、止盈子单、限流和 WebSocket 断线。模型晋升使用证据包和 approval id；交易主网仍必须完成 `docs/mainnet_go_live_checklist.md` 并获得人工批准。

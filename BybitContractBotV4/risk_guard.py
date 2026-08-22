@@ -31,6 +31,7 @@ class AccountSnapshot:
     unrealised_pnl: float = 0.0
     consecutive_losses: int = 0
     cooldown_until: Optional[datetime] = None
+    equity_high_water_usdt: Optional[float] = None
 
     @property
     def margin_utilization(self) -> float:
@@ -57,6 +58,7 @@ class SystemHealth:
 @dataclass(frozen=True)
 class RiskLimits:
     max_daily_loss_pct: float = 0.02
+    max_equity_drawdown_pct: float = 0.10
     max_gross_leverage: float = 2.0
     max_correlated_exposure_pct: float = 0.35
     max_margin_utilization: float = 0.70
@@ -142,6 +144,13 @@ class RiskGuard:
         daily_pnl = account.realised_pnl_today + account.unrealised_pnl
         if risk_increasing and daily_pnl <= -(account.equity_usdt * self.limits.max_daily_loss_pct):
             return reject("DAILY_LOSS_LIMIT", "daily realised plus unrealised loss reached the limit")
+        high_water = float(account.equity_high_water_usdt or account.equity_usdt)
+        equity_drawdown = (high_water - account.equity_usdt) / high_water if high_water > 0 else float("inf")
+        if risk_increasing and equity_drawdown >= self.limits.max_equity_drawdown_pct:
+            return reject(
+                "EQUITY_DRAWDOWN_LIMIT",
+                f"account equity drawdown {equity_drawdown:.3%} reached the high-water limit",
+            )
         if risk_increasing and account.margin_utilization >= self.limits.max_margin_utilization:
             return reject("MARGIN_UTILIZATION", "account margin utilization reached the limit")
         if risk_increasing and account.consecutive_losses >= self.limits.max_consecutive_losses:

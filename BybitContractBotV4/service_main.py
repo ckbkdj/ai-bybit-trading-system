@@ -50,6 +50,7 @@ class TradingExecutionService:
         self.websocket = None
         limits = RiskLimits(
             max_daily_loss_pct=settings.max_daily_loss_pct,
+            max_equity_drawdown_pct=settings.max_equity_drawdown_pct,
             max_gross_leverage=settings.max_gross_leverage,
             max_correlated_exposure_pct=settings.max_correlated_exposure_pct,
             max_margin_utilization=settings.max_margin_utilization,

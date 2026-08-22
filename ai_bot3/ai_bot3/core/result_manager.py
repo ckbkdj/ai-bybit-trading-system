@@ -65,6 +65,11 @@ _OPTIONAL_PREDICTION_FIELDS = (
     "target_raw_return",
     "expected_leveraged_return",
     "brain_training",
+    "calibration_status",
+    "data_source_reliable",
+    "out_of_distribution_score",
+    "out_of_distribution_details",
+    "factor_scores",
 )
 
 
@@ -97,6 +102,7 @@ class ResultManager:
         *,
         control_plane_db: Path | None = None,
         tickets_enabled: bool | None = None,
+        required_brain_release_stage: str | None = None,
     ):
         self.results_dir = results_dir
         self.results_dir.mkdir(parents=True, exist_ok=True)
@@ -105,10 +111,25 @@ class ResultManager:
                 "1", "true", "yes", "on"
             }
         self.tickets_enabled = bool(tickets_enabled)
+        self.required_brain_release_stage = str(
+            required_brain_release_stage
+            or os.environ.get("AI_BOT_REQUIRED_BRAIN_RELEASE_STAGE", "live")
+        ).strip().lower()
+        if self.required_brain_release_stage not in {"candidate", "live"}:
+            raise ValueError("required_brain_release_stage must be candidate or live")
         default_db = self.results_dir.parent / "data" / "control_plane.sqlite3"
         self.control_plane = ControlPlaneRepository(control_plane_db or default_db)
         self.forecast_adapter = LegacyForecastAdapter()
         self.ticket_builder = TicketBuilder()
+
+    def _brain_authorized_for_ticket(self, prediction: Dict[str, Any]) -> bool:
+        brain = prediction.get("brain_prediction")
+        if not isinstance(brain, dict) or not bool(brain.get("actionable")):
+            return False
+        stage = str(brain.get("release_stage") or "unreviewed").lower()
+        if self.required_brain_release_stage == "live":
+            return stage == "live"
+        return stage in {"candidate", "live"}
 
     def _get_file_path(self, symbol: str, mode: str) -> Path:
         return self.results_dir / f"{symbol}_{mode}.json"
@@ -131,7 +152,7 @@ class ResultManager:
         try:
             forecast = self.forecast_adapter.adapt(symbol, mode, normalized)
             ticket = None
-            if self.tickets_enabled:
+            if self.tickets_enabled and self._brain_authorized_for_ticket(normalized):
                 reference_price = (
                     normalized.get("current_price")
                     or normalized.get("kline_last_price")

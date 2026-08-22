@@ -40,6 +40,7 @@ from .market_context import (
     NEWS_FEATURE_COLUMNS,
 )
 from .data_fetch import MarketDataUnavailable
+from .evaluation.time_series_split import purged_holdout_boundary
 
 
 def _now_iso() -> str:
@@ -157,79 +158,117 @@ def run_training_in_process(prepared_data: Dict[str, Any]):
 
         log.info(f"[{os.getpid()}] 原始数据检查完成。X_scaled 形状: {X_scaled.shape}, y_scaled 形状: {y_scaled.shape}")
 
-        # 防未来函数：序列 X[i:i+window] 只能预测下一根 close[i+window]，
-        # 且时间序列训练不随机打乱，避免验证/训练语义被破坏。
-        # Keras 的 timeseries_dataset_from_array 会把 targets[i] 作为
-        # 第 i 个窗口的标签；因此 data 截到倒数第 2 根，targets 从 window
-        # 开始，严格形成“已收盘窗口 -> 下一根”的监督样本。
-        ds = keras.preprocessing.timeseries_dataset_from_array(
-            data=X_scaled[:-1],
-            targets=y_scaled[window:],
+        validation_fraction = float(prepared_data.get("validation_fraction", 0.2))
+        requested_purge = int(prepared_data.get("validation_purge_bars", window))
+        # A complete sequence window is purged between train and validation. This
+        # deliberately gives up some data to ensure the holdout was never observed
+        # by either model fitting or overlapping feature windows.
+        boundary = purged_holdout_boundary(
+            len(y_scaled),
+            validation_fraction=validation_fraction,
+            minimum_train_size=window + 2,
+            minimum_validation_size=max(8, window // 4),
+            purge_size=max(window, requested_purge),
+        )
+        train_ds = keras.preprocessing.timeseries_dataset_from_array(
+            data=X_scaled[: boundary.train_end - 1],
+            targets=y_scaled[window : boundary.train_end],
             sequence_length=window,
             batch_size=batch,
             shuffle=False,
         )
-        log.info("子进程已启动，ds")
+        validation_context_start = boundary.validation_start - window
+        validation_ds = keras.preprocessing.timeseries_dataset_from_array(
+            data=X_scaled[validation_context_start : boundary.validation_end - 1],
+            targets=y_scaled[boundary.validation_start : boundary.validation_end],
+            sequence_length=window,
+            batch_size=batch,
+            shuffle=False,
+        )
+        log.info(
+            "Purged holdout prepared: train_end=%s validation_start=%s purge=%s",
+            boundary.train_end,
+            boundary.validation_start,
+            boundary.purge_size,
+        )
         input_shape = (window, X_scaled.shape[1])
         log.info("子进程已启动，input_shape")
         model_path = Path(model_path_str)
         log.info(f"子进程已启动，modelpath--{model_path_str}")
-        if model_path.exists():
-            log.info("子进程已启动，load_model")
-            model = keras.models.load_model(str(model_path), compile=True)
-        else:
-            log.info("子进程已启动，build_lstm_functional")
-            model = build_lstm_functional(input_shape)
+        # Never warm-start a validation candidate from a model that may have seen
+        # the holdout in a previous training run.
+        log.info("Building a fresh LSTM validation candidate")
+        model = build_lstm_functional(input_shape)
         log.info("子进程已启动，load ok")
         model.summary(print_fn=log.info)
         log.info("子进程已启动，summary")
-        model.fit(ds, epochs=epochs, verbose=0)
+        callbacks = [
+            keras.callbacks.EarlyStopping(
+                monitor="val_loss",
+                patience=int(prepared_data.get("early_stop_patience", 3)),
+                restore_best_weights=True,
+            ),
+            keras.callbacks.ReduceLROnPlateau(
+                monitor="val_loss",
+                patience=int(prepared_data.get("reduce_lr_patience", 2)),
+                factor=float(prepared_data.get("reduce_lr_factor", 0.5)),
+                min_lr=1e-6,
+            ),
+        ]
+        history = model.fit(
+            train_ds,
+            validation_data=validation_ds,
+            epochs=epochs,
+            callbacks=callbacks,
+            verbose=0,
+        )
         log.info("子进程已启动，fit")
+        # ---- 训练完成元数据返回（每模式训练时间 / 新闻训练摘要 / 校验指标） ----
+        training_finished_at = _now_iso()
+        training_duration_sec = float(time.time() - training_started_ts)
+        try:
+            pred_scaled = model.predict(validation_ds, verbose=0).reshape(-1, 1)
+            target_scaled = y_scaled[boundary.validation_start : boundary.validation_end].reshape(-1, 1)
+            previous_scaled = y_scaled[
+                boundary.validation_start - 1 : boundary.validation_end - 1
+            ].reshape(-1, 1)
+            pred_price = scaler_y.inverse_transform(pred_scaled).reshape(-1)
+            target_price = scaler_y.inverse_transform(target_scaled).reshape(-1)
+            previous_price = scaler_y.inverse_transform(previous_scaled).reshape(-1)
+            valid_price = np.abs(previous_price) > 1e-12
+            predicted_return = np.zeros_like(pred_price)
+            actual_return = np.zeros_like(target_price)
+            predicted_return[valid_price] = (
+                pred_price[valid_price] / previous_price[valid_price] - 1.0
+            )
+            actual_return[valid_price] = (
+                target_price[valid_price] / previous_price[valid_price] - 1.0
+            )
+            rmse = float(np.sqrt(np.mean((predicted_return - actual_return) ** 2)))
+            acc = float(np.mean(np.sign(predicted_return) == np.sign(actual_return)))
+            price_rmse = float(np.sqrt(np.mean((pred_price - target_price) ** 2)))
+        except Exception as exc:
+            raise RuntimeError("purged holdout validation failed; candidate was not saved") from exc
+        if not all(np.isfinite(value) for value in (rmse, acc, price_rmse)):
+            raise RuntimeError("purged holdout metrics are non-finite; candidate was not saved")
+
+        # Only a candidate with a successfully evaluated untouched holdout may
+        # replace the active weak-prior model and scaler.
         log.info("子进程已启动，save start")
         atomic_save_model(model, model_path)
         log.info("子进程已启动，save finish")
         if fit_needed:
-            # 保存 scaler，附带 feature_names，便于在线兼容旧 / 新特征集
             feature_names = prepared_data.get("feature_columns")
             with open(scaler_path_str, "wb") as f:
                 pickle.dump((scaler_X, scaler_y, feature_names), f)
                 log.info(f"新的缩放器已保存到 {scaler_path_str}")
         log.info("子进程训练任务完成，即将退出。")
-        # ---- 训练完成元数据返回（每模式训练时间 / 新闻训练摘要 / 校验指标） ----
-        training_finished_at = _now_iso()
-        training_duration_sec = float(time.time() - training_started_ts)
-        try:
-            # 简易校验：最后 10% 样本的方向命中率
-            split = max(1, int(len(y_scaled) * 0.9))
-            val_X = X_scaled[split:]
-            val_y = y_scaled[split:]
-            if len(val_X) >= window + 1:
-                val_seq = np.asarray(
-                    [val_X[i - window:i] for i in range(window, len(val_X))],
-                    dtype=np.float32,
-                )
-                val_target = val_y[window:]
-                pred = model.predict(val_seq, verbose=0).reshape(-1)
-                val_target = val_target.reshape(-1)
-                rmse = float(np.sqrt(np.mean((pred - val_target) ** 2)))
-                # 方向准确率：相邻样本方向是否一致
-                d_pred = np.sign(np.diff(pred))
-                d_true = np.sign(np.diff(val_target))
-                hits = int(np.sum(d_pred == d_true))
-                acc = hits / max(1, len(d_pred))
-            else:
-                rmse = 0.0
-                acc = 0.0
-        except Exception as exc:
-            log.debug(f"训练后校验跳过: {exc}")
-            rmse = 0.0
-            acc = 0.0
 
         meta = {
             "symbol": sym,
             "mode": prepared_data.get("mode"),
             "timeframe": tf_code,
-            "model_version": "lstm_keras_v1",
+            "model_version": "lstm_keras_v2_purged_holdout",
             "training_started_at": training_started_at,
             "training_finished_at": training_finished_at,
             "training_duration_sec": training_duration_sec,
@@ -247,7 +286,18 @@ def run_training_in_process(prepared_data: Dict[str, Any]):
             "data_end_ts": prepared_data.get("data_end_ts"),
             "kline_augmentation": prepared_data.get("kline_augmentation"),
             "validation_rmse_return": rmse,
+            "validation_rmse_price": price_rmse,
             "validation_direction_acc": acc,
+            "validation": {
+                "kind": "purged_chronological_holdout",
+                "train_rows": int(boundary.train_size),
+                "validation_rows": int(boundary.validation_size),
+                "purge_rows": int(boundary.purge_size),
+                "validation_fraction": validation_fraction,
+                "candidate_warm_started": False,
+                "holdout_seen_during_fit": False,
+                "best_validation_loss": float(min(history.history.get("val_loss", [0.0]))),
+            },
             "feature_columns": prepared_data.get("feature_columns"),
             "news_training_summary": prepared_data.get("news_training_summary"),
         }
@@ -427,6 +477,8 @@ class TrainerDataPreparer:
         return df
 
     async def prepare_data_for_process(self, batch: int, epochs: int) -> Dict[str, Any] | None:
+        train_cfg = (self.cfg.get("training", {}) or {})
+        historical_kline_only = bool(train_cfg.get("historical_kline_only", True))
         try:
             df = await self._feature_df()
         except MarketDataUnavailable as exc:
@@ -456,9 +508,9 @@ class TrainerDataPreparer:
             ]
 
         scaler_X, scaler_y = None, None
-        fit_needed = False
+        fit_needed = bool(train_cfg.get("strict_refit_scaler", True))
         prev_feature_names = None
-        if self.scaler_path.exists():
+        if self.scaler_path.exists() and not fit_needed:
             try:
                 with open(self.scaler_path, "rb") as f:
                     bundle = pickle.load(f)
@@ -481,12 +533,22 @@ class TrainerDataPreparer:
 
         X_raw, y_raw = df[feats].values, df[["close"]].values
 
-        # 防泄漏：scaler 只能拟合训练段，不能用完整训练+验证数据拟合。
-        # 若已有兼容 scaler，则沿用；首次/列变更时仅用前 80% 时间序列样本 fit。
+        # Candidate scalers are fit only on the training partition. Reusing a
+        # historical scaler is opt-in because its extrema may include the holdout.
         if fit_needed:
-            split_idx = max(1, int(len(X_raw) * 0.8))
-            scaler_X.fit(X_raw[:split_idx])
-            scaler_y.fit(y_raw[:split_idx])
+            validation_fraction = float(train_cfg.get("validation_fraction", 0.2))
+            scaler_boundary = purged_holdout_boundary(
+                len(X_raw),
+                validation_fraction=validation_fraction,
+                minimum_train_size=self.window + 2,
+                minimum_validation_size=max(8, self.window // 4),
+                purge_size=max(
+                    self.window,
+                    int(train_cfg.get("validation_purge_bars", self.window)),
+                ),
+            )
+            scaler_X.fit(X_raw[: scaler_boundary.train_end])
+            scaler_y.fit(y_raw[: scaler_boundary.train_end])
             X_scaled = scaler_X.transform(X_raw)
             y_scaled = scaler_y.transform(y_raw)
         else:
@@ -513,6 +575,11 @@ class TrainerDataPreparer:
             "X_scaled": X_scaled, "y_scaled": y_scaled,
             "window": self.window, "batch": batch, "epochs": epochs,
             "fit_needed": fit_needed, "scaler_X": scaler_X, "scaler_y": scaler_y,
+            "validation_fraction": float(train_cfg.get("validation_fraction", 0.2)),
+            "validation_purge_bars": int(train_cfg.get("validation_purge_bars", self.window)),
+            "early_stop_patience": int(train_cfg.get("early_stop_patience", 3)),
+            "reduce_lr_patience": int(train_cfg.get("reduce_lr_patience", 2)),
+            "reduce_lr_factor": float(train_cfg.get("reduce_lr_factor", 0.5)),
             "feature_columns": feats,
             "samples": int(len(y_scaled)),
             "news_training_summary": news_summary,

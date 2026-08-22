@@ -153,6 +153,12 @@ class ExecutionStore:
                     kill_switch INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS equity_runtime(
+                    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                    equity_high_water_usdt REAL NOT NULL,
+                    latest_equity_usdt REAL NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS receipt_outbox(
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                     receipt_id TEXT NOT NULL UNIQUE,
@@ -797,6 +803,29 @@ class ExecutionStore:
             "kill_switch": 0,
             "updated_at": iso(utc_now()),
         }
+
+    def observe_equity(self, equity_usdt: float) -> float:
+        """Persist and return the monotonic account-equity high-water mark."""
+        observed = float(equity_usdt)
+        if observed <= 0:
+            raise ValueError("equity observation must be positive")
+        now = iso(utc_now())
+        with self.transaction(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT equity_high_water_usdt FROM equity_runtime WHERE singleton=1"
+            ).fetchone()
+            high_water = max(observed, float(row["equity_high_water_usdt"]) if row else observed)
+            connection.execute(
+                """INSERT INTO equity_runtime(
+                    singleton, equity_high_water_usdt, latest_equity_usdt, updated_at
+                ) VALUES (1, ?, ?, ?)
+                ON CONFLICT(singleton) DO UPDATE SET
+                    equity_high_water_usdt=excluded.equity_high_water_usdt,
+                    latest_equity_usdt=excluded.latest_equity_usdt,
+                    updated_at=excluded.updated_at""",
+                (high_water, observed, now),
+            )
+        return high_water
 
     def update_risk_runtime(
         self,

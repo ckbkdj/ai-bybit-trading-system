@@ -14,6 +14,9 @@
 8. 慢研究：持久任务、checkpoint、revision、来源分级、去重、实体、情景和 EventImpactVector。
 9. 评估：walk-forward/purge/embargo、成本与部分成交、预测/交易指标、因子组消融。
 10. 服务与验证：薄控制面、薄交易入口、本机 HTTP 影子 E2E、20 项验收和运维/主网门禁。
+11. 模型治理：purged holdout、训练段 scaler、研究 trial ledger、Deflated Sharpe、显式模型 stage 与人工证据晋升。
+12. AI 到出票：Brain 正式方向、在线校准状态、OOD、来源可靠性、因子组得分和默认 live-only 门禁。
+13. 组合证据与风控：历史非重叠成本复放、证据缺口报告、持久净值高水位和最大回撤熔断。
 
 ## 有意保留且未自动执行
 

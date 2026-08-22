@@ -49,6 +49,7 @@ class ControlPlaneApiTests(unittest.TestCase):
                 "data_source_reliable": True,
                 "context_completeness": {"score": 0.96},
                 "out_of_distribution_score": 0.1,
+                "calibration_status": "valid",
                 "current_price_age_seconds": 5,
                 "market_regime": "risk_on",
                 "model_version": "api-test-model",
