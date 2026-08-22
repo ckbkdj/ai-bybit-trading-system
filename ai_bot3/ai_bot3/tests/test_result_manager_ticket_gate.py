@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import sys
 import tempfile
@@ -73,3 +74,20 @@ def test_candidate_stage_requires_explicit_testnet_policy():
         )
         asyncio.run(manager.save_result("BTCUSDT", "scalping", _prediction("candidate")))
         assert _counts(db) == (1, 1)
+
+
+def test_prediction_file_is_atomic_and_read_does_not_refresh_its_age():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        manager = ResultManager(
+            root / "results",
+            control_plane_db=root / "control.sqlite3",
+            tickets_enabled=False,
+        )
+        asyncio.run(manager.save_result("BTCUSDT", "scalping", _prediction("shadow")))
+        path = root / "results" / "BTCUSDT_scalping.json"
+        first = json.loads(path.read_text(encoding="utf-8"))
+        loaded = manager.get_latest_results()["BTCUSDT"]["details"]["scalping"]
+        assert loaded["saved_at"] == first["saved_at"]
+        assert loaded["updated_at"] == first["updated_at"]
+        assert list((root / "results").glob("*.tmp")) == []

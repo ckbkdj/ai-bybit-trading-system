@@ -145,15 +145,25 @@ class BybitExecutor:
         return SubmissionResult(target_link_id, bybit_order_id, response, True)
 
     def submit_take_profits(
-        self, ticket: OperationTicket, rules: InstrumentRules
+        self,
+        ticket: OperationTicket,
+        rules: InstrumentRules,
+        *,
+        position_quantity: Decimal | None = None,
     ) -> tuple[SubmissionResult, ...]:
         """Install deterministic reduce-only TP children after the entry is fully filled."""
         if not ticket.protection or not ticket.protection.take_profit:
             return ()
         entry = self.store.order(order_link_id(ticket.ticket_id, "entry"))
-        if not entry or str(entry.get("order_status")).upper() != "FILLED":
-            raise ValueError("take-profit orders require a fully filled entry")
-        total_quantity = decimal(entry["cum_exec_qty"])
+        if not entry or decimal(entry.get("cum_exec_qty") or 0) <= 0:
+            raise ValueError("take-profit orders require a filled entry quantity")
+        total_quantity = (
+            decimal(position_quantity)
+            if position_quantity is not None
+            else decimal(entry["cum_exec_qty"])
+        )
+        if total_quantity <= 0:
+            raise ValueError("take-profit orders require a live position quantity")
         exit_side = "SELL" if ticket.intent.side == "BUY" else "BUY"
         results = []
         for index, level in enumerate(ticket.protection.take_profit, start=1):
@@ -204,3 +214,58 @@ class BybitExecutor:
             self.store.record_exit_submission(link_id, bybit_order_id, response)
             results.append(SubmissionResult(link_id, bybit_order_id, response, True))
         return tuple(results)
+
+    def submit_time_exit(
+        self,
+        ticket: OperationTicket,
+        *,
+        position_quantity: Decimal,
+    ) -> SubmissionResult:
+        """Close an overdue position once with a deterministic reduce-only market order."""
+
+        quantity = decimal(position_quantity)
+        if quantity <= 0:
+            raise ValueError("time exit requires a positive live position quantity")
+        role = "time_exit_1"
+        link_id = order_link_id(ticket.ticket_id, role)
+        exit_side = "SELL" if ticket.intent.side == "BUY" else "BUY"
+        reserved = self.store.reserve_exit_order(
+            ticket.ticket_id,
+            link_id,
+            role=role,
+            side=exit_side,
+            order_type="MARKET",
+            quantity=float(quantity),
+            price=None,
+        )
+        if not reserved:
+            existing = self.store.order(link_id) or {}
+            return SubmissionResult(
+                link_id,
+                existing.get("bybit_order_id"),
+                {"idempotent_replay": True},
+                False,
+            )
+        self.rate_limiter.acquire(self.uid, "POST:/v5/order/create")
+        try:
+            response = self.client.create_ticket_order(
+                symbol=ticket.instrument.symbol,
+                side=exit_side,
+                order_type="MARKET",
+                amount=quantity,
+                price=None,
+                leverage=Decimal("1"),
+                order_link_id=link_id,
+                reduce_only=True,
+                time_in_force="IOC",
+            )
+        except Exception as exc:
+            raise AmbiguousSubmission(
+                f"time-exit outcome must be reconciled for {link_id}: {exc}"
+            ) from exc
+        self._update_rate_headers("POST:/v5/order/create")
+        if not isinstance(response, dict):
+            response = {"raw": repr(response)}
+        bybit_order_id = self._extract_order_id(response)
+        self.store.record_exit_submission(link_id, bybit_order_id, response)
+        return SubmissionResult(link_id, bybit_order_id, response, True)

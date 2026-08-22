@@ -41,6 +41,11 @@ from .market_context import (
 )
 from .data_fetch import MarketDataUnavailable
 from .brain_model import predict_brain_from_df
+from .kline_feature_store import (
+    KLINE_DERIVED_FEATURES,
+    add_kline_derived_features,
+    select_persisted_features,
+)
 from .model_monitoring import factor_group_scores, scaled_feature_ood_score, source_is_reliable
 
 
@@ -218,7 +223,7 @@ def _calculate_metrics(
 
     llm_payload = (extras or {}).get("openai_prediction") or {}
     llm_signal = float(llm_payload.get("score") or 0.0)
-    news_signal = float(snapshot.get("news_context_score") or 0.0)
+    news_signal = float(bias["components"].get("news_signal") or 0.0)
 
     fused = fuse_direction_signals(
         local_predicted_return=predicted_return,
@@ -226,6 +231,7 @@ def _calculate_metrics(
         news_signal=news_signal,
         llm_signal=llm_signal,
         completeness=completeness,
+        llm_available=str(llm_payload.get("status") or "").lower() == "ok",
     )
     out["ensemble_score"] = fused["fused_score"]
     out["fused_weights"] = fused["fused_weights"]
@@ -575,6 +581,11 @@ class InferencerDataPreparer:
                 continue
             df[col] = float(snap.get(col, 0.0))
 
+        # 与训练共用同一套 K 线派生特征，并保持训练期的一根 K 线反泄漏位移。
+        # 旧模型若未使用这些列不会受到影响；新版 scaler 会按持久化列名取值。
+        df = add_kline_derived_features(df)
+        df[list(KLINE_DERIVED_FEATURES)] = df[list(KLINE_DERIVED_FEATURES)].shift(1)
+
         # 保留行情数据源元信息，供 prepare_data / inference 透传到结果。
         src_attrs = dict(getattr(df, "attrs", {}) or {})
 
@@ -616,18 +627,12 @@ class InferencerDataPreparer:
         default_features = ["open", "high", "low", "close", "volume", "ma", "rsi", "boll_upper", "boll_middle", "boll_lower",
                             "macd", "macdsignal", "macdhist", "funding_rate", "long_short_ratio", "news_sentiment"]
         features = list(persisted_features) if persisted_features else default_features
-        # 缺失列补 0，避免 KeyError
-        for col in features:
-            if col not in df.columns:
-                df[col] = 0.0
-        X_raw = df[features].values
         try:
+            X_raw = select_persisted_features(df, features)
             X_scaled = scaler_X.transform(X_raw)
         except Exception as exc:
-            self.log.warning(f"scaler 维度不匹配，回退默认列: {exc}")
-            features = default_features
-            X_raw = df[features].values
-            X_scaled = scaler_X.transform(X_raw)
+            self.log.error(f"训练/推理特征契约不一致，拒绝预测: {exc}")
+            return None
         X_seq = np.asarray([X_scaled[i - self.window:i] for i in range(self.window, len(df))], dtype=np.float32)
         if X_seq.size == 0:
             self.log.warning("X_seq 为空，跳过预测")
@@ -671,22 +676,6 @@ class InferencerDataPreparer:
         if current_meta.get("current_price_warning"):
             self.log.warning(f"当前价来源告警: {current_meta.get('current_price_warning')}")
 
-        # ---- 在线学习校准（如有） ----
-        online_payload = None
-        if self.calibrator is not None:
-            try:
-                last_price = current_price_for_metrics
-                # 这里只做粗略 predicted_return，真正校准在子进程里再次合并
-                # 因为 prepared_data 通过子进程跨进程传递，calibrator 必须在父进程完成 calibrate
-                tentative_return = float(market_snapshot.get("liquidation_imbalance") or 0.0) * 0.0005
-                online_payload = self.calibrator.calibrate(
-                    self.sym, self.tf_code, self.mode,
-                    tentative_return,
-                    last_price,
-                )
-            except Exception as exc:
-                self.log.debug(f"在线学习校准失败: {exc}")
-
         if current_meta.get("current_price_warning") and current_meta.get("current_price") is None:
             self.log.warning(f"当前价不可用，回退K线收盘价: {current_meta.get('current_price_warning')}")
 
@@ -722,7 +711,10 @@ class InferencerDataPreparer:
             "market_snapshot": market_snapshot,
             "context_completeness": completeness,
             "openai_prediction": openai_payload,
-            "online_calibration": online_payload,
+            # Calibration is applied by Portfolio only after the worker has
+            # produced the real model return.  A proxy factor must never be
+            # presented as calibration of the model output.
+            "online_calibration": None,
             "loaded_model_metadata": loaded_model_metadata,
             "data_sources_generated_at": self._collect_source_times(),
             # 行情数据源溯源（由 data_fetch.get_ohlcv 写入 df.attrs）

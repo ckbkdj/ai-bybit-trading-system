@@ -3,10 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Iterator, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -18,6 +19,34 @@ SCALER_VERSION = "standard_train_split_v1"
 FORBIDDEN_HISTORICAL_FEATURE_KEYS = (
     "news", "funding", "long_short", "longshort", "liquidation", "llm", "snapshot", "market_snapshot"
 )
+
+
+class FeatureStoreIntegrityError(RuntimeError):
+    """Raised when SQLite evidence cannot be trusted or read consistently."""
+
+
+class FeatureContractError(RuntimeError):
+    """Raised when live data cannot satisfy the feature contract saved at training."""
+
+
+def select_persisted_features(frame: pd.DataFrame, feature_names: Sequence[str]) -> np.ndarray:
+    """Select the exact ordered feature set persisted with a trained model.
+
+    Production inference must not invent missing inputs with zeroes: doing so
+    changes the model's meaning and hides train/serve skew.
+    """
+
+    names = list(feature_names)
+    missing = [name for name in names if name not in frame.columns]
+    if missing:
+        preview = ", ".join(missing[:8])
+        raise FeatureContractError(
+            f"live frame is missing {len(missing)} trained features: {preview}"
+        )
+    values = frame[names].to_numpy()
+    if not np.isfinite(values).all():
+        raise FeatureContractError("live trained-feature matrix contains non-finite values")
+    return values
 
 
 def _now_iso() -> str:
@@ -45,6 +74,58 @@ def _config_hash(cfg: Dict[str, Any]) -> str:
         "brain_model": cfg.get("brain_model"),
     }
     return _stable_hash(relevant)
+
+
+KLINE_DERIVED_FEATURES = (
+    "ret_1", "ret_3", "ret_6", "logret_1", "range_pct", "body_pct",
+    "upper_wick_pct", "lower_wick_pct", "volume_zscore", "atr_pct",
+    "realized_vol_12", "realized_vol_24", "ema_gap_8_21",
+    "ma_gap_21_55", "boll_pos", "trend_strength",
+)
+
+
+def add_kline_derived_features(frame: pd.DataFrame) -> pd.DataFrame:
+    """One feature definition shared by historical training and live inference."""
+
+    output = frame.copy()
+    close = pd.to_numeric(output["close"], errors="coerce").astype(float).replace(0, np.nan)
+    open_ = pd.to_numeric(output["open"], errors="coerce").astype(float).replace(0, np.nan)
+    high = pd.to_numeric(output["high"], errors="coerce").astype(float)
+    low = pd.to_numeric(output["low"], errors="coerce").astype(float)
+    volume = pd.to_numeric(output["volume"], errors="coerce").astype(float).fillna(0.0)
+    output["ret_1"] = close.pct_change(1)
+    output["ret_3"] = close.pct_change(3)
+    output["ret_6"] = close.pct_change(6)
+    output["logret_1"] = np.log(close / close.shift(1))
+    output["range_pct"] = (high - low) / close
+    output["body_pct"] = (close - open_) / open_
+    output["upper_wick_pct"] = (high - np.maximum(open_, close)) / close
+    output["lower_wick_pct"] = (np.minimum(open_, close) - low) / close
+    output["volume_zscore"] = (
+        (volume - volume.rolling(48, min_periods=8).mean())
+        / (volume.rolling(48, min_periods=8).std() + 1e-9)
+    )
+    true_range = pd.concat(
+        [(high - low), (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1
+    ).max(axis=1)
+    output["atr_pct"] = true_range.rolling(14, min_periods=4).mean() / close
+    output["realized_vol_12"] = close.pct_change().rolling(12, min_periods=6).std()
+    output["realized_vol_24"] = close.pct_change().rolling(24, min_periods=8).std()
+    ema8 = close.ewm(span=8, adjust=False, min_periods=4).mean()
+    ema21 = close.ewm(span=21, adjust=False, min_periods=8).mean()
+    output["ema_gap_8_21"] = ema8 / (ema21 + 1e-9) - 1
+    output["ma_gap_21_55"] = (
+        close.rolling(21, min_periods=8).mean()
+        / (close.rolling(55, min_periods=16).mean() + 1e-9)
+        - 1
+    )
+    middle = close.rolling(20, min_periods=8).mean()
+    std = close.rolling(20, min_periods=8).std()
+    upper = middle + 2 * std
+    lower = middle - 2 * std
+    output["boll_pos"] = (close - lower) / (upper - lower + 1e-9)
+    output["trend_strength"] = close.pct_change(12) / (output["realized_vol_24"] + 1e-9)
+    return output.replace([np.inf, -np.inf], np.nan)
 
 
 @dataclass(frozen=True)
@@ -108,12 +189,23 @@ class KlineFeatureStore:
         self.cfg = cfg or {}
         self.fetcher = fetcher
         self.source = source
+        if self.db_path.exists() and self.db_path.stat().st_size > 0:
+            self.assert_database_integrity()
         self.ensure_schema()
 
-    def _connect(self) -> sqlite3.Connection:
-        con = sqlite3.connect(str(self.db_path))
-        con.row_factory = sqlite3.Row
-        return con
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Yield one bounded connection and always release its Windows handle."""
+
+        connection = sqlite3.connect(str(self.db_path))
+        connection.row_factory = sqlite3.Row
+        try:
+            yield connection
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def ensure_schema(self) -> None:
         with self._connect() as con:
@@ -160,6 +252,20 @@ class KlineFeatureStore:
                 )
             """)
             con.commit()
+
+    def assert_database_integrity(self) -> None:
+        """Run SQLite's non-mutating quick check once before using existing evidence."""
+
+        try:
+            with self._connect() as connection:
+                findings = [str(row[0]) for row in connection.execute("PRAGMA quick_check")]
+        except sqlite3.DatabaseError as exc:
+            raise FeatureStoreIntegrityError(
+                f"feature store quick_check failed: {exc}"
+            ) from exc
+        if findings != ["ok"]:
+            detail = "; ".join(findings[:10]) or "no quick_check result"
+            raise FeatureStoreIntegrityError(f"feature store integrity failure: {detail}")
 
     def load_mode_specs(self, symbols: Sequence[str] | None = None) -> list[ModeSpec]:
         syms = list(symbols or (self.cfg.get("general", {}) or {}).get("symbols") or [])
@@ -258,31 +364,8 @@ class KlineFeatureStore:
         if df.empty:
             return df.copy(), _stable_hash([])
         x = df.copy().sort_values("open_time").reset_index(drop=True)
-        close = pd.to_numeric(x["close"], errors="coerce").astype(float).replace(0, np.nan)
-        open_ = pd.to_numeric(x["open"], errors="coerce").astype(float).replace(0, np.nan)
-        high = pd.to_numeric(x["high"], errors="coerce").astype(float)
-        low = pd.to_numeric(x["low"], errors="coerce").astype(float)
-        volume = pd.to_numeric(x["volume"], errors="coerce").astype(float).fillna(0.0)
-        feats = pd.DataFrame(index=x.index)
-        feats["ret_1"] = close.pct_change(1)
-        feats["ret_3"] = close.pct_change(3)
-        feats["ret_6"] = close.pct_change(6)
-        feats["logret_1"] = np.log(close / close.shift(1))
-        feats["range_pct"] = (high - low) / close
-        feats["body_pct"] = (close - open_) / open_
-        feats["upper_wick_pct"] = (high - np.maximum(open_, close)) / close
-        feats["lower_wick_pct"] = (np.minimum(open_, close) - low) / close
-        feats["volume_zscore"] = (volume - volume.rolling(48, min_periods=8).mean()) / (volume.rolling(48, min_periods=8).std() + 1e-9)
-        tr = pd.concat([(high-low), (high-close.shift(1)).abs(), (low-close.shift(1)).abs()], axis=1).max(axis=1)
-        feats["atr_pct"] = tr.rolling(14, min_periods=4).mean() / close
-        feats["realized_vol_12"] = close.pct_change().rolling(12, min_periods=6).std()
-        feats["realized_vol_24"] = close.pct_change().rolling(24, min_periods=8).std()
-        ema8 = close.ewm(span=8, adjust=False, min_periods=4).mean(); ema21 = close.ewm(span=21, adjust=False, min_periods=8).mean()
-        feats["ema_gap_8_21"] = ema8 / (ema21 + 1e-9) - 1
-        feats["ma_gap_21_55"] = close.rolling(21, min_periods=8).mean() / (close.rolling(55, min_periods=16).mean() + 1e-9) - 1
-        mid = close.rolling(20, min_periods=8).mean(); std = close.rolling(20, min_periods=8).std(); upper = mid + 2*std; lower = mid - 2*std
-        feats["boll_pos"] = (close - lower) / (upper - lower + 1e-9)
-        feats["trend_strength"] = close.pct_change(12) / (feats["realized_vol_24"] + 1e-9)
+        augmented = add_kline_derived_features(x)
+        feats = augmented[list(KLINE_DERIVED_FEATURES)]
         self._validate_feature_columns(feats.columns)
         out = pd.concat([x[["open_time","close_time","open","high","low","close","volume"]], feats], axis=1).replace([np.inf,-np.inf], np.nan)
         return out, _stable_hash(list(feats.columns), 16)
@@ -361,8 +444,13 @@ class KlineFeatureStore:
         sql = """SELECT open_time,close_time,open,high,low,close,volume,features_json,feature_set_hash
                  FROM enhanced_kline WHERE symbol=? AND timeframe=? AND source=? AND feature_version=? AND config_hash=? AND schema_version=?
                  ORDER BY open_time ASC"""
-        with self._connect() as con:
-            rows = con.execute(sql, (symbol, timeframe, self.source, spec.feature_version, spec.config_hash, SCHEMA_VERSION)).fetchall()
+        try:
+            with self._connect() as con:
+                rows = con.execute(sql, (symbol, timeframe, self.source, spec.feature_version, spec.config_hash, SCHEMA_VERSION)).fetchall()
+        except sqlite3.DatabaseError as exc:
+            raise FeatureStoreIntegrityError(
+                f"enhanced feature evidence is unreadable for {symbol}-{timeframe}: {exc}"
+            ) from exc
         records = []
         for r in rows:
             d = dict(r); fj = json.loads(d.pop("features_json") or "{}"); d.update(fj); records.append(d)
@@ -406,7 +494,8 @@ class KlineFeatureStore:
             raise ValueError(f"raw/label columns cannot be model features: {sorted(raw_leaks)}")
         ds = frame.copy().sort_values("close_time").reset_index(drop=True)
         if shift_features:
-            ds[feature_cols] = ds[feature_cols].shift(1)
+            shifted = ds[feature_cols].shift(1)
+            ds = pd.concat([ds.drop(columns=feature_cols), shifted], axis=1).copy()
         horizon = max(1, int(spec.label_horizon))
         ds["future_return"] = ds["close"].shift(-horizon) / ds["close"] - 1.0
         ds = ds.dropna(subset=feature_cols + ["future_return"]).reset_index(drop=True)

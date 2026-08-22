@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import yaml
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -53,7 +54,7 @@ def test_lstm_training_dataset_is_chronological_and_next_close_aligned():
     assert ast.unparse(fit_kwargs["validation_data"]) == "validation_ds"
 
 
-def test_brain_features_are_shifted_for_training_to_avoid_future_leakage():
+def test_brain_kline_features_have_identical_lag_in_training_and_inference():
     try:
         from core.brain_model import build_brain_features
     except ModuleNotFoundError as exc:
@@ -70,12 +71,24 @@ def test_brain_features_are_shifted_for_training_to_avoid_future_leakage():
         "volume": np.linspace(1000, 2000, len(idx)),
     }, index=idx)
     cfg = {"brain_model": {"historical_kline_only": True, "anti_leakage_shift_features": 1}}
-    shifted = build_brain_features(df, "scalping", "BTCUSDT", cfg=cfg)
-    unshifted = build_brain_features(df, "scalping", "BTCUSDT", market_snapshot={}, cfg=cfg)
-    # ret_1 at t in shifted training features equals unshifted ret_1 from t-1.
-    assert np.isclose(shifted["ret_1"].iloc[-1], unshifted["ret_1"].iloc[-2])
+    training = build_brain_features(df, "scalping", "BTCUSDT", cfg=cfg)
+    inference = build_brain_features(df, "scalping", "BTCUSDT", market_snapshot={}, cfg=cfg)
+    # Merely supplying a live snapshot cannot change the OHLCV time alignment.
+    for col in ["ret_1", "ret_12", "volume_zscore", "atr_pct", "trend_strength"]:
+        assert np.allclose(training[col], inference[col])
     for col in ["snap_funding_rate", "snap_long_short_ratio", "snap_liquidation_imbalance"]:
-        assert float(shifted[col].abs().max()) == 0.0
+        assert float(training[col].abs().max()) == 0.0
+
+    live_cfg = {"brain_model": {"historical_kline_only": False, "anti_leakage_shift_features": 1}}
+    live = build_brain_features(
+        df,
+        "scalping",
+        "BTCUSDT",
+        market_snapshot={"funding_rate": 0.001, "long_short_ratio": 1.2},
+        cfg=live_cfg,
+    )
+    assert np.allclose(training["ret_1"], live["ret_1"])
+    assert np.isclose(live["snap_funding_rate"].iloc[-1], 0.001)
 
 
 def test_trainer_declares_kline_only_no_news_policy():
@@ -84,3 +97,18 @@ def test_trainer_declares_kline_only_no_news_policy():
     assert "ohlcv_kline_only" in text
     assert "disabled_for_training_anti_leakage" in text
     assert "ret_1" in text and "atr_pct" in text and "boll_pos" in text
+
+
+def test_online_calibration_is_applied_after_real_model_return_exists():
+    inferencer = (ROOT / "core" / "inferencer3_fixed.py").read_text(encoding="utf-8")
+    portfolio = (ROOT / "core" / "portfolio3_3_fixed.py").read_text(encoding="utf-8")
+    assert "tentative_return" not in inferencer
+    assert 'float(result.get("predicted_return") or 0.0)' in portfolio
+
+
+def test_live_feature_contract_rejects_missing_trained_columns():
+    from core.kline_feature_store import FeatureContractError, select_persisted_features
+
+    frame = pd.DataFrame({"ret_1": [0.1], "atr_pct": [0.02]})
+    with pytest.raises(FeatureContractError, match="missing 1 trained features"):
+        select_persisted_features(frame, ["ret_1", "atr_pct", "mtf_15m_ret_1"])

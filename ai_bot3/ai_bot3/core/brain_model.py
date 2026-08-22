@@ -289,6 +289,15 @@ def build_brain_features(df: pd.DataFrame, mode: str, symbol: str, market_snapsh
     feat["realized_vol_24"] = close.pct_change().rolling(24, min_periods=8).std()
     feat["trend_strength"] = close.pct_change(12) / (feat["realized_vol_24"] + 1e-9)
     feat["mode_id"] = {"scalping": 1, "mid_short": 2, "trend": 3, "trend_swing": 4, "swing": 5}.get(mode, 0)
+
+    # Kline features must have identical point-in-time semantics in training
+    # and inference.  A supplied live snapshot must never disable the lag for
+    # the unrelated OHLCV columns (the previous implementation did exactly
+    # that and created train/serve skew).
+    shift_n = int(bc.get("anti_leakage_shift_features", 1) or 0)
+    if shift_n > 0:
+        feat = feat.shift(shift_n)
+
     # 当前快照只允许作为推理门控；训练集特征默认保持中性，避免把“今天”的市场快照泄漏到历史样本。
     snap = {}
     if not bool(bc.get("historical_kline_only", True)):
@@ -298,12 +307,6 @@ def build_brain_features(df: pd.DataFrame, mode: str, symbol: str, market_snapsh
             feat[f"snap_{key}"] = float(snap.get(key, 0.0) or 0.0)
         except Exception:
             feat[f"snap_{key}"] = 0.0
-    shift_n = int(bc.get("anti_leakage_shift_features", 1) or 0)
-    if shift_n > 0:
-        # 训练标签是 t -> t+horizon，特征整体 shift(1) 后只使用 t-1 已收盘以前的信息。
-        # 推理传入 market_snapshot 时不 shift，保留当前已知快照作为实时门控。
-        if market_snapshot is None:
-            feat = feat.shift(shift_n)
     feat = feat.replace([np.inf, -np.inf], np.nan).fillna(0.0)
     return feat.astype(np.float32)
 

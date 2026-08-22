@@ -32,6 +32,7 @@ class AccountSnapshot:
     consecutive_losses: int = 0
     cooldown_until: Optional[datetime] = None
     equity_high_water_usdt: Optional[float] = None
+    risk_metrics_healthy: bool = True
 
     @property
     def margin_utilization(self) -> float:
@@ -96,9 +97,9 @@ class RiskGuard:
         def reject(code: str, detail: str) -> RiskDecision:
             return RiskDecision(False, code, detail, tuple(checks))
 
-        if health.kill_switch:
+        if risk_increasing and health.kill_switch:
             return reject("KILL_SWITCH", "system kill switch is enabled")
-        checks.append("kill_switch")
+        checks.append("kill_switch_allows_risk_reduction" if health.kill_switch else "kill_switch")
         if current < ticket.valid_from:
             return reject("NOT_YET_VALID", "ticket valid_from is in the future")
         if current >= ticket.expires_at:
@@ -121,7 +122,12 @@ class RiskGuard:
                 return reject("POSITION_VERSION_CONFLICT", "position version no longer matches the ticket")
             if abs(health.exchange_clock_drift_sec) > self.limits.max_exchange_clock_drift_sec:
                 return reject("CLOCK_DRIFT", "exchange clock drift exceeds the limit")
-            if health.mode != "shadow" and self.limits.require_websocket_confirmation and not health.websocket_confirmed:
+            if (
+                risk_increasing
+                and health.mode != "shadow"
+                and self.limits.require_websocket_confirmation
+                and not health.websocket_confirmed
+            ):
                 return reject("WEBSOCKET_UNCONFIRMED", "private WebSocket health is not confirmed")
             return RiskDecision(True, "APPROVED", "cancel risk checks passed", tuple(checks))
         if market.last_price <= 0 or market.bid_price <= 0 or market.ask_price <= 0:
@@ -139,8 +145,13 @@ class RiskGuard:
         if risk_increasing and market.market_regime != ticket.guards.observed_market_regime:
             return reject("REGIME_CHANGED", "market regime changed after ticket creation")
         checks.append("regime")
-        if account.equity_usdt <= 0 or account.free_margin_usdt < 0:
+        if risk_increasing and (account.equity_usdt <= 0 or account.free_margin_usdt < 0):
             return reject("ACCOUNT_EQUITY_INVALID", "account equity or free margin is invalid")
+        if risk_increasing and not account.risk_metrics_healthy:
+            return reject(
+                "ACCOUNT_RISK_METRICS_UNAVAILABLE",
+                "daily account PnL and loss-streak evidence is unavailable",
+            )
         daily_pnl = account.realised_pnl_today + account.unrealised_pnl
         if risk_increasing and daily_pnl <= -(account.equity_usdt * self.limits.max_daily_loss_pct):
             return reject("DAILY_LOSS_LIMIT", "daily realised plus unrealised loss reached the limit")
@@ -162,16 +173,21 @@ class RiskGuard:
             return reject("POSITION_VERSION_CONFLICT", "position version no longer matches the ticket")
         if risk_increasing and ticket.guards.require_flat_position and abs(portfolio.current_position_qty) > 1e-12:
             return reject("POSITION_NOT_FLAT", "ticket requires a flat position")
-        gross_leverage = portfolio.gross_notional_usdt / account.equity_usdt
-        if risk_increasing and gross_leverage >= self.limits.max_gross_leverage:
-            return reject("GROSS_LEVERAGE_LIMIT", "portfolio gross leverage reached the limit")
-        correlated_pct = portfolio.same_direction_correlated_notional_usdt / account.equity_usdt
-        if risk_increasing and correlated_pct >= self.limits.max_correlated_exposure_pct:
-            return reject("CORRELATED_EXPOSURE", "same-direction correlated exposure reached the limit")
+        if risk_increasing:
+            gross_leverage = portfolio.gross_notional_usdt / account.equity_usdt
+            if gross_leverage >= self.limits.max_gross_leverage:
+                return reject("GROSS_LEVERAGE_LIMIT", "portfolio gross leverage reached the limit")
+            correlated_pct = (
+                portfolio.same_direction_correlated_notional_usdt / account.equity_usdt
+            )
+            if correlated_pct >= self.limits.max_correlated_exposure_pct:
+                return reject("CORRELATED_EXPOSURE", "same-direction correlated exposure reached the limit")
         checks.append("portfolio")
-        if abs(health.exchange_clock_drift_sec) > self.limits.max_exchange_clock_drift_sec:
+        if risk_increasing and abs(health.exchange_clock_drift_sec) > self.limits.max_exchange_clock_drift_sec:
             return reject("CLOCK_DRIFT", "exchange clock drift exceeds the limit")
         if (
+            risk_increasing
+            and
             health.mode != "shadow"
             and self.limits.require_websocket_confirmation
             and not health.websocket_confirmed

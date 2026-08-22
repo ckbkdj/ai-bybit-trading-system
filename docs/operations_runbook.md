@@ -27,6 +27,8 @@ AI_BOT_REQUIRED_BRAIN_RELEASE_STAGE=live
 
 API key、secret、token 和 webhook 只在安全机器上通过环境或 `.env.local` 注入。任何曾写入旧源码或日志的凭证均按已泄露处理并轮换。
 
+主网还必须设置非空 `BYBIT_LIVE_APPROVAL_ID`，用于把本次启动绑定到人工批准/变更单；仅设置 `BYBIT_ENABLE_LIVE=true` 不足以启动 live。
+
 ## 2. 启动顺序
 
 1. 启动预测控制面：在 `ai_bot3/ai_bot3` 下执行 `python -m uvicorn api.control_plane_main:app --host 内网IP --port 8000`。

@@ -14,7 +14,7 @@ WORKSPACE = ROOT.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(WORKSPACE))
 
-from bybit import BybitClient
+from exchange_gateway import ExchangeGateway
 from bybit_executor import BybitExecutor
 from contracts.common import order_link_id
 from contracts.operation_ticket_v1 import OperationTicket
@@ -27,9 +27,12 @@ from risk_guard import (
     AccountSnapshot,
     MarketSnapshot,
     PortfolioSnapshot,
+    RiskGuard,
     SystemHealth,
 )
 from sizing import InstrumentRules, PositionSizer
+from runtime_context import BybitRuntimeContext
+from service_main import TradingExecutionService
 from ticket_consumer import TicketConsumer
 from ticket_store import ExecutionStore
 
@@ -133,12 +136,17 @@ class FakeReconciliationGateway:
     def __init__(self, remote=None, fills=None):
         self.remote = remote
         self.fills = fills or []
+        self.cancelled = []
 
     def find_order(self, symbol, order_link_id):
         return self.remote
 
     def fetch_executions(self, symbol, order_link_id):
         return list(self.fills)
+
+    def cancel_order(self, symbol, bybit_order_id):
+        self.cancelled.append((symbol, bybit_order_id))
+        return {"id": bybit_order_id, "status": "canceled"}
 
 
 class FakeClock:
@@ -153,7 +161,7 @@ class ExecutionEngineTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.store = ExecutionStore(Path(self.temp.name) / "execution.sqlite3")
-        self.client = BybitClient(mode="shadow")
+        self.client = ExchangeGateway(mode="shadow")
         self.context = StaticContext()
         self.executor = BybitExecutor(self.client, self.store)
         self.consumer = TicketConsumer(
@@ -227,6 +235,20 @@ class ExecutionEngineTests(unittest.TestCase):
         self.assertEqual(self.store.state(ticket.ticket_id), ExecutionState.FILLED)
         self.assertEqual(self.store.order(link)["order_status"], "FILLED")
 
+    def test_private_stream_ignores_manual_orders_and_requires_live_probe(self):
+        stream = PrivateStreamHandler(self.store)
+        stream.mark_connected()
+        self.assertFalse(stream.health_confirmed())
+        stream.set_connection_probe(lambda: True)
+        stream.mark_connected()
+        self.assertTrue(stream.health_confirmed())
+        stream.on_order({"data": [{"orderLinkId": "manual-order-123", "orderStatus": "New"}]})
+        stream.on_execution(
+            {"data": [{"execId": "manual-exec", "orderLinkId": "manual-order-123"}]}
+        )
+        self.assertEqual(stream.ignored_records, 2)
+        self.assertFalse(self.store.kill_switch_enabled())
+
     def test_cancel_fill_race_promotes_actual_fill(self):
         ticket = OperationTicket.model_validate(ticket_payload())
         self.consumer.process(ticket, now=NOW)
@@ -277,6 +299,55 @@ class ExecutionEngineTests(unittest.TestCase):
         )
         self.assertEqual(self.store.state(ticket.ticket_id), ExecutionState.FILLED)
 
+    def test_max_holding_submits_one_reduce_only_market_exit_and_stops_new_risk(self):
+        payload = ticket_payload("tk_time_exit_001")
+        payload["protection"]["max_holding_sec"] = 60
+        ticket = OperationTicket.model_validate(payload)
+        self.consumer.process(ticket, now=NOW)
+        entry_link = order_link_id(ticket.ticket_id)
+        entry = self.store.order(entry_link)
+        quantity = float(entry["quantity"])
+        self.store.record_fill(
+            exec_id="time-exit-entry-fill",
+            order_link_id=entry_link,
+            quantity=quantity,
+            price=99990,
+            fee=0.1,
+            executed_at=NOW,
+        )
+        self.client.exchange.positions = [
+            {
+                "symbol": "BTCUSDT",
+                "side": "long",
+                "contracts": quantity,
+                "markPrice": 100000,
+                "entryPrice": 99990,
+                "notional": quantity * 100000,
+                "info": {"symbol": "BTCUSDT", "size": str(quantity)},
+            }
+        ]
+        runtime_context = BybitRuntimeContext(
+            public_exchange=object(),
+            account_client=self.client,
+            store=self.store,
+            mode="shadow",
+            correlated_symbols={"BTCUSDT"},
+        )
+        service = TradingExecutionService.__new__(TradingExecutionService)
+        service.store = self.store
+        service.context = runtime_context
+        service.executor = self.executor
+        self.executor.rate_limiter = EndpointRateLimiter(minimum_interval_seconds=0)
+
+        service._enforce_max_holding(now=NOW + timedelta(seconds=61))
+        service._enforce_max_holding(now=NOW + timedelta(seconds=90))
+
+        self.assertTrue(self.store.kill_switch_enabled())
+        self.assertEqual(len(self.client.exchange.orders), 2)
+        exit_order = self.client.exchange.orders[-1]
+        self.assertEqual(exit_order["type"], "market")
+        self.assertTrue(exit_order["params"]["reduceOnly"])
+
     def test_restart_recovery_uses_order_link_id_without_resubmit(self):
         ticket = OperationTicket.model_validate(ticket_payload())
         self.store.receive(ticket)
@@ -301,9 +372,47 @@ class ExecutionEngineTests(unittest.TestCase):
         )
         remote = {"id": "remote-order-1", "status": "open", "info": {"orderStatus": "New"}}
         reconciler = ExecutionReconciler(self.store, FakeReconciliationGateway(remote=remote))
-        recovered = reconciler.recover_all()
+        recovered = reconciler.recover_all(now=NOW + timedelta(seconds=10))
         self.assertEqual(recovered[ticket.ticket_id], ExecutionState.ACKNOWLEDGED)
         self.assertEqual(len(self.client.exchange.orders), 0)
+
+    def test_entry_wait_timeout_cancels_gtc_order_and_confirms_state(self):
+        ticket = OperationTicket.model_validate(ticket_payload("tk_wait_timeout_001"))
+        self.consumer.process(ticket, now=NOW)
+        gateway = FakeReconciliationGateway()
+        reconciler = ExecutionReconciler(self.store, gateway)
+        state = reconciler.reconcile_ticket(
+            ticket.ticket_id, now=ticket.expires_at + timedelta(seconds=1)
+        )
+        self.assertEqual(state, ExecutionState.CANCELLED)
+        self.assertEqual(len(gateway.cancelled), 1)
+        self.assertEqual(
+            self.store.order(order_link_id(ticket.ticket_id))["order_status"],
+            "CANCELLED",
+        )
+
+    def test_filled_ticket_with_active_exit_remains_recoverable(self):
+        ticket = OperationTicket.model_validate(ticket_payload("tk_exit_recovery_001"))
+        self.consumer.process(ticket, now=NOW)
+        entry_link = order_link_id(ticket.ticket_id)
+        entry = self.store.order(entry_link)
+        self.store.record_fill(
+            exec_id="entry-before-restart",
+            order_link_id=entry_link,
+            quantity=entry["quantity"],
+            price=99990,
+            fee=0.1,
+            executed_at=NOW,
+        )
+        self.executor.rate_limiter = EndpointRateLimiter(minimum_interval_seconds=0)
+        self.executor.submit_take_profits(ticket, self.context.rules)
+        exit_link = order_link_id(ticket.ticket_id, "take_profit_1")
+        remote = {"id": "remote-tp", "status": "open", "info": {"orderStatus": "New"}}
+        recovered = ExecutionReconciler(
+            self.store, FakeReconciliationGateway(remote=remote)
+        ).recover_all(now=NOW + timedelta(minutes=1))
+        self.assertIn(ticket.ticket_id, recovered)
+        self.assertEqual(self.store.order(exit_link)["order_status"], "OPEN")
 
     def test_position_version_price_and_kill_switch_are_rejected(self):
         conflict = OperationTicket.model_validate(ticket_payload("tk_position_conflict", position_version=99))
@@ -332,6 +441,17 @@ class ExecutionEngineTests(unittest.TestCase):
         self.assertEqual(plan.quantity % Decimal("0.001"), 0)
         self.assertEqual(plan.price % Decimal("0.1"), 0)
         self.assertLessEqual(plan.notional_usdt, Decimal("5000"))
+
+    def test_position_size_includes_proposed_correlated_exposure(self):
+        ticket = OperationTicket.model_validate(ticket_payload("tk_corr_capacity_001"))
+        portfolio = replace(
+            self.context.portfolio_snapshot,
+            same_direction_correlated_notional_usdt=3000,
+        )
+        plan = PositionSizer().calculate(
+            ticket, self.context.account_snapshot, portfolio, self.context.rules
+        )
+        self.assertLessEqual(plan.notional_usdt, Decimal("500"))
 
     def test_reduce_and_close_size_from_current_position_only(self):
         portfolio = replace(self.context.portfolio_snapshot, current_position_qty=0.021)
@@ -471,6 +591,20 @@ class ExecutionEngineTests(unittest.TestCase):
         self.assertEqual(first.position_version_after, version)
         self.assertEqual(len(self.store.pending_receipts()), 1)
 
+    def test_account_risk_snapshot_replay_replaces_stale_runtime_values(self):
+        loss_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+        self.store.synchronize_risk_runtime(
+            realised_pnl=-125,
+            unrealised_pnl=-25,
+            consecutive_losses=3,
+            last_loss_at=loss_at,
+        )
+        snapshot = self.store.risk_runtime()
+        self.assertEqual(snapshot["realised_pnl"], -125)
+        self.assertEqual(snapshot["unrealised_pnl"], -25)
+        self.assertEqual(snapshot["consecutive_losses"], 3)
+        self.assertIsNotNone(snapshot["cooldown_until"])
+
     def test_superseded_ticket_cannot_continue(self):
         old = OperationTicket.model_validate(ticket_payload("tk_old_ticket_001"))
         replacement_payload = ticket_payload("tk_new_ticket_001")
@@ -484,6 +618,129 @@ class ExecutionEngineTests(unittest.TestCase):
         self.assertEqual(self.store.state(old.ticket_id), ExecutionState.SUPERSEDED)
         self.assertEqual(self.consumer.process(old, now=NOW), ExecutionState.SUPERSEDED)
         self.assertEqual(len(self.client.exchange.orders), 0)
+
+
+class BybitEvidenceTests(unittest.TestCase):
+    def test_kill_switch_blocks_open_but_keeps_close_path_available(self):
+        close_payload = ticket_payload("tk_kill_switch_close_001")
+        close_payload["intent"].update(
+            action="CLOSE",
+            side="SELL",
+            position_effect="CLOSE_ONLY",
+            target_exposure_pct=0,
+            risk_budget_pct=0,
+        )
+        close_payload["entry"].update(order_type="MARKET", limit_price=None)
+        close_payload["protection"] = None
+        close_payload["economics"] = {
+            "expected_return_bps": 0,
+            "estimated_fee_bps": 0,
+            "estimated_slippage_bps": 0,
+            "estimated_funding_bps": 0,
+            "model_error_buffer_bps": 0,
+            "expected_return_after_cost_bps": 0,
+        }
+        ticket = OperationTicket.model_validate(close_payload)
+        decision = RiskGuard().evaluate(
+            ticket,
+            MarketSnapshot("BTCUSDT", 100000, 99990, 100010, "normal", NOW),
+            AccountSnapshot(0, 0, 0, risk_metrics_healthy=False),
+            PortfolioSnapshot(2000, 2000, 3, 0.02),
+            SystemHealth("live", True, False, False, float("inf")),
+            now=NOW,
+        )
+        self.assertTrue(decision.approved)
+
+    def test_ccxt_unified_position_symbol_is_included_in_portfolio_risk(self):
+        class Account:
+            def get_all_open_positions(self):
+                return [
+                    {
+                        "symbol": "BTC/USDT:USDT",
+                        "side": "long",
+                        "contracts": 0.02,
+                        "markPrice": 100000,
+                        "entryPrice": 99000,
+                        "notional": 2000,
+                        "info": {"symbol": "BTCUSDT", "size": "0.02"},
+                    }
+                ]
+
+        with tempfile.TemporaryDirectory() as td:
+            store = ExecutionStore(Path(td) / "execution.sqlite3")
+            context = BybitRuntimeContext(
+                public_exchange=object(),
+                account_client=Account(),
+                store=store,
+                mode="shadow",
+                correlated_symbols={"BTCUSDT", "ETHUSDT"},
+            )
+            ticket = OperationTicket.model_validate(ticket_payload("tk_symbol_normalize_001"))
+            portfolio = context.portfolio(ticket)
+            self.assertEqual(portfolio.current_position_qty, 0.02)
+            self.assertEqual(portfolio.gross_notional_usdt, 2000)
+            self.assertEqual(portfolio.same_direction_correlated_notional_usdt, 2000)
+
+    def test_closed_order_recovery_uses_history_after_realtime_cache_miss(self):
+        class Exchange:
+            def fetch_open_orders(self, symbol):
+                return []
+
+            def private_get_v5_order_realtime(self, params):
+                return {"result": {"list": []}}
+
+            def private_get_v5_order_history(self, params):
+                return {
+                    "result": {
+                        "list": [{"orderId": "remote-1", "orderStatus": "Filled"}]
+                    }
+                }
+
+        result = ExchangeGateway(mode="live", exchange=Exchange()).find_order_by_link_id(
+            "BTCUSDT", "tk-history-entry"
+        )
+        self.assertEqual(result["orderId"], "remote-1")
+
+    def test_daily_risk_replays_only_trading_ledger_and_loss_streak(self):
+        now_ms = int(NOW.timestamp() * 1000)
+
+        class Exchange:
+            def private_get_v5_account_transaction_log(self, params):
+                return {
+                    "result": {
+                        "list": [
+                            {"type": "TRADE", "orderId": "loss-1", "change": "-11", "cashFlow": "-10", "transactionTime": now_ms - 4},
+                            {"type": "SETTLEMENT", "change": "-2", "cashFlow": "0", "transactionTime": now_ms - 3},
+                            {"type": "TRANSFER_IN", "change": "100", "cashFlow": "100", "transactionTime": now_ms - 2},
+                            {"type": "TRADE", "orderId": "win-1", "change": "3.5", "cashFlow": "4", "transactionTime": now_ms - 1},
+                            {"type": "TRADE", "orderId": "loss-2", "change": "-2.5", "cashFlow": "-2", "transactionTime": now_ms},
+                        ],
+                        "nextPageCursor": "",
+                    }
+                }
+
+        metrics = ExchangeGateway(mode="live", exchange=Exchange()).get_daily_risk_metrics(NOW)
+        self.assertTrue(metrics["healthy"])
+        self.assertEqual(metrics["realised_pnl"], -12.0)
+        self.assertEqual(metrics["consecutive_losses"], 1)
+        self.assertEqual(metrics["record_count"], 5)
+
+    def test_daily_risk_fails_closed_when_page_cap_is_exceeded(self):
+        class Exchange:
+            calls = 0
+
+            def private_get_v5_account_transaction_log(self, params):
+                self.calls += 1
+                return {
+                    "result": {
+                        "list": [{"type": "TRADE", "change": "0", "cashFlow": "0"}],
+                        "nextPageCursor": f"cursor-{self.calls}",
+                    }
+                }
+
+        metrics = ExchangeGateway(mode="live", exchange=Exchange()).get_daily_risk_metrics(NOW)
+        self.assertFalse(metrics["healthy"])
+        self.assertEqual(metrics["reason"], "transaction_log_pagination_limit_exceeded")
 
 
 if __name__ == "__main__":

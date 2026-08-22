@@ -7,7 +7,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from core.kline_feature_store import KlineFeatureStore, ModeSpec
+from core.kline_feature_store import (
+    FeatureStoreIntegrityError,
+    KLINE_DERIVED_FEATURES,
+    KlineFeatureStore,
+    ModeSpec,
+    add_kline_derived_features,
+)
 
 
 def cfg():
@@ -163,8 +169,26 @@ def test_build_mode_dataset_excludes_raw_ohlcv_from_feature_columns(tmp_path):
     s = spec_for(store, mode="scalping")
     store.update_enhanced_kline("BTCUSDT", "5m", s)
     built = store.build_mode_dataset(s)
-    forbidden = {"open", "high", "low", "close", "volume", "open_time", "close_time", "future_return"}
+    forbidden = {
+        "open", "high", "low", "close", "volume", "open_time", "close_time",
+        "future_return", "feature_set_hash",
+    }
     assert not forbidden.intersection(built.feature_columns)
+
+
+def test_training_and_inference_share_nonzero_kline_feature_definition():
+    source = raw("2024-01-01", 90, "5min", 100)
+    augmented = add_kline_derived_features(source)
+    assert set(KLINE_DERIVED_FEATURES).issubset(augmented.columns)
+    assert augmented["ret_1"].dropna().abs().sum() > 0
+    assert augmented["trend_strength"].dropna().abs().sum() > 0
+
+
+def test_existing_non_sqlite_feature_store_fails_integrity_gate(tmp_path):
+    path = tmp_path / "kfs.sqlite"
+    path.write_bytes(b"not-a-sqlite-database")
+    with pytest.raises(FeatureStoreIntegrityError):
+        KlineFeatureStore(path, cfg())
 
 
 class FakeFetcher:

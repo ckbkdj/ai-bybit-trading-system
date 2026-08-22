@@ -1,7 +1,9 @@
 import json
+import os
 import sys
 from asyncio import sleep
-from datetime import datetime, timezone
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import asyncio
@@ -14,6 +16,7 @@ from typing import Any, Dict, Optional
 
 from .http_client import HTTPClient
 from .market_context import build_market_feature_snapshot
+from .providers.trad_panel_provider import TradPanelProvider
 
 BINANCE = "https://fapi.binance.com"
 if sys.platform == "win32":
@@ -58,24 +61,24 @@ class MarketDataUnavailable(RuntimeError):
 
 # Timeframe-aware max age between "now" and the latest cached K 线. 若实际 latest
 # 比这更旧，且本轮抓取没有新增 K 线，则视为数据源不可用，禁止用陈旧缓存出预测。
-_TF_MAX_KLINE_AGE: Dict[str, pd.Timedelta] = {
-    "1m": pd.Timedelta(minutes=5),
-    "3m": pd.Timedelta(minutes=10),
-    "5m": pd.Timedelta(minutes=15),
-    "15m": pd.Timedelta(minutes=45),
-    "30m": pd.Timedelta(minutes=90),
-    "1h": pd.Timedelta(hours=2),
-    "2h": pd.Timedelta(hours=4),
-    "4h": pd.Timedelta(hours=8),
-    "6h": pd.Timedelta(hours=12),
-    "8h": pd.Timedelta(hours=16),
-    "12h": pd.Timedelta(hours=20),
-    "1d": pd.Timedelta(hours=36),
+_TF_MAX_KLINE_AGE: Dict[str, timedelta] = {
+    "1m": timedelta(minutes=5),
+    "3m": timedelta(minutes=10),
+    "5m": timedelta(minutes=15),
+    "15m": timedelta(minutes=45),
+    "30m": timedelta(minutes=90),
+    "1h": timedelta(hours=2),
+    "2h": timedelta(hours=4),
+    "4h": timedelta(hours=8),
+    "6h": timedelta(hours=12),
+    "8h": timedelta(hours=16),
+    "12h": timedelta(hours=20),
+    "1d": timedelta(hours=36),
 }
 
 
-def _max_kline_age(tf: str) -> pd.Timedelta:
-    return _TF_MAX_KLINE_AGE.get(tf, pd.Timedelta(hours=8))
+def _max_kline_age(tf: str) -> timedelta:
+    return _TF_MAX_KLINE_AGE.get(tf, timedelta(hours=8))
 
 
 def _timeframe_ms(tf: str) -> int:
@@ -85,6 +88,22 @@ def _timeframe_ms(tf: str) -> int:
     if unit not in mult:
         raise ValueError(f"unsupported timeframe: {tf}")
     return n * mult[unit]
+
+
+def _closed_kline_rows(rows, timeframe: str, *, now_ms: Optional[int] = None):
+    """Keep only candles whose exchange close time is no later than now."""
+
+    cutoff = int(now_ms if now_ms is not None else time.time() * 1000)
+    timeframe_ms = _timeframe_ms(timeframe)
+    closed = []
+    for row in rows or []:
+        try:
+            exchange_close_ms = int(row[6]) if len(row) > 6 else int(row[0]) + timeframe_ms - 1
+        except (TypeError, ValueError, IndexError):
+            continue
+        if exchange_close_ms <= cutoff:
+            closed.append(row)
+    return closed
 
 
 def _now_utc() -> pd.Timestamp:
@@ -131,6 +150,13 @@ class DataFetcher:
             "aiohttp_proxy": aiohttp_proxy,
             'timeout': 30000
         })
+        self.external_panel_provider = None
+        external_root = os.getenv("TRAD_DATA_SERVICE_ROOT", "").strip()
+        if external_root:
+            try:
+                self.external_panel_provider = TradPanelProvider(Path(external_root))
+            except Exception as exc:
+                self.log.warning("外部日频面板初始化失败，将保持禁用: %s", exc)
 
         # ---------- SQLite 缓存 ----------
     def _db(self, sym): return self.db_dir / f"{sym}.sqlite"
@@ -139,14 +165,15 @@ class DataFetcher:
     def _load_cache(self, sym, tf):
         p = self._db(sym)
         if not p.exists(): return pd.DataFrame()
-        with sqlite3.connect(p) as c:
+        with closing(sqlite3.connect(p)) as c:
             try:
                 return pd.read_sql(f"SELECT * FROM {self._table(tf)}", c, parse_dates=["ts"])
             except Exception: return pd.DataFrame()
 
     def _save_cache(self, sym, tf, df):
-        with sqlite3.connect(self._db(sym)) as c:
+        with closing(sqlite3.connect(self._db(sym))) as c:
             df.to_sql(self._table(tf), c, if_exists="replace", index=False)
+            c.commit()
 
     # ---------- Binance OHLCV ----------
     async def get_ohlcv(self, sym, tf, limit):
@@ -170,6 +197,7 @@ class DataFetcher:
             latest_raw_data = await self.exchange.fapiPublicGetKlines(
                 {"symbol": sym, "interval": tf, "limit": 1500}
             )
+            latest_raw_data = _closed_kline_rows(latest_raw_data, tf)
             latest_fetch_ok = True
             if latest_raw_data:
                 if not df_cache.empty:
@@ -278,6 +306,16 @@ class DataFetcher:
             df_final_raw = pd.concat([old_df, df_final_raw]).drop_duplicates("ts").sort_values("ts")
             self.log.debug(f"Combined all data (cache + new + old): {len(df_final_raw)} rows.")
 
+        # Legacy caches may contain the still-open candle from the previous
+        # implementation. Remove it before either inference or a cache rewrite.
+        if not df_final_raw.empty:
+            closed_before = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(
+                milliseconds=_timeframe_ms(tf)
+            )
+            df_final_raw = df_final_raw[
+                pd.to_datetime(df_final_raw["ts"]) <= closed_before
+            ]
+
         # 6. 最终统一裁剪策略：优先满足 limit 数量，然后裁剪到 cache_days 以便保存
         # 裁剪到 limit (从最新开始保留 limit 条)
         if len(df_final_raw) > limit:
@@ -368,14 +406,9 @@ class DataFetcher:
         if not data:
             return pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume"])
         now_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
-        tf_ms = _timeframe_ms(tf)
         rows = []
-        for row in data:
+        for row in _closed_kline_rows(data, tf, now_ms=now_ms):
             open_ms = int(row[0])
-            close_ms = open_ms + int(tf_ms)
-            # Exclude an unfinished current candle; training/prediction must use closed Klines only.
-            if close_ms > now_ms:
-                continue
             if since_open_time_ms is not None and open_ms < int(since_open_time_ms):
                 continue
             rows.append(row)
@@ -569,6 +602,27 @@ class DataFetcher:
             except Exception:
                 pass
         return snap
+
+    def get_external_panel_context(self, *, as_of: Optional[datetime] = None) -> Dict[str, Any]:
+        """Return auditable shadow context without adding it to model features."""
+
+        if self.external_panel_provider is None:
+            return {
+                "status": "disabled",
+                "source": "trad_data_service.canonical_panel",
+                "data": None,
+                "warnings": [],
+                "error": None,
+            }
+        result = self.external_panel_provider.fetch(as_of=as_of or datetime.now(timezone.utc))
+        return {
+            "status": result.status.value,
+            "source": result.source,
+            "generated_at": result.generated_at.isoformat(),
+            "data": result.data,
+            "warnings": list(result.warnings),
+            "error": result.error,
+        }
 
     async def close(self):
         """Close the CCXT client session."""

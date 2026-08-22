@@ -122,7 +122,20 @@ class PositionSizer:
             - decimal(portfolio.gross_notional_usdt),
         )
         portfolio_qty = portfolio_capacity / reference
-        candidates = [risk_qty, notional_cap_qty, exposure_qty, margin_qty, portfolio_qty]
+        correlated_capacity = max(
+            Decimal("0"),
+            equity * decimal(self.risk_limits.max_correlated_exposure_pct)
+            - decimal(portfolio.same_direction_correlated_notional_usdt),
+        )
+        correlated_qty = correlated_capacity / reference
+        candidates = [
+            risk_qty,
+            notional_cap_qty,
+            exposure_qty,
+            margin_qty,
+            portfolio_qty,
+            correlated_qty,
+        ]
         if rules.max_qty is not None:
             candidates.append(rules.max_qty)
         raw_qty = min(candidates)

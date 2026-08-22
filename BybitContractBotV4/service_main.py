@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 
-from bybit import build_bybit_client
 from bybit_executor import BybitExecutor
+from exchange_gateway import build_exchange_gateway
 from execution_reconciler import BybitReconciliationGateway, ExecutionReconciler
 from execution_reporter import ExecutionReporter
 from execution_service import TicketConsumerService
@@ -38,7 +39,7 @@ class TradingExecutionService:
         if not db_path.is_absolute():
             db_path = settings.root / db_path
         self.store = ExecutionStore(db_path.resolve())
-        self.account_client = build_bybit_client(settings)
+        self.account_client = build_exchange_gateway(settings)
         self.public_exchange = _public_exchange(settings)
         self.ticket_client = TicketHttpClient(
             settings.ticket_api_base_url,
@@ -66,6 +67,7 @@ class TradingExecutionService:
             private_stream=self.stream_handler,
             regime_provider=self.ticket_client.latest_market_regime,
             data_health_provider=self.ticket_client.health,
+            correlated_symbols=set(settings.correlated_symbols),
         )
         self.executor = BybitExecutor(self.account_client, self.store, uid=settings.ticket_consumer_id)
         self.stream_handler.on_entry_filled = self._install_take_profits
@@ -97,27 +99,98 @@ class TradingExecutionService:
             settings.health_host, settings.health_port, self.health_snapshot
         )
 
-    def _install_take_profits(self, ticket_id: str) -> None:
+    def _install_take_profits(self, ticket_id: str, *, recover: bool = False) -> None:
         ticket = self.store.get_ticket(ticket_id)
         if not ticket:
             self.store.set_kill_switch(True)
             logger.error("Protection install failed: ticket %s is absent", ticket_id)
             return
+        if any(
+            str(order.get("role") or "").startswith("time_exit_")
+            for order in self.store.orders_for_ticket(ticket_id)
+        ):
+            # Once the maximum-holding close has started, adding new profit
+            # targets only creates an avoidable cancel/fill race.
+            return
         try:
             rules = self.context.instrument_rules(ticket)
-            self.executor.submit_take_profits(ticket, rules)
+            position_quantity = None
+            if recover:
+                portfolio = self.context.portfolio(ticket)
+                expected_long = ticket.intent.side == "BUY"
+                live_quantity = float(portfolio.current_position_qty)
+                if abs(live_quantity) <= 1e-12:
+                    return
+                if (live_quantity > 0) != expected_long:
+                    self.store.set_kill_switch(True)
+                    logger.error(
+                        "Protection recovery found opposite live position for ticket %s",
+                        ticket_id,
+                    )
+                    return
+                position_quantity = abs(live_quantity)
+            self.executor.submit_take_profits(
+                ticket, rules, position_quantity=position_quantity
+            )
         except Exception:
             # The entry stop is attached atomically. Failure to add profit-taking
             # children still escalates to the kill switch for operator review.
             self.store.set_kill_switch(True)
             logger.exception("Take-profit installation failed for ticket %s", ticket_id)
 
+    def _recover_take_profits(self) -> None:
+        # Only the newest filled/part-filled entry per symbol can own the current
+        # position because opening tickets require a flat position.
+        for ticket_id in self.store.latest_position_origin_ticket_ids():
+            self._install_take_profits(ticket_id, recover=True)
+
+    def _enforce_max_holding(self, *, now: datetime | None = None) -> None:
+        """Submit one auditable reduce-only close when a ticket's hold clock expires."""
+
+        current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        for ticket_id in self.store.latest_position_origin_ticket_ids():
+            ticket = self.store.get_ticket(ticket_id)
+            if not ticket or not ticket.protection:
+                continue
+            first_fill = self.store.first_entry_fill_at(ticket_id)
+            if first_fill is None:
+                continue
+            age_seconds = (current - first_fill).total_seconds()
+            if age_seconds < ticket.protection.max_holding_sec:
+                continue
+            portfolio = self.context.portfolio(ticket)
+            live_quantity = float(portfolio.current_position_qty)
+            if abs(live_quantity) <= 1e-12:
+                continue
+            expected_long = ticket.intent.side == "BUY"
+            if (live_quantity > 0) != expected_long:
+                self.store.set_kill_switch(True)
+                raise RuntimeError(
+                    f"max-holding exit found opposite position for {ticket_id}"
+                )
+            # Stop all new risk before an automatic risk-reducing action.  The
+            # deterministic child id makes retries safe across restarts.
+            self.store.set_kill_switch(True)
+            self.executor.submit_time_exit(
+                ticket, position_quantity=Decimal(str(abs(live_quantity)))
+            )
+            logger.warning(
+                "Maximum holding time reached; reduce-only exit submitted for %s age_sec=%s",
+                ticket_id,
+                int(age_seconds),
+            )
+
     def health_snapshot(self) -> dict:
         return {
             "status": "degraded" if self.last_error else "ok",
             "mode": self.settings.mode.value,
             "kill_switch": self.store.kill_switch_enabled(),
-            "private_websocket_connected": self.stream_handler.connected,
+            "private_websocket_connected": self.stream_handler.health_confirmed(),
+            "private_websocket_last_message_at": (
+                self.stream_handler.last_message_at.isoformat()
+                if self.stream_handler.last_message_at else None
+            ),
+            "private_stream_ignored_records": self.stream_handler.ignored_records,
             "incomplete_ticket_count": len(self.store.incomplete_ticket_ids()),
             "last_poll_at": self.last_poll_at,
             "last_poll_result": self.last_poll_result,
@@ -136,10 +209,14 @@ class TradingExecutionService:
             )
             self.websocket.start()
         self.reconciler.recover_all()
+        self._enforce_max_holding()
+        self._recover_take_profits()
 
     def run_once(self) -> None:
         try:
             self.reconciler.recover_all()
+            self._enforce_max_holding()
+            self._recover_take_profits()
             result = self.consumer_service.run_once()
             self.last_poll_at = datetime.now(timezone.utc).isoformat()
             self.last_poll_result = result.__dict__

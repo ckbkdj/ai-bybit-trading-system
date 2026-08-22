@@ -28,6 +28,7 @@ TA-Lib                  # 技术指标
 tensorflow              # core/portfolio3_3_fixed.py 训练后端
 tf-keras                # tensorflow 2.16+ 拆出的 keras shim
 onnxruntime             # core/inferencer3_fixed.py 推理后端
+pyarrow                 # 可选 trad_data_service Parquet 只读适配器
 
 # ---- Coinglass 反向解密 ----
 pycryptodome            # liqmap_fetcher.py AES-ECB

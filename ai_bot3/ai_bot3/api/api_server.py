@@ -50,10 +50,17 @@ from api.control_plane_api import create_control_plane_router
 
 app = FastAPI()
 
+_configured_origins = [
+    item.strip()
+    for item in os.environ.get(
+        "AI_BOT_CORS_ORIGINS", "http://127.0.0.1,http://localhost"
+    ).split(",")
+    if item.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_configured_origins,
+    allow_credentials="*" not in _configured_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -1404,7 +1411,6 @@ def _ai_refresher_loop() -> None:
             slept += 5
 
 
-@app.on_event("startup")
 def _start_ai_refresher() -> None:
     """Kick off the AI cache background thread; never blocks startup."""
     global _AI_REFRESHER_STARTED
@@ -1420,6 +1426,12 @@ def _start_ai_refresher() -> None:
         # serve cache_missing payloads and trigger a best-effort refresh on
         # first request.
         pass
+
+
+# FastAPI 0.133 removed ``FastAPI.add_event_handler`` while Starlette keeps
+# the router-level lifecycle API.  Register there so old deployments and the
+# current runtime share one compatible startup path.
+app.router.add_event_handler("startup", _start_ai_refresher)
 
 
 @app.get("/ai-analysis/{symbol}")

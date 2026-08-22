@@ -53,10 +53,38 @@ class BybitRuntimeContext:
     def account(self, ticket: OperationTicket) -> AccountSnapshot:
         balance = self.account_client.get_balances()
         usdt = balance.get("USDT") or {}
-        equity = float(usdt.get("total") or 0)
-        free = float(usdt.get("free") if usdt.get("free") is not None else equity)
-        used = float(usdt.get("used") or max(0, equity - free))
+        account_rows = ((((balance.get("info") or {}).get("result") or {}).get("list")) or [])
+        account = account_rows[0] if account_rows else {}
+
+        def numeric(value, fallback=0.0) -> float:
+            try:
+                return float(value) if value not in (None, "") else float(fallback)
+            except (TypeError, ValueError):
+                return float(fallback)
+
+        equity = numeric(account.get("totalEquity"), usdt.get("total") or 0)
+        free = numeric(
+            account.get("totalAvailableBalance"),
+            usdt.get("free") if usdt.get("free") is not None else equity,
+        )
+        used = numeric(account.get("totalInitialMargin"), usdt.get("used") or max(0, equity - free))
+        unrealised = numeric(account.get("totalPerpUPL"), 0)
         runtime = self.store.risk_runtime()
+        metrics_healthy = self.mode == "shadow"
+        metrics_provider = getattr(self.account_client, "get_daily_risk_metrics", None)
+        if callable(metrics_provider):
+            metrics = metrics_provider()
+            metrics_healthy = bool(metrics.get("healthy"))
+            if metrics_healthy:
+                realised = numeric(metrics.get("realised_pnl"), runtime.get("realised_pnl") or 0)
+                consecutive = int(metrics.get("consecutive_losses") or 0)
+                self.store.synchronize_risk_runtime(
+                    realised_pnl=realised,
+                    unrealised_pnl=unrealised,
+                    consecutive_losses=consecutive,
+                    last_loss_at=metrics.get("last_loss_at"),
+                )
+                runtime = self.store.risk_runtime()
         high_water = self.store.observe_equity(equity) if equity > 0 else None
         cooldown = parse_time(runtime["cooldown_until"]) if runtime.get("cooldown_until") else None
         return AccountSnapshot(
@@ -64,10 +92,11 @@ class BybitRuntimeContext:
             free_margin_usdt=free,
             margin_used_usdt=used,
             realised_pnl_today=float(runtime.get("realised_pnl") or 0),
-            unrealised_pnl=float(runtime.get("unrealised_pnl") or 0),
+            unrealised_pnl=unrealised,
             consecutive_losses=int(runtime.get("consecutive_losses") or 0),
             cooldown_until=cooldown,
             equity_high_water_usdt=high_water,
+            risk_metrics_healthy=metrics_healthy,
         )
 
     def portfolio(self, ticket: OperationTicket) -> PortfolioSnapshot:
@@ -80,7 +109,12 @@ class BybitRuntimeContext:
         target_notional = 0.0
         desired_side = "long" if ticket.intent.side == "BUY" else "short"
         for position in positions or []:
-            symbol = str(position.get("symbol") or (position.get("info") or {}).get("symbol") or "").upper()
+            info = position.get("info") or {}
+            # Prefer Bybit's raw instrument id. CCXT's unified symbol is often
+            # BTC/USDT:USDT and must not be compared directly with ticket ids
+            # such as BTCUSDT; doing so previously hid the current position and
+            # correlated exposure from the risk engine.
+            symbol = self._linear_symbol_id(info.get("symbol") or position.get("symbol"))
             quantity = abs(float(position.get("contracts") or (position.get("info") or {}).get("size") or 0))
             mark = float(position.get("markPrice") or (position.get("info") or {}).get("markPrice") or 0)
             notional = abs(float(position.get("notional") or quantity * mark))
@@ -103,6 +137,13 @@ class BybitRuntimeContext:
         )
         return PortfolioSnapshot(gross, correlated, version, target_qty)
 
+    @staticmethod
+    def _linear_symbol_id(value: object) -> str:
+        symbol = str(value or "").strip().upper()
+        if ":" in symbol:
+            symbol = symbol.split(":", 1)[0]
+        return symbol.replace("/", "").replace("-", "")
+
     def health(self, ticket: OperationTicket) -> SystemHealth:
         try:
             server_ms = float(self.public_exchange.fetch_time())
@@ -110,7 +151,7 @@ class BybitRuntimeContext:
         except Exception:
             drift = float("inf")
         data_healthy = bool(self.data_health_provider and self.data_health_provider())
-        websocket = bool(self.private_stream and self.private_stream.connected)
+        websocket = bool(self.private_stream and self.private_stream.health_confirmed())
         return SystemHealth(
             self.mode,
             self.store.kill_switch_enabled(),

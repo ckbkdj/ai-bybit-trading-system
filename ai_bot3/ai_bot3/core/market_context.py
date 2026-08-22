@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import re
 import time
 from datetime import datetime, timezone
@@ -92,6 +93,30 @@ def _safe_load_json(path: Path) -> Optional[Dict[str, Any]]:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat()
+
+
+def _source_timestamp(payload: Dict[str, Any], path: Path, *, allow_mtime: bool) -> Optional[float]:
+    value = payload.get("ts") or payload.get("generated_at")
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        return numeric / 1000.0 if numeric > 10_000_000_000 else numeric
+    if isinstance(value, str) and value.strip():
+        text = value.strip().replace("/", "-")
+        if text.endswith(("Z", "z")):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+            if parsed.tzinfo is None:
+                parsed = parsed.astimezone()
+            return parsed.timestamp()
+        except ValueError:
+            pass
+    if allow_mtime:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return None
+    return None
 
 
 def repair_mojibake_value(value: Any) -> Any:
@@ -412,6 +437,7 @@ def assess_context_completeness(
     base: Optional[str],
     *,
     data_dir: Optional[Path] = None,
+    now_epoch: Optional[float] = None,
 ) -> Dict[str, Any]:
     """评估当前数据栈完整度。完整度越高，新闻上下文权重越高。
 
@@ -429,20 +455,23 @@ def assess_context_completeness(
             data_dir = None
     liqmap_path = (data_dir / f"{base}.json") if data_dir else None
     checks: List[tuple] = [
-        ("liqmap", liqmap_path),
-        ("funding_rate", metrics_dir / f"{base}_funding_rate.json"),
-        ("open_interest", metrics_dir / f"{base}_open_interest.json"),
-        ("long_short_ratio", metrics_dir / f"{base}_long_short_ratio.json"),
-        ("volume_24h", metrics_dir / f"{base}_volume_24h.json"),
-        ("liquidation_today", metrics_dir / f"{base}_liquidation_today.json"),
-        ("news_context", metrics_dir / "news_context.json"),
-        ("financial_calendar", metrics_dir / "financial_calendar.json"),
-        ("whale_alert", metrics_dir / "whale_alert.json"),
-        ("fear_greed_index", metrics_dir / "fear_greed_index.json"),
+        ("liqmap", liqmap_path, 600, True),
+        ("funding_rate", metrics_dir / f"{base}_funding_rate.json", 1800, False),
+        ("open_interest", metrics_dir / f"{base}_open_interest.json", 900, False),
+        ("long_short_ratio", metrics_dir / f"{base}_long_short_ratio.json", 900, False),
+        ("volume_24h", metrics_dir / f"{base}_volume_24h.json", 900, False),
+        ("liquidation_today", metrics_dir / f"{base}_liquidation_today.json", 900, False),
+        ("news_context", metrics_dir / "news_context.json", 3600, False),
+        ("financial_calendar", metrics_dir / "financial_calendar.json", 86400, False),
+        ("whale_alert", metrics_dir / "whale_alert.json", 3600, False),
+        ("fear_greed_index", metrics_dir / "fear_greed_index.json", 90000, False),
     ]
     ok = 0
     missing: List[str] = []
-    for name, path in checks:
+    stale: List[str] = []
+    observed_now = float(now_epoch if now_epoch is not None else time.time())
+    source_age_seconds: Dict[str, Optional[float]] = {}
+    for name, path, maximum_age, allow_mtime in checks:
         try:
             if path is None:
                 sources[name] = False
@@ -455,12 +484,25 @@ def assess_context_completeness(
                 continue
             status = wrapper.get("status")
             # 爆仓图原始 JSON 没有 status 字段，但只要有 lastPrice/liqMapV2 就视为 ok
-            if status == "ok" or wrapper.get("lastPrice") or wrapper.get("liqMapV2"):
+            structurally_ok = bool(
+                status == "ok"
+                or wrapper.get("lastPrice")
+                or wrapper.get("liqMapV2")
+                or (name == "news_context" and wrapper.get("scores"))
+            )
+            timestamp = _source_timestamp(wrapper, path, allow_mtime=allow_mtime)
+            age = None if timestamp is None else max(0.0, observed_now - timestamp)
+            source_age_seconds[name] = age
+            is_fresh = age is not None and age <= maximum_age
+            if structurally_ok and is_fresh and not bool(wrapper.get("synthetic", False)):
                 sources[name] = True
                 ok += 1
             else:
                 sources[name] = False
-                missing.append(name)
+                if structurally_ok and age is not None and age > maximum_age:
+                    stale.append(name)
+                else:
+                    missing.append(name)
         except Exception:
             sources[name] = False
             missing.append(name)
@@ -469,6 +511,8 @@ def assess_context_completeness(
         "score": score,
         "sources": sources,
         "missing": missing,
+        "stale": stale,
+        "source_age_seconds": source_age_seconds,
         "generated_at": _now_iso(),
     }
 
@@ -516,17 +560,22 @@ def compute_market_bias(
         macro_event_importance=float(snapshot.get("macro_event_importance") or 0.0),
     )
 
-    # 各锚点子分数
-    liq = float(snapshot.get("liquidation_imbalance") or 0.0)
-    fund = math.tanh(float(snapshot.get("funding_rate") or 0.0) * 50.0)
-    oi = math.tanh(float(snapshot.get("open_interest_change") or 0.0) * 5.0)
-    vol = math.tanh(float(snapshot.get("volume_24h_change") or 0.0) * 2.0)
-    ls = math.tanh((float(snapshot.get("long_short_ratio") or 1.0) - 1.0) * 2.0)
-    lsc = math.tanh(float(snapshot.get("long_short_ratio_change") or 0.0) * 2.0)
+    sources = completeness.get("sources") or {}
+
+    def available(name: str) -> bool:
+        return bool(sources.get(name, True)) if sources else True
+
+    # Each component is masked when its source is absent, stale or synthetic.
+    liq = float(snapshot.get("liquidation_imbalance") or 0.0) if available("liqmap") else 0.0
+    fund = math.tanh(float(snapshot.get("funding_rate") or 0.0) * 50.0) if available("funding_rate") else 0.0
+    oi = math.tanh(float(snapshot.get("open_interest_change") or 0.0) * 5.0) if available("open_interest") else 0.0
+    vol = math.tanh(float(snapshot.get("volume_24h_change") or 0.0) * 2.0) if available("volume_24h") else 0.0
+    ls = math.tanh((float(snapshot.get("long_short_ratio") or 1.0) - 1.0) * 2.0) if available("long_short_ratio") else 0.0
+    lsc = math.tanh(float(snapshot.get("long_short_ratio_change") or 0.0) * 2.0) if available("long_short_ratio") else 0.0
     taker = math.tanh((float(snapshot.get("taker_buy_sell_ratio") or 1.0) - 1.0) * 2.0)
-    news = float(snapshot.get("news_context_score") or 0.0)
-    fg = float(snapshot.get("fear_greed_score") or 0.0)
-    wh = float(snapshot.get("whale_alert_score") or 0.0)
+    news = float(snapshot.get("news_context_score") or 0.0) if available("news_context") else 0.0
+    fg = float(snapshot.get("fear_greed_score") or 0.0) if available("fear_greed_index") else 0.0
+    wh = float(snapshot.get("whale_alert_score") or 0.0) if available("whale_alert") else 0.0
 
     funding_oi_volume = (fund + oi + vol) / 3.0
     long_short_taker = (ls + lsc + taker) / 3.0
@@ -563,14 +612,28 @@ def fuse_direction_signals(
     news_signal: float,
     llm_signal: float,
     completeness: Dict[str, Any],
+    llm_available: bool = True,
 ) -> Dict[str, Any]:
     """四路融合：本地模型 + 市场因子 + 新闻 + LLM 辅助。"""
     score = float(completeness.get("score", 0.0))
     # 完整度越高，新闻 / LLM 权重越高（但本地模型仍主导）
     local_w = 0.55 - 0.05 * score      # 至少 0.50
-    factor_w = 0.20
-    news_w = 0.10 + 0.08 * score
-    llm_w = 0.10 + 0.04 * score
+    sources = completeness.get("sources") or {}
+    source_known = bool(sources)
+    factor_available = (
+        any(
+            bool(sources.get(name))
+            for name in (
+                "liqmap", "funding_rate", "open_interest", "long_short_ratio",
+                "volume_24h", "liquidation_today",
+            )
+        )
+        if source_known else True
+    )
+    news_available = bool(sources.get("news_context")) if source_known else True
+    factor_w = 0.20 if factor_available else 0.0
+    news_w = (0.10 + 0.08 * score) if news_available else 0.0
+    llm_w = (0.10 + 0.04 * score) if llm_available else 0.0
     s = local_w + factor_w + news_w + llm_w
     local_w, factor_w, news_w, llm_w = local_w / s, factor_w / s, news_w / s, llm_w / s
 
@@ -618,9 +681,15 @@ class OpenAIFormatSignalClient:
     def __init__(self, cfg: Optional[Dict[str, Any]] = None):
         cfg = cfg or {}
         self.enabled: bool = bool(cfg.get("enabled", False))
-        self.base_url: str = str(cfg.get("base_url") or "").rstrip("/")
-        self.api_key: str = str(cfg.get("api_key") or "")
-        self.model: str = str(cfg.get("model") or "gpt-4o-mini")
+        self.base_url: str = str(
+            os.environ.get("AI_BOT_LLM_BASE_URL") or cfg.get("base_url") or ""
+        ).rstrip("/")
+        self.api_key: str = str(
+            os.environ.get("AI_BOT_LLM_API_KEY") or cfg.get("api_key") or ""
+        )
+        self.model: str = str(
+            os.environ.get("AI_BOT_LLM_MODEL") or cfg.get("model") or "gpt-4o-mini"
+        )
         raw_fallback_models = cfg.get("fallback_models") or cfg.get("model_fallbacks") or []
         if isinstance(raw_fallback_models, str):
             raw_fallback_models = [raw_fallback_models]

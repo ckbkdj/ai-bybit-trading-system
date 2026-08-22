@@ -6,7 +6,7 @@
 
 目标是形成可审计、可复放、可停止、可分阶段发布的量化产品。目标不是承诺收益。任何历史命中率、回测收益或 AI 文本都不能替代实盘成交证据和风险批准。
 
-模型治理采用“概念合理性、持续监控、结果分析/回测、独立质疑和变更控制”的框架，参考美国联储的 [Model Risk Management guidance](https://www.federalreserve.gov/frrs/guidance/supervisory-guidance-on-model-risk-management.htm) 和 [SR 11-7](https://www.federalreserve.gov/boarddocs/srletters/2011/sr1107a1.pdf)。
+模型治理采用风险强度匹配、首次使用前验证、OOS/OOT 测试、持续监控、模型清单、独立质疑和变更控制的框架，参考美国联储 2026 年发布并替代 SR 11-7 的 [SR 26-2](https://www.federalreserve.gov/supervisionreg/srletters/SR2602.htm) 与 [Model Risk Management guidance](https://www.federalreserve.gov/frrs/guidance/supervisory-guidance-on-model-risk-management.htm)。这是工程治理参考，不代表本项目受其监管或已经通过监管验证。
 
 ## 当前模型清单
 

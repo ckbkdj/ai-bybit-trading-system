@@ -38,7 +38,9 @@
 
 本机 HTTP 影子 E2E 结果要求并已观测：`cursor=1`、`state=SUBMITTED`、`shadow_order_count=1`、`control_plane_receipt_count=1`。
 
-最终全量回归：预测端 `pytest` 为 **99 passed / 0 skipped / 0 failed**；交易端 `pytest` 为 **27 passed / 0 failed**。两个项目及工作区脚本的 Python 文件均通过语法编译。
+最终全量回归：预测端 `pytest` 为 **112 passed / 0 failed**；交易端 `pytest` 为 **43 passed / 0 failed**。本机 HTTP 影子闭环再次通过。
+
+新增数据验收：损坏特征库已非破坏重建，raw/enhanced 各 **2,587,737 行、25 组**且 `quick_check=ok`，生产路径未切换；参考 `trad_data_service` 2.2 GB canonical 面板的 SHA 已按最后 PASS 收据验证，但最新更新任务为 BLOCKED，适配结果保持 degraded/shadow-only。
 
 历史策略证据：3,255 条 settled 预测在严格 live 门禁下因缺 recorded direction 而得到 0 笔合格交易，不能证明盈利。仅供诊断的旧方向推断得到 304 笔，计 11 bps 双边手续费与 6 bps 往返滑点后约 **-13.48%**，收盘到收盘最大回撤约 **13.48%**；没有 intrabar 和真实 fills，不能当作实盘回测。结论为 `profitability_not_demonstrated`。
 

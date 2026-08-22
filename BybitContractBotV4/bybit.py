@@ -2,6 +2,7 @@ import sys
 import threading
 import time
 import traceback
+from datetime import datetime, timezone
 from decimal import Decimal
 from itertools import count
 from typing import Callable
@@ -212,6 +213,8 @@ def build_bybit_client(settings):
 
 class BybitClient(_BybitConnection):
 
+    _risk_metrics_cache_seconds = 15.0
+
     def response_headers(self):
         return dict(getattr(self.exchange, "last_response_headers", None) or {})
 
@@ -279,14 +282,33 @@ class BybitClient(_BybitConnection):
             info = order.get("info") or {}
             if info.get("orderLinkId") == order_link_id or order.get("clientOrderId") == order_link_id:
                 return order
+        realtime_error = None
         try:
             response = self.exchange.private_get_v5_order_realtime(
                 {"category": "linear", "symbol": symbol, "orderLinkId": order_link_id}
             )
             records = (((response or {}).get("result") or {}).get("list") or [])
-            return records[0] if records else None
-        except Exception:
+            if records:
+                return records[0]
+        except Exception as exc:
+            realtime_error = exc
+
+        # Bybit documents that realtime only retains a bounded recent closed-order
+        # window and that this cache is cleared after a server restart.  History is
+        # therefore required before deciding that an idempotent submission is absent.
+        history_endpoint = getattr(self.exchange, "private_get_v5_order_history", None)
+        if not callable(history_endpoint):
+            if realtime_error is not None:
+                raise RuntimeError("both open-order and realtime reconciliation failed") from realtime_error
             return None
+        try:
+            response = history_endpoint(
+                {"category": "linear", "symbol": symbol, "orderLinkId": order_link_id, "limit": 1}
+            )
+            records = (((response or {}).get("result") or {}).get("list") or [])
+            return records[0] if records else None
+        except Exception as exc:
+            raise RuntimeError("order reconciliation history is unavailable") from exc
         
     def check_any_limit_order_exists(self, symbol, side):
       """
@@ -532,6 +554,127 @@ class BybitClient(_BybitConnection):
         :return: 账户的余额信息
         """
         return self.exchange.fetch_balance()
+
+    def get_daily_risk_metrics(self, now=None):
+        """Replay today's Bybit linear ledger into deterministic risk metrics.
+
+        Transfers are excluded.  Realised trading cash flow, trading fees and
+        funding/settlement changes are included through Bybit's ``change`` field.
+        """
+
+        current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        if self.mode == "shadow":
+            return {
+                "healthy": True,
+                "realised_pnl": 0.0,
+                "consecutive_losses": 0,
+                "last_loss_at": None,
+                "record_count": 0,
+            }
+        cache = getattr(self, "_daily_risk_cache", None)
+        monotonic_now = time.monotonic()
+        if (
+            cache
+            and cache[0] == current.date().isoformat()
+            and monotonic_now - cache[1] <= self._risk_metrics_cache_seconds
+        ):
+            return dict(cache[2])
+
+        start = current.replace(hour=0, minute=0, second=0, microsecond=0)
+        params = {
+            "accountType": "UNIFIED",
+            "category": "linear",
+            "startTime": int(start.timestamp() * 1000),
+            "endTime": int(current.timestamp() * 1000),
+            "limit": 50,
+        }
+        endpoint = getattr(self.exchange, "private_get_v5_account_transaction_log", None)
+        if not callable(endpoint):
+            return {
+                "healthy": False,
+                "realised_pnl": 0.0,
+                "consecutive_losses": 0,
+                "last_loss_at": None,
+                "record_count": 0,
+                "reason": "transaction_log_endpoint_unavailable",
+            }
+        records = []
+        seen_cursors = set()
+        pagination_exhausted = False
+        try:
+            for page_number in range(20):
+                response = endpoint(dict(params))
+                result = (response or {}).get("result") or {}
+                records.extend(result.get("list") or [])
+                cursor = str(result.get("nextPageCursor") or "")
+                if not cursor or cursor in seen_cursors:
+                    break
+                seen_cursors.add(cursor)
+                params["cursor"] = cursor
+                if page_number == 19:
+                    pagination_exhausted = True
+        except Exception as exc:
+            return {
+                "healthy": False,
+                "realised_pnl": 0.0,
+                "consecutive_losses": 0,
+                "last_loss_at": None,
+                "record_count": len(records),
+                "reason": f"{type(exc).__name__}: transaction_log_query_failed",
+            }
+        if pagination_exhausted:
+            # A partial daily ledger can understate losses, so never use it to
+            # approve a risk-increasing ticket.
+            return {
+                "healthy": False,
+                "realised_pnl": 0.0,
+                "consecutive_losses": 0,
+                "last_loss_at": None,
+                "record_count": len(records),
+                "reason": "transaction_log_pagination_limit_exceeded",
+            }
+
+        included_types = {"TRADE", "SETTLEMENT", "DELIVERY"}
+        realised = 0.0
+        closed_orders = {}
+        for record in records:
+            event_type = str(record.get("type") or "").upper()
+            if event_type not in included_types:
+                continue
+            try:
+                change = float(record.get("change") or 0)
+                cash_flow = float(record.get("cashFlow") or 0)
+                event_ms = int(record.get("transactionTime") or 0)
+            except (TypeError, ValueError):
+                continue
+            realised += change
+            if event_type == "TRADE" and abs(cash_flow) > 1e-15:
+                key = str(record.get("orderId") or record.get("tradeId") or record.get("id") or "")
+                if not key:
+                    continue
+                aggregate = closed_orders.setdefault(key, {"pnl": 0.0, "time": 0})
+                aggregate["pnl"] += change
+                aggregate["time"] = max(aggregate["time"], event_ms)
+        ordered_closes = sorted(closed_orders.values(), key=lambda item: item["time"])
+        consecutive_losses = 0
+        last_loss_at = None
+        for event in ordered_closes:
+            if event["pnl"] < 0:
+                consecutive_losses += 1
+                if event["time"] > 0:
+                    last_loss_at = datetime.fromtimestamp(event["time"] / 1000, timezone.utc)
+            else:
+                consecutive_losses = 0
+                last_loss_at = None
+        metrics = {
+            "healthy": True,
+            "realised_pnl": realised,
+            "consecutive_losses": consecutive_losses,
+            "last_loss_at": last_loss_at,
+            "record_count": len(records),
+        }
+        self._daily_risk_cache = (current.date().isoformat(), monotonic_now, metrics)
+        return dict(metrics)
 
     # todo 平仓收益 private_get_v5_position_closed_pnl
 

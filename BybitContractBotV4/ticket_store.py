@@ -414,7 +414,7 @@ class ExecutionStore:
         price: Optional[float],
     ) -> bool:
         """Reserve a deterministic child exit without changing the completed entry state."""
-        if not role.startswith(("take_profit_", "trailing_", "stop_loss_")):
+        if not role.startswith(("take_profit_", "trailing_", "stop_loss_", "time_exit_")):
             raise ValueError("exit order role is invalid")
         now = utc_now()
         with self.transaction(immediate=True) as connection:
@@ -510,23 +510,82 @@ class ExecutionStore:
         self, order_link_id: str, order_status: str, raw: Optional[dict[str, Any]] = None
     ) -> None:
         now = utc_now()
+        normalized_status = str(order_status or "UNKNOWN").strip().upper().replace("CANCELED", "CANCELLED")
         with self.transaction(immediate=True) as connection:
             order = connection.execute(
                 "SELECT ticket_id, role, order_status FROM execution_orders WHERE order_link_id=?", (order_link_id,)
             ).fetchone()
             if not order:
                 raise KeyError(order_link_id)
-            progress_states = {"PARTIALLY_FILLED", "FILLED", "CANCELLED"}
-            if str(order["order_status"]).upper() not in progress_states:
+            current_order_status = str(order["order_status"] or "").upper().replace("CANCELED", "CANCELLED")
+            final_order_states = {"FILLED", "CANCELLED", "REJECTED", "DEACTIVATED"}
+            should_update = (
+                current_order_status not in final_order_states
+                or normalized_status == "FILLED"
+            )
+            if should_update:
+                remote_order_id = str((raw or {}).get("orderId") or "") or None
                 connection.execute(
-                    "UPDATE execution_orders SET order_status=?, raw_json=?, updated_at=? WHERE order_link_id=?",
-                    (order_status, canonical(raw or {})[0], iso(now), order_link_id),
+                    """UPDATE execution_orders SET bybit_order_id=COALESCE(?, bybit_order_id),
+                       order_status=?, raw_json=?, updated_at=? WHERE order_link_id=?""",
+                    (remote_order_id, normalized_status, canonical(raw or {})[0], iso(now), order_link_id),
                 )
             ticket = connection.execute(
                 "SELECT state FROM tickets WHERE ticket_id=?", (order["ticket_id"],)
             ).fetchone()
             current = ExecutionState(ticket["state"])
-            if order["role"] == "entry" and current in {ExecutionState.SUBMITTING, ExecutionState.SUBMITTED}:
+            if order["role"] != "entry":
+                self._append_event(
+                    connection,
+                    order["ticket_id"],
+                    current,
+                    current,
+                    "exit_order_update",
+                    {"order_link_id": order_link_id, "order_status": normalized_status},
+                    now,
+                )
+                return
+            if normalized_status in {"CANCELLED", "DEACTIVATED"} and current not in {
+                ExecutionState.FILLED,
+                ExecutionState.CANCELLED,
+            }:
+                require_transition(current, ExecutionState.CANCELLED)
+                connection.execute(
+                    "UPDATE tickets SET state=?, updated_at=? WHERE ticket_id=?",
+                    (ExecutionState.CANCELLED.value, iso(now), order["ticket_id"]),
+                )
+                self._append_event(
+                    connection,
+                    order["ticket_id"],
+                    current,
+                    ExecutionState.CANCELLED,
+                    "entry_order_cancelled",
+                    {"order_link_id": order_link_id},
+                    now,
+                )
+            elif normalized_status == "REJECTED" and current not in TERMINAL_STATES:
+                require_transition(current, ExecutionState.FAILED)
+                connection.execute(
+                    """UPDATE tickets SET state=?, reason_code=?, reason_detail=?, updated_at=?
+                       WHERE ticket_id=?""",
+                    (
+                        ExecutionState.FAILED.value,
+                        "EXCHANGE_ORDER_REJECTED",
+                        str((raw or {}).get("rejectReason") or "exchange rejected entry order"),
+                        iso(now),
+                        order["ticket_id"],
+                    ),
+                )
+                self._append_event(
+                    connection,
+                    order["ticket_id"],
+                    current,
+                    ExecutionState.FAILED,
+                    "entry_order_rejected",
+                    {"order_link_id": order_link_id},
+                    now,
+                )
+            elif current in {ExecutionState.SUBMITTING, ExecutionState.SUBMITTED} and normalized_status not in final_order_states:
                 require_transition(current, ExecutionState.ACKNOWLEDGED)
                 connection.execute(
                     "UPDATE tickets SET state=?, updated_at=? WHERE ticket_id=?",
@@ -536,6 +595,38 @@ class ExecutionStore:
                     connection, order["ticket_id"], current, ExecutionState.ACKNOWLEDGED,
                     "websocket_order_acknowledged", {"order_link_id": order_link_id}, now,
                 )
+
+    def record_cancel_requested(
+        self, order_link_id: str, raw: Optional[dict[str, Any]] = None
+    ) -> None:
+        """Persist an entry cancellation request without claiming it was confirmed."""
+
+        now = utc_now()
+        with self.transaction(immediate=True) as connection:
+            order = connection.execute(
+                "SELECT ticket_id, role FROM execution_orders WHERE order_link_id=?",
+                (order_link_id,),
+            ).fetchone()
+            if not order:
+                raise KeyError(order_link_id)
+            connection.execute(
+                """UPDATE execution_orders SET order_status='CANCEL_REQUESTED', raw_json=?,
+                   updated_at=? WHERE order_link_id=? AND order_status NOT IN ('FILLED','CANCELLED')""",
+                (canonical(raw or {})[0], iso(now), order_link_id),
+            )
+            ticket = connection.execute(
+                "SELECT state FROM tickets WHERE ticket_id=?", (order["ticket_id"],)
+            ).fetchone()
+            current = ExecutionState(ticket["state"])
+            self._append_event(
+                connection,
+                order["ticket_id"],
+                current,
+                current,
+                "entry_cancel_requested",
+                {"order_link_id": order_link_id},
+                now,
+            )
 
     def record_fill(
         self,
@@ -692,6 +783,57 @@ class ExecutionStore:
                 terminal,
             ).fetchall()
         return [row["ticket_id"] for row in rows]
+
+    def reconciliation_ticket_ids(self) -> list[str]:
+        """Include terminal entry tickets while any deterministic child order is active."""
+
+        terminal = tuple(state.value for state in TERMINAL_STATES)
+        placeholders = ",".join("?" for _ in terminal)
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                f"""SELECT DISTINCT t.ticket_id
+                    FROM tickets t
+                    LEFT JOIN execution_orders o ON o.ticket_id=t.ticket_id
+                    WHERE t.state NOT IN ({placeholders})
+                       OR (o.role!='entry' AND UPPER(o.order_status) NOT IN
+                           ('FILLED','CANCELLED','CANCELED','REJECTED','DEACTIVATED'))
+                    ORDER BY t.updated_at""",
+                terminal,
+            ).fetchall()
+        return [row["ticket_id"] for row in rows]
+
+    def latest_position_origin_ticket_ids(self) -> list[str]:
+        """Return only the newest filled/part-filled entry ticket for each symbol."""
+
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                """SELECT t.ticket_id
+                   FROM tickets t
+                   JOIN execution_orders o ON o.ticket_id=t.ticket_id AND o.role='entry'
+                   WHERE o.cum_exec_qty>0
+                     AND t.updated_at=(
+                         SELECT MAX(t2.updated_at)
+                         FROM tickets t2
+                         JOIN execution_orders o2 ON o2.ticket_id=t2.ticket_id AND o2.role='entry'
+                         WHERE t2.symbol=t.symbol AND o2.cum_exec_qty>0
+                     )
+                   ORDER BY t.symbol"""
+            ).fetchall()
+        return [row["ticket_id"] for row in rows]
+
+    def first_entry_fill_at(self, ticket_id: str) -> Optional[datetime]:
+        """Return the exchange execution time that started the position clock."""
+
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                """SELECT MIN(f.executed_at) AS first_fill_at
+                   FROM execution_fills f
+                   JOIN execution_orders o ON o.order_link_id=f.order_link_id
+                   WHERE o.ticket_id=? AND o.role='entry'""",
+                (ticket_id,),
+            ).fetchone()
+        value = row["first_fill_at"] if row else None
+        return parse_time(value) if value else None
 
     def all_ticket_ids(self) -> list[str]:
         with closing(self.connect()) as connection:
@@ -863,6 +1005,53 @@ class ExecutionStore:
                 (
                     day, realised_pnl, unrealised_pnl, losses,
                     cooldown_until, kill_switch, iso(now),
+                ),
+            )
+
+    def synchronize_risk_runtime(
+        self,
+        *,
+        realised_pnl: float,
+        unrealised_pnl: float,
+        consecutive_losses: int,
+        last_loss_at: Optional[datetime] = None,
+        cooldown_minutes: int = 30,
+    ) -> None:
+        """Replace today's risk snapshot from a replayable account-ledger query."""
+
+        now = utc_now()
+        day = now.date().isoformat()
+        cooldown_until = None
+        if consecutive_losses > 0 and last_loss_at is not None:
+            cooldown_until = iso(
+                last_loss_at.astimezone(timezone.utc)
+                + timedelta(minutes=max(1, int(cooldown_minutes)))
+            )
+        with self.transaction(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT kill_switch FROM risk_runtime WHERE risk_date=?", (day,)
+            ).fetchone()
+            kill_switch = int(row["kill_switch"] if row else 0)
+            connection.execute(
+                """INSERT INTO risk_runtime(
+                    risk_date, realised_pnl, unrealised_pnl, consecutive_losses,
+                    cooldown_until, kill_switch, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(risk_date) DO UPDATE SET
+                    realised_pnl=excluded.realised_pnl,
+                    unrealised_pnl=excluded.unrealised_pnl,
+                    consecutive_losses=excluded.consecutive_losses,
+                    cooldown_until=excluded.cooldown_until,
+                    kill_switch=excluded.kill_switch,
+                    updated_at=excluded.updated_at""",
+                (
+                    day,
+                    float(realised_pnl),
+                    float(unrealised_pnl),
+                    max(0, int(consecutive_losses)),
+                    cooldown_until,
+                    kill_switch,
+                    iso(now),
                 ),
             )
 

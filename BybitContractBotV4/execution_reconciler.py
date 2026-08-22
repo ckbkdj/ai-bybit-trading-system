@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
 
 from execution_state import ExecutionState
@@ -12,6 +12,8 @@ class ReconciliationGateway(Protocol):
 
     def fetch_executions(self, symbol: str, order_link_id: str) -> list[dict[str, Any]]: ...
 
+    def cancel_order(self, symbol: str, bybit_order_id: str) -> dict[str, Any]: ...
+
 
 class BybitReconciliationGateway:
     def __init__(self, client):
@@ -21,12 +23,11 @@ class BybitReconciliationGateway:
         return self.client.find_order_by_link_id(symbol, order_link_id)
 
     def fetch_executions(self, symbol: str, order_link_id: str) -> list[dict[str, Any]]:
-        try:
-            trades = self.client.exchange.fetch_my_trades(
-                symbol, params={"orderLinkId": order_link_id, "category": "linear"}
-            )
-        except Exception:
-            return []
+        # A transport/authentication failure is not equivalent to "no fills".
+        # Let the service fail closed and try again without changing ticket state.
+        trades = self.client.exchange.fetch_my_trades(
+            symbol, params={"orderLinkId": order_link_id, "category": "linear"}
+        )
         records = []
         for trade in trades or []:
             info = trade.get("info") or {}
@@ -42,6 +43,9 @@ class BybitReconciliationGateway:
                 }
             )
         return records
+
+    def cancel_order(self, symbol: str, bybit_order_id: str) -> dict[str, Any]:
+        return self.client.cancel_order(bybit_order_id, symbol)
 
 
 class ExecutionReconciler:
@@ -90,6 +94,34 @@ class ExecutionReconciler:
                 )
             return self.store.state(ticket_id)
         for order in self.store.orders_for_ticket(ticket_id):
+            local_status = str(order.get("order_status") or "").upper().replace("CANCELED", "CANCELLED")
+            if local_status in {"FILLED", "CANCELLED", "REJECTED", "DEACTIVATED"}:
+                continue
+            if order["role"] == "entry" and ticket.entry is not None:
+                wait_deadline = min(
+                    ticket.expires_at,
+                    parse_time(order["created_at"])
+                    + timedelta(seconds=ticket.entry.max_wait_sec),
+                )
+                if current_time >= wait_deadline and order.get("bybit_order_id"):
+                    try:
+                        response = self.gateway.cancel_order(
+                            ticket.instrument.symbol, str(order["bybit_order_id"])
+                        )
+                    except Exception as exc:
+                        response = {"cancel_error": f"{type(exc).__name__}: {exc}"}
+                    self.store.record_cancel_requested(order["order_link_id"], response)
+                    response_status = str(
+                        (response or {}).get("status")
+                        or ((response or {}).get("info") or {}).get("orderStatus")
+                        or (response or {}).get("orderStatus")
+                        or ""
+                    ).upper()
+                    if response_status in {"CANCELED", "CANCELLED", "DEACTIVATED"}:
+                        self.store.acknowledge_order(
+                            order["order_link_id"], response_status, response
+                        )
+                        continue
             remote = self.gateway.find_order(ticket.instrument.symbol, order["order_link_id"])
             if remote:
                 bybit_id = str(
@@ -98,8 +130,10 @@ class ExecutionReconciler:
                     or remote.get("orderId")
                     or ""
                 ) or None
-                if state == ExecutionState.SUBMITTING:
+                if order["role"] == "entry" and state == ExecutionState.SUBMITTING:
                     self.store.record_rest_submission(order["order_link_id"], bybit_id, remote)
+                elif order["role"] != "entry" and not order.get("bybit_order_id"):
+                    self.store.record_exit_submission(order["order_link_id"], bybit_id, remote)
                 remote_status = str(
                     remote.get("status")
                     or (remote.get("info") or {}).get("orderStatus")
@@ -137,8 +171,8 @@ class ExecutionReconciler:
                 )
         return self.store.state(ticket_id)
 
-    def recover_all(self) -> dict[str, ExecutionState]:
+    def recover_all(self, *, now: datetime | None = None) -> dict[str, ExecutionState]:
         return {
-            ticket_id: self.reconcile_ticket(ticket_id)
-            for ticket_id in self.store.incomplete_ticket_ids()
+            ticket_id: self.reconcile_ticket(ticket_id, now=now)
+            for ticket_id in self.store.reconciliation_ticket_ids()
         }

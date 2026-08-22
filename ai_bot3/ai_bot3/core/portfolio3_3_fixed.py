@@ -39,7 +39,7 @@ from .sentiment import Sentiment
 from .market_context import OpenAIFormatSignalClient
 from .online_calibration import OnlinePredictionCalibrator
 from .brain_model import train_brain_from_df
-from .kline_feature_store import KlineFeatureStore
+from .kline_feature_store import FeatureStoreIntegrityError, KlineFeatureStore
 
 # 活跃训练 / 推理路径必须使用 *_fixed 分支
 from .trainer3 import TrainerDataPreparer, run_training_in_process
@@ -186,13 +186,17 @@ def _request_process_restart(reason: str) -> None:
     except Exception:
         pass
     try:
-        kill_zombie_processes()
+        kill_zombie_processes(terminate_live=True)
     except Exception:
         pass
     os._exit(75)
 
-def kill_zombie_processes():
-    """清理僵尸进程和相关子进程"""
+def kill_zombie_processes(*, terminate_live: bool = False):
+    """Reap this process's children without touching another service's workers.
+
+    Normal maintenance only reaps zombies.  Live descendants are terminated solely
+    during an explicit process-pool shutdown/restart.
+    """
     global _last_cleanup_time
 
     current_time = time.time()
@@ -224,52 +228,33 @@ def kill_zombie_processes():
         logging.warning(f"僵尸进程清理失败: {e}")
 
     try:
-        for proc in psutil.process_iter(['pid', 'ppid', 'cmdline', 'status']):
+        parent = psutil.Process(current_pid)
+        descendants = parent.children(recursive=True)
+        live_children = []
+        for child in descendants:
             try:
-                proc_info = proc.info
-                if proc_info['pid'] == current_pid:
-                    continue
-
-                is_child = proc_info['ppid'] == current_pid
-                is_multiprocessing = (
-                    proc_info.get('cmdline') and
-                    any('multiprocessing.spawn' in str(cmd) for cmd in proc_info.get('cmdline', []))
-                )
-                is_zombie = proc_info.get('status') == psutil.STATUS_ZOMBIE
-
-                if is_zombie and is_child:
+                if child.status() == psutil.STATUS_ZOMBIE:
                     try:
-                        os.waitpid(proc_info['pid'], os.WNOHANG)
-                        zombie_count += 1
-                    except OSError:
+                        child.wait(timeout=0)
+                    except (psutil.TimeoutExpired, psutil.NoSuchProcess):
                         pass
-                elif (is_child or is_multiprocessing) and not is_zombie:
-                    try:
-                        proc_obj = psutil.Process(proc_info['pid'])
-                        proc_obj.terminate()
-                        killed_count += 1
-                        logging.debug(f"终止子进程 PID {proc_info['pid']}")
-                    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                        pass
+                    zombie_count += 1
+                elif terminate_live:
+                    child.terminate()
+                    live_children.append(child)
+                    killed_count += 1
+                    logging.debug(f"终止本服务子进程 PID {child.pid}")
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
 
-        if killed_count > 0:
-            time.sleep(2)
-            for proc in psutil.process_iter(['pid', 'ppid', 'cmdline', 'status']):
+        if live_children:
+            _, alive = psutil.wait_procs(live_children, timeout=2)
+            for child in alive:
                 try:
-                    proc_info = proc.info
-                    if (proc_info['ppid'] == current_pid and
-                        proc_info.get('status') != psutil.STATUS_ZOMBIE):
-                        try:
-                            proc_obj = psutil.Process(proc_info['pid'])
-                            if proc_obj.is_running():
-                                proc_obj.kill()
-                                logging.warning(f"强制杀死进程 PID {proc_info['pid']}")
-                        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                            pass
+                    child.kill()
+                    logging.warning(f"强制杀死本服务子进程 PID {child.pid}")
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                    continue
+                    pass
     except Exception as e:
         logging.error(f"清理子进程时出错: {e}")
 
@@ -327,7 +312,7 @@ def shutdown_process_pool(force: bool = False, wait_for_completion: bool = True)
                         PROCESS_POOL.shutdown(wait=False)
                     if wait_for_completion:
                         time.sleep(1)
-                        kill_zombie_processes()
+                        kill_zombie_processes(terminate_live=True)
                 else:
                     start_time = time.time()
                     PROCESS_POOL.shutdown(wait=True)
@@ -558,12 +543,24 @@ class PortfolioPredictor:
         self.sentiment = Sentiment(cfg, self.http)
 
         # ---- Incremental Kline feature store (raw_kline/enhanced_kline/model_registry) ----
+        self.kline_store_error = None
         try:
-            kfs_db = Path(cfg["general"].get("db_dir", "./data")) / "kline_feature_store.sqlite3"
+            # Keep the active store path explicit so a rebuilt candidate can be
+            # reviewed, switched and rolled back without renaming either file.
+            configured_store = (
+                os.getenv("AI_BOT_KLINE_FEATURE_STORE_PATH", "").strip()
+                or cfg["general"].get("kline_feature_store_path")
+            )
+            kfs_db = (
+                Path(str(configured_store))
+                if configured_store
+                else Path(cfg["general"].get("db_dir", "./data")) / "kline_feature_store.sqlite3"
+            )
             self.kline_store = KlineFeatureStore(kfs_db, cfg, self.fetcher)
         except Exception as exc:
-            self.log.warning(f"KlineFeatureStore 初始化失败，回退旧训练路径: {exc}")
+            self.log.error(f"KlineFeatureStore 初始化失败: {exc}", exc_info=True)
             self.kline_store = None
+            self.kline_store_error = f"{type(exc).__name__}: {exc}"
 
         # ---- OpenAI 兼容辅助预测器（默认禁用，配置后才生效，失败回退中性） ----
         self.llm_aux = OpenAIFormatSignalClient(cfg.get("llm_aux", {}))
@@ -979,6 +976,14 @@ class PortfolioPredictor:
             mode_spec = None
             built_dataset = None
             store_update = None
+            require_versioned_store = bool(
+                (self.cfg.get("training") or {}).get("require_versioned_feature_store", True)
+            )
+            if self.kline_store is None and require_versioned_store:
+                self.log.error(
+                    f"[{sym}-{mode}] 禁止训练：版本化特征库不可用: {self.kline_store_error}"
+                )
+                return None
             if self.kline_store is not None:
                 try:
                     mode_spec = self.kline_store.spec_for(sym, mode)
@@ -993,7 +998,19 @@ class PortfolioPredictor:
                         self.kline_store.record_model("lstm", mode_spec, built_dataset.signature, str(self.model_read_dir / f"{sym}_{tf_code}.keras"), "skipped", lstm_reason)
                         self.log.info(f"[{sym}-{mode}] LSTM跳过训练: {lstm_reason}")
                         return True
+                except FeatureStoreIntegrityError as exc:
+                    self.log.error(
+                        f"[{sym}-{mode}] 禁止训练：版本化特征证据完整性失败: {exc}",
+                        exc_info=True,
+                    )
+                    return None
                 except Exception as exc:
+                    if require_versioned_store:
+                        self.log.error(
+                            f"[{sym}-{mode}] 禁止训练：版本化特征准备失败: {exc}",
+                            exc_info=True,
+                        )
+                        return None
                     self.log.warning(f"[{sym}-{mode}] KlineFeatureStore 准备失败，回退旧训练路径: {exc}", exc_info=True)
                     mode_spec = None; built_dataset = None; store_update = None
             # === 训练输出目录使用 write/；有 built_dataset 时不再全量拉取/现场重算增强特征 ===
@@ -1173,6 +1190,19 @@ class PortfolioPredictor:
                 run_keras_inference_in_process, prepared_data, timeout=predict_timeout
             )
             if result:
+                # Persist the slow external panel as shadow evidence only.  It
+                # is intentionally not passed into the model or direction
+                # fusion until PIT/OOS ablation approves a versioned contract.
+                try:
+                    result["external_panel_context"] = self.fetcher.get_external_panel_context()
+                except Exception as external_exc:
+                    result["external_panel_context"] = {
+                        "status": "outage",
+                        "source": "trad_data_service.canonical_panel",
+                        "data": None,
+                        "warnings": [],
+                        "error": f"{type(external_exc).__name__}: {external_exc}",
+                    }
                 # 在线学习记录预测，便于后续回填学习
                 try:
                     if self.calibrator is not None:
@@ -1182,6 +1212,35 @@ class PortfolioPredictor:
                                 self.log.info(f"在线学习已结算 {settled} 条到期预测")
                         except Exception as settle_exc:
                             self.log.debug(f"在线学习结算失败: {settle_exc}")
+                        try:
+                            calibration = self.calibrator.calibrate(
+                                sym,
+                                tf_code,
+                                mode,
+                                float(result.get("predicted_return") or 0.0),
+                                float(result.get("last") or 0.0),
+                            )
+                            result["calibrated_predicted_return"] = calibration.get(
+                                "calibrated_predicted_return"
+                            )
+                            result["calibrated_return"] = calibration.get(
+                                "calibrated_predicted_return"
+                            )
+                            result["calibrated_direction"] = calibration.get(
+                                "calibrated_trend"
+                            )
+                            result["direction_confidence"] = calibration.get(
+                                "direction_confidence"
+                            )
+                            result["calibration_status"] = calibration.get(
+                                "calibration_status", "unknown"
+                            )
+                            result["online_learning"] = calibration.get("online_learning")
+                        except Exception as calibration_exc:
+                            result["calibration_status"] = "error"
+                            self.log.debug(
+                                f"在线学习校准失败，结果禁止出票: {calibration_exc}"
+                            )
                         horizon_seconds_map = {
                             "scalping": 180, "mid_short": 900,
                             "trend": 7200, "trend_swing": 14400, "swing": 86400,

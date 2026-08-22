@@ -91,6 +91,23 @@ def test_fuse_direction_signals_produces_direction():
     assert abs(sum(fused["fused_weights"].values()) - 1.0) < 1e-6
 
 
+def test_missing_factor_news_and_llm_do_not_dilute_local_model():
+    completeness = {
+        "score": 0.0,
+        "sources": {"liqmap": False, "funding_rate": False, "news_context": False},
+        "missing": ["liqmap", "funding_rate", "news_context"],
+    }
+    fused = fuse_direction_signals(
+        local_predicted_return=0.005,
+        factor_bias=0.0,
+        news_signal=0.0,
+        llm_signal=0.0,
+        completeness=completeness,
+        llm_available=False,
+    )
+    assert fused["fused_weights"]["local_model"] == 1.0
+
+
 def test_llm_aux_disabled_returns_neutral():
     client = OpenAIFormatSignalClient({"enabled": False})
     payload = client.predict(
@@ -100,6 +117,12 @@ def test_llm_aux_disabled_returns_neutral():
     assert payload["score"] == 0.0
     assert payload["direction"] == "flat"
     assert payload["status"] == "disabled"
+
+
+def test_llm_credentials_are_loaded_from_environment_not_repository(monkeypatch):
+    monkeypatch.setenv("AI_BOT_LLM_API_KEY", "test-runtime-key")
+    client = OpenAIFormatSignalClient({"enabled": False, "api_key": ""})
+    assert client.api_key == "test-runtime-key"
 
 
 def test_llm_aux_network_failure_returns_neutral(monkeypatch):
@@ -194,6 +217,29 @@ def test_completeness_explicit_data_dir_finds_liqmap():
         assert out["sources"]["liqmap"] is True
         # 数据源越少，score 越低
         assert 0.0 < out["score"] <= 1.0
+
+
+def test_stale_or_synthetic_context_is_not_counted_or_fused():
+    with tempfile.TemporaryDirectory() as tmp:
+        metrics = Path(tmp) / "coinglass_metrics"
+        metrics.mkdir()
+        (metrics / "BTC_funding_rate.json").write_text(json.dumps({
+            "status": "ok", "ts": 1, "data": [{"value": 0.01}]
+        }))
+        (metrics / "BTC_open_interest.json").write_text(json.dumps({
+            "status": "ok", "ts": 3999, "synthetic": True,
+            "data": {"openInterest": 100, "h24OIChangePercent": 50}
+        }))
+        completeness = assess_context_completeness(
+            metrics, "BTC", data_dir=Path(tmp), now_epoch=4000
+        )
+        assert completeness["sources"]["funding_rate"] is False
+        assert "funding_rate" in completeness["stale"]
+        assert completeness["sources"]["open_interest"] is False
+        bias = compute_market_bias(
+            {"funding_rate": 0.01, "open_interest_change": 0.5}, completeness
+        )
+        assert bias["components"]["funding_oi_volume"] == 0.0
 
 
 def test_news_context_score_propagates_to_snapshot():

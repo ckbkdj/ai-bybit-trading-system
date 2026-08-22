@@ -41,6 +41,7 @@ class TradingSettings:
     api_key: str
     secret_key: str
     enable_live: bool
+    live_approval_id: str
     shadow_account_equity_usdt: float
     prediction_api_base_url: str
     prediction_api_route: str
@@ -59,6 +60,7 @@ class TradingSettings:
     max_equity_drawdown_pct: float
     max_gross_leverage: float
     max_correlated_exposure_pct: float
+    correlated_symbols: frozenset[str]
     max_margin_utilization: float
     max_consecutive_losses: int
     max_exchange_clock_drift_seconds: float
@@ -92,10 +94,12 @@ class TradingSettings:
         api_key = value("BYBIT_API_KEY")
         secret_key = value("BYBIT_SECRET_KEY")
         enable_live = _truthy(value("BYBIT_ENABLE_LIVE", "false"))
+        live_approval_id = value("BYBIT_LIVE_APPROVAL_ID")
 
-        if mode is TradingMode.LIVE and not enable_live:
+        if mode is TradingMode.LIVE and (not enable_live or not live_approval_id):
             raise SettingsError(
-                "live mode is blocked: set BYBIT_ENABLE_LIVE=true only during an approved launch"
+                "live mode is blocked: BYBIT_ENABLE_LIVE=true and a non-empty "
+                "BYBIT_LIVE_APPROVAL_ID are both required for an approved launch"
             )
         if mode in {TradingMode.TESTNET, TradingMode.LIVE} and not (api_key and secret_key):
             raise SettingsError(f"{mode.value} mode requires BYBIT_API_KEY and BYBIT_SECRET_KEY")
@@ -139,6 +143,7 @@ class TradingSettings:
             api_key=api_key,
             secret_key=secret_key,
             enable_live=enable_live,
+            live_approval_id=live_approval_id,
             shadow_account_equity_usdt=shadow_equity,
             prediction_api_base_url=value(
                 "PREDICTION_API_BASE_URL", "https://crypto_api.hk.ie520.com"
@@ -164,6 +169,14 @@ class TradingSettings:
             max_equity_drawdown_pct=max_equity_drawdown,
             max_gross_leverage=max_gross_leverage,
             max_correlated_exposure_pct=max_correlated,
+            correlated_symbols=frozenset(
+                item.strip().upper()
+                for item in value(
+                    "CORRELATED_SYMBOLS",
+                    "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,1000PEPEUSDT",
+                ).split(",")
+                if item.strip()
+            ),
             max_margin_utilization=max_margin_utilization,
             max_consecutive_losses=max_consecutive_losses,
             max_exchange_clock_drift_seconds=max_clock_drift,

@@ -18,6 +18,7 @@
 | LLM 辅助 | 结构化 score、summary | 配置中的内网 OpenAI-compatible/Qwen 端点 | 请求只携带结构化快照；失败返回中性 | 仅为辅助因子，不能单独出票、调仓、绕过风险门禁 |
 | 在线校准 | bias、scale、adaptive threshold、direction confidence | `online_learning.sqlite3` 中已到期预测 | 只有 settled 样本达到 min_samples 才是 `valid` | 现在会显式输出 `valid/insufficient_samples/disabled`；没有 valid 就不出票 |
 | OOD | scaler 空间训练范围违例率与最大超界 | 当前 LSTM 输入和训练期 scaler | 每次推理 | 不是密度估计；是保守报警器。缺 scaler 或非有限值时分数为 1，失败关闭 |
+| 跨资产影子上下文 | SPY/QQQ/TLT/GLD/USO/UUP/GBTC/COIN 的 1/5/20 日收益 | `D:\lh\trad_data_service_20260821\data_service\data\canonical\panel.parquet`，只读四列 | `ts <= as_of-30h`，并校验最后 PASS 发布收据 SHA | 已真实跑通但 `fusion_eligible=false`；只做研究/影子记录，不影响方向或出票 |
 
 ## 已实现计算，但尚未证明为在线生产输入
 
@@ -30,11 +31,14 @@
 | 监管/公司事件 | 申报、监管公告、重要公司文件 | SEC EDGAR API 和各监管机构第一方发布 | 研究任务/source tier 已实现；未配置数据流 |
 | 跨资产 | 黄金、原油、美股、风险偏好、美元、中国、医疗轮动 | 交易所/官方/已授权专业行情 | 只允许外部训练后的 regime 权重；无校准权重时函数拒绝运行 |
 
+参考面板虽然含 5,332 列，但 `asset_family` 有历史错标/漂移，故禁止按分类标签批量取因子，也禁止把全部字段直接输入模型。当前适配器只按显式 symbol 白名单读取基础收盘价，标签只输出供审计。
+
 权威接口：
 
 - [Bybit Orderbook](https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook)、[Public Trades](https://bybit-exchange.github.io/docs/v5/websocket/public/trade)、[Instrument Info](https://bybit-exchange.github.io/docs/v5/market/instrument)
 - [FRED real-time periods](https://fred.stlouisfed.org/docs/api/fred/realtime_period.html)、[vintage dates](https://fred.stlouisfed.org/docs/api/fred/series_vintagedates.html)
 - [SEC EDGAR APIs](https://www.sec.gov/search-filings/edgar-application-programming-interfaces)、[EIA Open Data](https://www.eia.gov/opendata/index.php/api)
+- [Binance USDⓈ-M Market Data](https://developers.binance.com/en/docs/derivatives/usds-margined-futures/market-data/rest-api)：K 线可分页；OI history 仅约 1 个月，long/short 与 taker history 仅约 30 天，不能从当前官方接口恢复完整三年历史。
 
 ## 来源等级
 
@@ -43,4 +47,3 @@
 - Tier C：新闻、社媒、搜索和 LLM；只用于发现与弱辅助。
 
 任何 provider 都必须登记 owner、endpoint、证书/CA、授权范围、时区、event/published/available/ingested 时间、修订策略、限流、陈旧阈值、缺失语义和回退策略。未登记或过期就是 missing/degraded，不补假值。
-

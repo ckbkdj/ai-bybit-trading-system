@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -73,16 +74,20 @@ _OPTIONAL_PREDICTION_FIELDS = (
 )
 
 
-def _normalize_prediction(data: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_prediction(data: Dict[str, Any], *, saving: bool = False) -> Dict[str, Any]:
     """补齐扩展字段；保留旧字段含义。"""
     if not isinstance(data, dict):
         return {"error": "invalid prediction payload"}
     out = dict(data)
     out.setdefault("generated_at", _now_iso())
-    # saved_at / updated_at 始终刷新为当前时间，便于落盘 & API 输出感知最新一次归一化
-    _ts_now = _now_iso()
-    out["saved_at"] = _ts_now
-    out["updated_at"] = _ts_now
+    if saving:
+        saved_at = _now_iso()
+        out["saved_at"] = saved_at
+        out["updated_at"] = saved_at
+    else:
+        # Reading an old file must never make it look freshly predicted.
+        out.setdefault("saved_at", out.get("generated_at"))
+        out.setdefault("updated_at", out.get("saved_at"))
     # raw_trend/calibrated_trend 默认与 trend 对齐
     if "raw_trend" not in out:
         out["raw_trend"] = out.get("trend")
@@ -93,6 +98,32 @@ def _normalize_prediction(data: Dict[str, Any]) -> Dict[str, Any]:
     for k in _OPTIONAL_PREDICTION_FIELDS:
         out.setdefault(k, None)
     return out
+
+
+def _atomic_json_write(path: Path, payload: Dict[str, Any]) -> None:
+    """Write one complete JSON document, then atomically replace the visible file."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_name = handle.name
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        Path(temporary_name).replace(path)
+    finally:
+        if temporary_name:
+            Path(temporary_name).unlink(missing_ok=True)
 
 
 class ResultManager:
@@ -139,16 +170,13 @@ class ResultManager:
 
     async def save_result(self, symbol: str, mode: str, data: dict):
         """保存预测结果。除原始字段外，自动补齐扩展字段。"""
-        normalized = _normalize_prediction(data)
+        normalized = _normalize_prediction(data, saving=True)
         # 顺手把训练元数据合并进来，便于 API 一次返回
         meta = self.load_training_metadata(symbol, mode)
         if meta:
             normalized["training_metadata"] = meta
         file_path = self._get_file_path(symbol, mode)
-        await asyncio.to_thread(
-            file_path.write_text,
-            json.dumps(normalized, indent=2, ensure_ascii=False),
-        )
+        await asyncio.to_thread(_atomic_json_write, file_path, normalized)
         try:
             forecast = self.forecast_adapter.adapt(symbol, mode, normalized)
             ticket = None
@@ -185,9 +213,7 @@ class ResultManager:
             metadata.setdefault("mode", mode)
             metadata.setdefault("generated_at", _now_iso())
             path = self._get_training_meta_path(symbol, mode)
-            tmp = path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(metadata, indent=2, ensure_ascii=False))
-            tmp.replace(path)
+            _atomic_json_write(path, metadata)
         except Exception as exc:
             logging.warning(f"训练元数据落盘失败: {exc}")
 
@@ -216,7 +242,7 @@ class ResultManager:
                 symbol, mode = parts
                 with open(file_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                data = _normalize_prediction(data)
+                data = _normalize_prediction(data, saving=False)
                 if symbol not in all_results:
                     all_results[symbol] = {"details": {}, "recommendation": None}
                 all_results[symbol]["details"][mode] = data

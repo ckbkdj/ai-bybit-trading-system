@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.request import urlopen
@@ -113,7 +114,7 @@ def main() -> int:
             if worker.returncode:
                 raise RuntimeError(f"shadow worker failed: {worker.stdout}\n{worker.stderr}")
             result = json.loads(worker.stdout.strip().splitlines()[-1])
-            with sqlite3.connect(control_db) as connection:
+            with closing(sqlite3.connect(control_db)) as connection:
                 receipts = connection.execute("SELECT COUNT(*) FROM execution_receipts").fetchone()[0]
             result["control_plane_receipt_count"] = receipts
             if receipts != 1:
