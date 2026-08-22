@@ -16,6 +16,7 @@ ai_bot3/ai_bot3/config.yml.bak_*
 **/.pytest_cache/
 **/.ruff_cache/
 **/.venv/
+.test-deps/
 **/node_modules/
 
 # Large model, market-data and runtime outputs
@@ -28,6 +29,8 @@ ai_bot3/ai_bot3/err
 # Trading runtime state
 BybitContractBotV4/*.db
 BybitContractBotV4/*.db-*
+BybitContractBotV4/*.sqlite3
+BybitContractBotV4/*.sqlite3-*
 BybitContractBotV4/*.ini
 BybitContractBotV4/*.log
 
@@ -47,3 +50,17 @@ BybitContractBotV4/cloud_db.py
 .DS_Store
 Thumbs.db
 *.swp
+
+# Preserved local histories, backups and experimental helpers outside the active system.
+log.txt.*
+ai_bot3/ai_bot3/.hermes_*.txt
+ai_bot3/ai_bot3/README.md
+ai_bot3/ai_bot3/read.md
+ai_bot3/ai_bot3/docs/
+ai_bot3/ai_bot3/api/*.bak_*
+ai_bot3/ai_bot3/api/static/*.bak_*
+ai_bot3/ai_bot3/api/static/*.bak_bad_*
+BybitContractBotV4/clean_hot_db.py
+BybitContractBotV4/*.sql
+BybitContractBotV4/test.py
+BybitContractBotV4/testhttp.py

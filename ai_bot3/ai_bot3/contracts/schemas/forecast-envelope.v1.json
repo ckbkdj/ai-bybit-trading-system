@@ -1,0 +1,419 @@
+{
+  "$defs": {
+    "ForecastDistribution": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_mae_bps": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expected Mae Bps"
+        },
+        "expected_mfe_bps": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expected Mfe Bps"
+        },
+        "expected_return_bps": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expected Return Bps"
+        },
+        "expected_volatility_bps": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expected Volatility Bps"
+        },
+        "p_down": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "P Down",
+          "type": "number"
+        },
+        "p_flat": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "P Flat",
+          "type": "number"
+        },
+        "p_up": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "P Up",
+          "type": "number"
+        },
+        "return_quantiles_bps": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReturnQuantiles"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "p_up",
+        "p_flat",
+        "p_down"
+      ],
+      "title": "ForecastDistribution",
+      "type": "object"
+    },
+    "ForecastEvidence": {
+      "additionalProperties": false,
+      "properties": {
+        "event_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Event Ids",
+          "type": "array"
+        },
+        "top_negative_drivers": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Top Negative Drivers",
+          "type": "array"
+        },
+        "top_positive_drivers": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Top Positive Drivers",
+          "type": "array"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Warnings",
+          "type": "array"
+        }
+      },
+      "title": "ForecastEvidence",
+      "type": "object"
+    },
+    "ForecastInstrument": {
+      "additionalProperties": false,
+      "properties": {
+        "asset_class": {
+          "default": "crypto",
+          "title": "Asset Class",
+          "type": "string"
+        },
+        "category": {
+          "default": "linear",
+          "title": "Category",
+          "type": "string"
+        },
+        "exchange": {
+          "default": "bybit",
+          "title": "Exchange",
+          "type": "string"
+        },
+        "symbol": {
+          "maxLength": 40,
+          "minLength": 3,
+          "title": "Symbol",
+          "type": "string"
+        }
+      },
+      "required": [
+        "symbol"
+      ],
+      "title": "ForecastInstrument",
+      "type": "object"
+    },
+    "ForecastLineage": {
+      "additionalProperties": false,
+      "properties": {
+        "calibration_model_id": {
+          "minLength": 1,
+          "title": "Calibration Model Id",
+          "type": "string"
+        },
+        "code_commit": {
+          "minLength": 1,
+          "title": "Code Commit",
+          "type": "string"
+        },
+        "feature_set_id": {
+          "minLength": 1,
+          "title": "Feature Set Id",
+          "type": "string"
+        },
+        "model_bundle_id": {
+          "minLength": 1,
+          "title": "Model Bundle Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "model_bundle_id",
+        "feature_set_id",
+        "calibration_model_id",
+        "code_commit"
+      ],
+      "title": "ForecastLineage",
+      "type": "object"
+    },
+    "ForecastQuality": {
+      "additionalProperties": false,
+      "properties": {
+        "calibration_status": {
+          "enum": [
+            "valid",
+            "degraded",
+            "invalid",
+            "unknown"
+          ],
+          "title": "Calibration Status",
+          "type": "string"
+        },
+        "data_coverage": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Data Coverage",
+          "type": "number"
+        },
+        "data_quality": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Data Quality",
+          "type": "number"
+        },
+        "max_feature_age_sec": {
+          "minimum": 0,
+          "title": "Max Feature Age Sec",
+          "type": "integer"
+        },
+        "out_of_distribution_score": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Out Of Distribution Score",
+          "type": "number"
+        },
+        "prediction_interval_coverage_target": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "maximum": 1,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prediction Interval Coverage Target"
+        },
+        "source_status": {
+          "default": "ok",
+          "enum": [
+            "ok",
+            "degraded",
+            "missing",
+            "error"
+          ],
+          "title": "Source Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "data_coverage",
+        "data_quality",
+        "calibration_status",
+        "out_of_distribution_score",
+        "max_feature_age_sec"
+      ],
+      "title": "ForecastQuality",
+      "type": "object"
+    },
+    "ForecastRegime": {
+      "additionalProperties": false,
+      "properties": {
+        "event_regime": {
+          "default": "normal",
+          "title": "Event Regime",
+          "type": "string"
+        },
+        "liquidity_regime": {
+          "default": "unknown",
+          "title": "Liquidity Regime",
+          "type": "string"
+        },
+        "market_regime": {
+          "default": "unknown",
+          "title": "Market Regime",
+          "type": "string"
+        }
+      },
+      "title": "ForecastRegime",
+      "type": "object"
+    },
+    "ForecastTime": {
+      "additionalProperties": false,
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "data_cutoff": {
+          "format": "date-time",
+          "title": "Data Cutoff",
+          "type": "string"
+        },
+        "forecast_target_at": {
+          "format": "date-time",
+          "title": "Forecast Target At",
+          "type": "string"
+        },
+        "horizon_sec": {
+          "exclusiveMinimum": 0,
+          "maximum": 31536000,
+          "title": "Horizon Sec",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "created_at",
+        "data_cutoff",
+        "horizon_sec",
+        "forecast_target_at"
+      ],
+      "title": "ForecastTime",
+      "type": "object"
+    },
+    "ReturnQuantiles": {
+      "additionalProperties": false,
+      "properties": {
+        "p10": {
+          "title": "P10",
+          "type": "number"
+        },
+        "p25": {
+          "title": "P25",
+          "type": "number"
+        },
+        "p50": {
+          "title": "P50",
+          "type": "number"
+        },
+        "p75": {
+          "title": "P75",
+          "type": "number"
+        },
+        "p90": {
+          "title": "P90",
+          "type": "number"
+        }
+      },
+      "required": [
+        "p10",
+        "p25",
+        "p50",
+        "p75",
+        "p90"
+      ],
+      "title": "ReturnQuantiles",
+      "type": "object"
+    }
+  },
+  "$id": "forecast-envelope.v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "distribution": {
+      "$ref": "#/$defs/ForecastDistribution"
+    },
+    "evidence": {
+      "$ref": "#/$defs/ForecastEvidence"
+    },
+    "factor_scores": {
+      "additionalProperties": {
+        "type": "number"
+      },
+      "title": "Factor Scores",
+      "type": "object"
+    },
+    "forecast_id": {
+      "maxLength": 80,
+      "minLength": 8,
+      "title": "Forecast Id",
+      "type": "string"
+    },
+    "instrument": {
+      "$ref": "#/$defs/ForecastInstrument"
+    },
+    "lineage": {
+      "$ref": "#/$defs/ForecastLineage"
+    },
+    "quality": {
+      "$ref": "#/$defs/ForecastQuality"
+    },
+    "regime": {
+      "$ref": "#/$defs/ForecastRegime"
+    },
+    "revision": {
+      "minimum": 1,
+      "title": "Revision",
+      "type": "integer"
+    },
+    "schema_version": {
+      "const": "forecast-envelope.v1",
+      "default": "forecast-envelope.v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "time": {
+      "$ref": "#/$defs/ForecastTime"
+    }
+  },
+  "required": [
+    "forecast_id",
+    "revision",
+    "instrument",
+    "time",
+    "distribution",
+    "regime",
+    "quality",
+    "lineage"
+  ],
+  "title": "ForecastEnvelope",
+  "type": "object"
+}

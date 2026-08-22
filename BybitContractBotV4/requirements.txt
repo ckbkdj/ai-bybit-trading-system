@@ -1,0 +1,5 @@
+ccxt>=4.0.0
+pandas
+requests
+pydantic>=2.7
+pybit>=5.9

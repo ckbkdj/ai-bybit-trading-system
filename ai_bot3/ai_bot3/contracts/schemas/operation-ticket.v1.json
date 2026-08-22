@@ -1,0 +1,602 @@
+{
+  "$defs": {
+    "StopLoss": {
+      "additionalProperties": false,
+      "properties": {
+        "max_loss_bps": {
+          "exclusiveMinimum": 0,
+          "maximum": 10000,
+          "title": "Max Loss Bps",
+          "type": "number"
+        },
+        "price": {
+          "exclusiveMinimum": 0,
+          "title": "Price",
+          "type": "number"
+        },
+        "type": {
+          "enum": [
+            "MARK_PRICE",
+            "LAST_PRICE",
+            "INDEX_PRICE"
+          ],
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "price",
+        "max_loss_bps"
+      ],
+      "title": "StopLoss",
+      "type": "object"
+    },
+    "TakeProfitLevel": {
+      "additionalProperties": false,
+      "properties": {
+        "close_fraction": {
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "title": "Close Fraction",
+          "type": "number"
+        },
+        "price": {
+          "exclusiveMinimum": 0,
+          "title": "Price",
+          "type": "number"
+        }
+      },
+      "required": [
+        "price",
+        "close_fraction"
+      ],
+      "title": "TakeProfitLevel",
+      "type": "object"
+    },
+    "TicketEconomics": {
+      "additionalProperties": false,
+      "properties": {
+        "estimated_fee_bps": {
+          "minimum": 0,
+          "title": "Estimated Fee Bps",
+          "type": "number"
+        },
+        "estimated_funding_bps": {
+          "minimum": 0,
+          "title": "Estimated Funding Bps",
+          "type": "number"
+        },
+        "estimated_slippage_bps": {
+          "minimum": 0,
+          "title": "Estimated Slippage Bps",
+          "type": "number"
+        },
+        "expected_return_after_cost_bps": {
+          "title": "Expected Return After Cost Bps",
+          "type": "number"
+        },
+        "expected_return_bps": {
+          "title": "Expected Return Bps",
+          "type": "number"
+        },
+        "model_error_buffer_bps": {
+          "minimum": 0,
+          "title": "Model Error Buffer Bps",
+          "type": "number"
+        }
+      },
+      "required": [
+        "expected_return_bps",
+        "estimated_fee_bps",
+        "estimated_slippage_bps",
+        "estimated_funding_bps",
+        "model_error_buffer_bps",
+        "expected_return_after_cost_bps"
+      ],
+      "title": "TicketEconomics",
+      "type": "object"
+    },
+    "TicketEntry": {
+      "additionalProperties": false,
+      "properties": {
+        "limit_price": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Limit Price"
+        },
+        "max_slippage_bps": {
+          "maximum": 10000,
+          "minimum": 0,
+          "title": "Max Slippage Bps",
+          "type": "number"
+        },
+        "max_wait_sec": {
+          "exclusiveMinimum": 0,
+          "maximum": 86400,
+          "title": "Max Wait Sec",
+          "type": "integer"
+        },
+        "order_type": {
+          "enum": [
+            "MARKET",
+            "LIMIT"
+          ],
+          "title": "Order Type",
+          "type": "string"
+        },
+        "post_only": {
+          "default": false,
+          "title": "Post Only",
+          "type": "boolean"
+        },
+        "price_band_bps": {
+          "maximum": 10000,
+          "minimum": 0,
+          "title": "Price Band Bps",
+          "type": "number"
+        },
+        "reference_price": {
+          "exclusiveMinimum": 0,
+          "title": "Reference Price",
+          "type": "number"
+        },
+        "time_in_force": {
+          "default": "GTC",
+          "enum": [
+            "GTC",
+            "IOC",
+            "FOK",
+            "POST_ONLY"
+          ],
+          "title": "Time In Force",
+          "type": "string"
+        }
+      },
+      "required": [
+        "order_type",
+        "reference_price",
+        "price_band_bps",
+        "max_slippage_bps",
+        "max_wait_sec"
+      ],
+      "title": "TicketEntry",
+      "type": "object"
+    },
+    "TicketGuards": {
+      "additionalProperties": false,
+      "properties": {
+        "event_blackout": {
+          "default": false,
+          "title": "Event Blackout",
+          "type": "boolean"
+        },
+        "max_feature_age_sec": {
+          "exclusiveMinimum": 0,
+          "title": "Max Feature Age Sec",
+          "type": "integer"
+        },
+        "max_live_price_deviation_bps": {
+          "minimum": 0,
+          "title": "Max Live Price Deviation Bps",
+          "type": "number"
+        },
+        "max_live_spread_bps": {
+          "minimum": 0,
+          "title": "Max Live Spread Bps",
+          "type": "number"
+        },
+        "min_data_quality": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Min Data Quality",
+          "type": "number"
+        },
+        "observed_data_quality": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Observed Data Quality",
+          "type": "number"
+        },
+        "observed_feature_age_sec": {
+          "minimum": 0,
+          "title": "Observed Feature Age Sec",
+          "type": "integer"
+        },
+        "observed_market_regime": {
+          "title": "Observed Market Regime",
+          "type": "string"
+        },
+        "require_flat_position": {
+          "default": false,
+          "title": "Require Flat Position",
+          "type": "boolean"
+        },
+        "required_market_regime": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Required Market Regime",
+          "type": "array"
+        },
+        "required_position_version": {
+          "minimum": 0,
+          "title": "Required Position Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "min_data_quality",
+        "observed_data_quality",
+        "max_feature_age_sec",
+        "observed_feature_age_sec",
+        "max_live_spread_bps",
+        "max_live_price_deviation_bps",
+        "observed_market_regime",
+        "required_position_version"
+      ],
+      "title": "TicketGuards",
+      "type": "object"
+    },
+    "TicketInstrument": {
+      "additionalProperties": false,
+      "properties": {
+        "category": {
+          "const": "linear",
+          "default": "linear",
+          "title": "Category",
+          "type": "string"
+        },
+        "exchange": {
+          "const": "bybit",
+          "default": "bybit",
+          "title": "Exchange",
+          "type": "string"
+        },
+        "settle_coin": {
+          "default": "USDT",
+          "title": "Settle Coin",
+          "type": "string"
+        },
+        "symbol": {
+          "maxLength": 40,
+          "minLength": 3,
+          "title": "Symbol",
+          "type": "string"
+        }
+      },
+      "required": [
+        "symbol"
+      ],
+      "title": "TicketInstrument",
+      "type": "object"
+    },
+    "TicketIntent": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "enum": [
+            "OPEN",
+            "INCREASE",
+            "REDUCE",
+            "CLOSE",
+            "CANCEL",
+            "REPLACE"
+          ],
+          "title": "Action",
+          "type": "string"
+        },
+        "leverage_cap": {
+          "exclusiveMinimum": 0,
+          "maximum": 100,
+          "title": "Leverage Cap",
+          "type": "number"
+        },
+        "max_notional_usdt": {
+          "exclusiveMinimum": 0,
+          "title": "Max Notional Usdt",
+          "type": "number"
+        },
+        "position_effect": {
+          "enum": [
+            "OPEN_OR_INCREASE",
+            "REDUCE_ONLY",
+            "CLOSE_ONLY",
+            "CANCEL_ONLY",
+            "REPLACE_ONLY"
+          ],
+          "title": "Position Effect",
+          "type": "string"
+        },
+        "reduce_fraction": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "maximum": 1,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reduce Fraction"
+        },
+        "risk_budget_pct": {
+          "maximum": 0.1,
+          "minimum": 0,
+          "title": "Risk Budget Pct",
+          "type": "number"
+        },
+        "side": {
+          "enum": [
+            "BUY",
+            "SELL"
+          ],
+          "title": "Side",
+          "type": "string"
+        },
+        "target_exposure_pct": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Target Exposure Pct",
+          "type": "number"
+        },
+        "target_order_link_id": {
+          "anyOf": [
+            {
+              "maxLength": 36,
+              "minLength": 8,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Target Order Link Id"
+        }
+      },
+      "required": [
+        "action",
+        "side",
+        "position_effect",
+        "target_exposure_pct",
+        "risk_budget_pct",
+        "max_notional_usdt",
+        "leverage_cap"
+      ],
+      "title": "TicketIntent",
+      "type": "object"
+    },
+    "TicketProtection": {
+      "additionalProperties": false,
+      "properties": {
+        "max_holding_sec": {
+          "exclusiveMinimum": 0,
+          "maximum": 31536000,
+          "title": "Max Holding Sec",
+          "type": "integer"
+        },
+        "stop_loss": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StopLoss"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "take_profit": {
+          "items": {
+            "$ref": "#/$defs/TakeProfitLevel"
+          },
+          "maxItems": 8,
+          "title": "Take Profit",
+          "type": "array"
+        },
+        "trailing_stop": {
+          "$ref": "#/$defs/TrailingStop"
+        }
+      },
+      "required": [
+        "max_holding_sec"
+      ],
+      "title": "TicketProtection",
+      "type": "object"
+    },
+    "TicketReason": {
+      "additionalProperties": false,
+      "properties": {
+        "event_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Event Ids",
+          "type": "array"
+        },
+        "regime": {
+          "title": "Regime",
+          "type": "string"
+        },
+        "top_factor_scores": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "title": "Top Factor Scores",
+          "type": "object"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Warnings",
+          "type": "array"
+        }
+      },
+      "required": [
+        "regime"
+      ],
+      "title": "TicketReason",
+      "type": "object"
+    },
+    "TrailingStop": {
+      "additionalProperties": false,
+      "properties": {
+        "activation_price": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Activation Price"
+        },
+        "distance_bps": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "maximum": 10000,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Distance Bps"
+        },
+        "enabled": {
+          "default": false,
+          "title": "Enabled",
+          "type": "boolean"
+        }
+      },
+      "title": "TrailingStop",
+      "type": "object"
+    }
+  },
+  "$id": "operation-ticket.v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "economics": {
+      "$ref": "#/$defs/TicketEconomics"
+    },
+    "entry": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TicketEntry"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "expires_at": {
+      "format": "date-time",
+      "title": "Expires At",
+      "type": "string"
+    },
+    "forecast_id": {
+      "maxLength": 80,
+      "minLength": 8,
+      "title": "Forecast Id",
+      "type": "string"
+    },
+    "forecast_revision": {
+      "minimum": 1,
+      "title": "Forecast Revision",
+      "type": "integer"
+    },
+    "guards": {
+      "$ref": "#/$defs/TicketGuards"
+    },
+    "instrument": {
+      "$ref": "#/$defs/TicketInstrument"
+    },
+    "intent": {
+      "$ref": "#/$defs/TicketIntent"
+    },
+    "protection": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TicketProtection"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "reason": {
+      "$ref": "#/$defs/TicketReason"
+    },
+    "schema_version": {
+      "const": "operation-ticket.v1",
+      "default": "operation-ticket.v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "supersedes_ticket_id": {
+      "anyOf": [
+        {
+          "maxLength": 80,
+          "minLength": 8,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Supersedes Ticket Id"
+    },
+    "ticket_id": {
+      "maxLength": 80,
+      "minLength": 8,
+      "title": "Ticket Id",
+      "type": "string"
+    },
+    "valid_from": {
+      "format": "date-time",
+      "title": "Valid From",
+      "type": "string"
+    }
+  },
+  "required": [
+    "ticket_id",
+    "forecast_id",
+    "forecast_revision",
+    "created_at",
+    "valid_from",
+    "expires_at",
+    "instrument",
+    "intent",
+    "entry",
+    "protection",
+    "economics",
+    "guards",
+    "reason"
+  ],
+  "title": "OperationTicket",
+  "type": "object"
+}

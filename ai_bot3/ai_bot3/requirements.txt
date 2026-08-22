@@ -1,0 +1,35 @@
+# ---------------------------------------------------------------------------
+# AIBot3 运行时依赖（已与活跃代码核对）
+# 仅列出 archive/ 之外的代码真正 import 的第三方包。
+# ---------------------------------------------------------------------------
+
+# ---- HTTP / 网络 ----
+aiohttp                 # core/http_client.py 异步 HTTP
+requests                # liqmap_fetcher.py / core/market_context.py 同步 HTTP
+ccxt>=4.0.0             # api/api_server.py 行情快照
+
+# ---- 调度 / 进程管理 ----
+croniter                # core/scheduler.py cron 解析
+psutil                  # core/portfolio3_3_fixed.py 资源监控
+
+# ---- Web 服务 ----
+fastapi                 # api/api_server.py / api/web_server.py
+uvicorn                 # 同上启动入口
+pydantic>=2.7           # versioned transport contracts
+
+# ---- 配置 ----
+PyYAML                  # core/config_loader.py
+
+# ---- 数据科学 / 模型 ----
+numpy
+pandas
+scikit-learn            # 训练 / 特征工程
+TA-Lib                  # 技术指标
+tensorflow              # core/portfolio3_3_fixed.py 训练后端
+tf-keras                # tensorflow 2.16+ 拆出的 keras shim
+onnxruntime             # core/inferencer3_fixed.py 推理后端
+
+# ---- Coinglass 反向解密 ----
+pycryptodome            # liqmap_fetcher.py AES-ECB
+pyotp                   # liqmap_fetcher.py TOTP
+PyExecJS                # liqmap_fetcher.py 执行 scrypt.js

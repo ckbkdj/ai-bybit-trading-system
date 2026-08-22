@@ -1,0 +1,11 @@
+PRAGMA foreign_keys=OFF;
+DROP TABLE IF EXISTS consumer_cursors;
+DROP TABLE IF EXISTS receipt_outbox;
+DROP TABLE IF EXISTS risk_runtime;
+DROP TABLE IF EXISTS position_snapshots;
+DROP TABLE IF EXISTS execution_fills;
+DROP TABLE IF EXISTS execution_orders;
+DROP TABLE IF EXISTS ticket_events;
+DROP TABLE IF EXISTS tickets;
+DELETE FROM schema_migrations WHERE version = 1;
+PRAGMA foreign_keys=ON;

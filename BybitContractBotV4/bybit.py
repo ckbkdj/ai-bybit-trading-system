@@ -49,7 +49,11 @@ class ShadowExchange:
             "params": dict(params or {}),
             "status": "open",
             "timestamp": int(time.time() * 1000),
-            "info": {"orderId": order_id, "stopOrderType": ""},
+            "info": {
+                "orderId": order_id,
+                "orderLinkId": dict(params or {}).get("orderLinkId"),
+                "stopOrderType": "",
+            },
             "shadow": True,
         }
         self.orders.append(order)
@@ -86,6 +90,14 @@ class ShadowExchange:
                 self.operations.append({"operation": "cancel_order", "order_id": order_id})
                 return order
         raise ValueError(f"shadow order not found: {order_id}")
+
+    def fetch_order(self, order_id, symbol=None, params=None):
+        order_link_id = (params or {}).get("orderLinkId")
+        for order in self.orders:
+            if order["id"] == order_id or order["params"].get("orderLinkId") == order_link_id:
+                if symbol is None or order["symbol"] == symbol:
+                    return order
+        raise ValueError(f"shadow order not found: {order_id or order_link_id}")
 
     def fetch_positions(self, symbols=None):
         if not symbols:
@@ -127,8 +139,13 @@ class _BybitConnection:
         exchange=None,
         load_markets=True,
         shadow_equity_usdt=10000.0,
+        position_mode="hedge",
     ):
         normalized_mode = str(getattr(mode, "value", mode)).strip().lower()
+        normalized_position_mode = str(position_mode).strip().lower()
+        if normalized_position_mode not in {"hedge", "one_way"}:
+            raise ValueError("position_mode must be hedge or one_way")
+        self.position_mode = normalized_position_mode
         if exchange is not None:
             self.exchange = exchange
             self.mode = normalized_mode
@@ -189,10 +206,14 @@ def build_bybit_client(settings):
         settings.secret_key,
         mode=settings.mode,
         shadow_equity_usdt=settings.shadow_account_equity_usdt,
+        position_mode=settings.position_mode,
     )
 
 
 class BybitClient(_BybitConnection):
+
+    def response_headers(self):
+        return dict(getattr(self.exchange, "last_response_headers", None) or {})
 
     def get_open_orders(self, symbol):
         orders = self.exchange.fetch_open_orders(symbol)
@@ -201,6 +222,71 @@ class BybitClient(_BybitConnection):
     def cancel_order(self,order_id,symbol):
         cancelled_order = self.exchange.cancel_order(order_id,symbol)
         return cancelled_order
+
+    def create_ticket_order(
+        self,
+        *,
+        symbol,
+        side,
+        order_type,
+        amount,
+        price,
+        leverage,
+        order_link_id,
+        reduce_only=False,
+        stop_loss_price=None,
+        stop_trigger_by="MarkPrice",
+        time_in_force="GTC",
+        post_only=False,
+    ):
+        if not reduce_only:
+            self.exchange.set_margin_mode(
+                marginMode="cross", symbol=symbol, params={"leverage": float(leverage)}
+            )
+        normalized_side = str(side).lower()
+        if self.position_mode == "one_way":
+            position_idx = 0
+        elif reduce_only:
+            position_idx = 2 if normalized_side == "buy" else 1
+        else:
+            position_idx = 1 if normalized_side == "buy" else 2
+        params = {
+            "positionIdx": position_idx,
+            "orderLinkId": order_link_id,
+            "reduceOnly": bool(reduce_only),
+            "timeInForce": "PostOnly" if post_only else str(time_in_force),
+        }
+        if stop_loss_price is not None and not reduce_only:
+            # Bybit attaches this protection to each filled portion of the entry.
+            params.update(
+                {
+                    "stopLoss": str(stop_loss_price),
+                    "slTriggerBy": str(stop_trigger_by),
+                    "tpslMode": "Full",
+                }
+            )
+        return self.exchange.create_order(
+            symbol=symbol,
+            type=str(order_type).lower(),
+            side=str(side).lower(),
+            amount=float(amount),
+            price=None if price is None else float(price),
+            params=params,
+        )
+
+    def find_order_by_link_id(self, symbol, order_link_id):
+        for order in self.exchange.fetch_open_orders(symbol):
+            info = order.get("info") or {}
+            if info.get("orderLinkId") == order_link_id or order.get("clientOrderId") == order_link_id:
+                return order
+        try:
+            response = self.exchange.private_get_v5_order_realtime(
+                {"category": "linear", "symbol": symbol, "orderLinkId": order_link_id}
+            )
+            records = (((response or {}).get("result") or {}).get("list") or [])
+            return records[0] if records else None
+        except Exception:
+            return None
         
     def check_any_limit_order_exists(self, symbol, side):
       """

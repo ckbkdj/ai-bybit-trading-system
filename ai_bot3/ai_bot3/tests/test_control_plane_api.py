@@ -1,0 +1,108 @@
+from __future__ import annotations
+
+import os
+import sys
+import tempfile
+import unittest
+from datetime import datetime, timezone
+from pathlib import Path
+from unittest.mock import patch
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+try:
+    import fastapi  # noqa: F401
+except ImportError:
+    fastapi = None
+
+
+@unittest.skipIf(fastapi is None, "FastAPI runtime is not installed in this test interpreter")
+class ControlPlaneApiTests(unittest.TestCase):
+    def setUp(self):
+        from adapters.legacy_forecast_adapter import LegacyForecastAdapter
+        from api.control_plane_api import create_control_plane_router
+        from core.decision.ticket_builder import TicketBuilder
+
+        self.temp = tempfile.TemporaryDirectory()
+        control_db = str(Path(self.temp.name) / "control.sqlite3")
+        research_db = str(Path(self.temp.name) / "research.sqlite3")
+        self.environment = patch.dict(
+            os.environ,
+            {"CONTROL_PLANE_DB": control_db, "RESEARCH_JOB_DB": research_db},
+        )
+        self.environment.start()
+        self.router = create_control_plane_router(ROOT)
+        self.repository = self.router.control_repository
+        self.forecast = LegacyForecastAdapter().adapt(
+            "BTCUSDT",
+            "scalping",
+            {
+                "generated_at": "2026-08-22T08:00:00Z",
+                "latest_kline_ts": "2026-08-22T07:59:55Z",
+                "trend": "up",
+                "calibrated_trend": "up",
+                "confidence": 0.9,
+                "predicted_return": 0.01,
+                "data_source_status": "ok",
+                "data_source_reliable": True,
+                "context_completeness": {"score": 0.96},
+                "out_of_distribution_score": 0.1,
+                "current_price_age_seconds": 5,
+                "market_regime": "risk_on",
+                "model_version": "api-test-model",
+            },
+        )
+        self.ticket = TicketBuilder().build_open_ticket(
+            self.forecast, reference_price=100000, required_position_version=0
+        )
+        self.repository.publish(self.forecast, self.ticket)
+
+    def tearDown(self):
+        self.environment.stop()
+        self.temp.cleanup()
+
+    def endpoint(self, path, method="GET"):
+        for route in self.router.routes:
+            if route.path == path and method in (route.methods or set()):
+                return route.endpoint
+        raise AssertionError(f"route not found: {method} {path}")
+
+    def test_schema_forecast_ticket_claim_and_receipt_endpoints(self):
+        from api.control_plane_api import ClaimRequest
+        from contracts.execution_receipt_v1 import ExecutionReceipt
+
+        health = self.endpoint("/v1/health")()
+        self.assertEqual(health["status"], "ok")
+        schema_response = self.endpoint("/v1/schema/{schema_name}")("operation-ticket")
+        self.assertIn(b"operation-ticket.v1", schema_response.body)
+        latest = self.endpoint("/v1/forecasts/latest")(symbol="BTCUSDT")
+        self.assertEqual(latest["forecast_id"], self.forecast.forecast_id)
+        page = self.endpoint("/v1/tickets")(
+            after_cursor=0, limit=100, consumer_id="test-consumer"
+        )
+        self.assertEqual(len(page["items"]), 1)
+        claim = self.endpoint("/v1/tickets/{ticket_id}/claim", "POST")(
+            self.ticket.ticket_id,
+            ClaimRequest(consumer_id="test-consumer", lease_token="lease-token-001", lease_sec=60),
+        )
+        self.assertTrue(claim["claimed"])
+        now = datetime.now(timezone.utc)
+        receipt = ExecutionReceipt.model_validate(
+            {
+                "receipt_id": "rc_api_endpoint_001",
+                "ticket_id": self.ticket.ticket_id,
+                "consumer_id": "test-consumer",
+                "mode": "shadow",
+                "status": "VALIDATED",
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        accepted = self.endpoint("/v1/executions", "POST")(receipt)
+        self.assertTrue(accepted["accepted"])
+
+
+if __name__ == "__main__":
+    unittest.main()
