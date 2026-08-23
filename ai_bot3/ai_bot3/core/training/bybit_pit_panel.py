@@ -29,6 +29,22 @@ BYBIT_FEATURE_SOURCE_CONTRACTS: Mapping[str, str] = {
     "liquidation_imbalance_5m": "bybit.public.liquidations",
 }
 
+BYBIT_FEATURE_ALLOWED_SOURCES: Mapping[str, tuple[str, ...]] = {
+    **{name: (source,) for name, source in BYBIT_FEATURE_SOURCE_CONTRACTS.items()},
+    "perpetual_basis_bps": (
+        "bybit.public.ticker",
+        "bybit.public.mark_index_kline",
+    ),
+    "funding_rate": (
+        "bybit.public.ticker",
+        "bybit.public.funding_history",
+    ),
+    "open_interest_change_1h": (
+        "bybit.public.ticker",
+        "bybit.public.open_interest_history",
+    ),
+}
+
 
 class BybitPITFeatureSource:
     """Read symbol-partitioned Bybit observations with strict as-of joins."""
@@ -81,6 +97,7 @@ class BybitPITFeatureSource:
             "quality",
             "provenance_kind",
             "archive_id",
+            "api_batch_id",
         ]
         payload = frame[columns].copy().sort_values("sequence")
         for column in ("event_time", "available_at", "ingested_at"):
@@ -138,10 +155,16 @@ class BybitPITFeatureSource:
             archive_expression = (
                 "archive_id" if "archive_id" in feature_columns else "NULL AS archive_id"
             )
+            api_batch_expression = (
+                "api_batch_id"
+                if "api_batch_id" in feature_columns
+                else "NULL AS api_batch_id"
+            )
             rows = connection.execute(
                 f"""SELECT sequence,observation_id,symbol,name,value,unit,event_time,
                             available_at,ingested_at,source,quality,
-                            {provenance_expression},{archive_expression}
+                            {provenance_expression},{archive_expression},
+                            {api_batch_expression}
                        FROM bybit_feature_observations
                       WHERE name IN ({placeholders}) AND sequence<=?
                       ORDER BY symbol,name,available_at,sequence""",
@@ -161,7 +184,7 @@ class BybitPITFeatureSource:
             }
         accepted_source = frame.apply(
             lambda row: str(row["source"])
-            == BYBIT_FEATURE_SOURCE_CONTRACTS[str(row["name"])],
+            in BYBIT_FEATURE_ALLOWED_SOURCES[str(row["name"])],
             axis=1,
         )
         rejected_source_contract_count = int((~accepted_source).sum())
@@ -194,6 +217,7 @@ class BybitPITFeatureSource:
             "live_capture",
             "legacy_live_capture",
             "historical_archive_replay",
+            "historical_api_replay",
         }
         if not set(frame["provenance_kind"].astype(str)).issubset(allowed_provenance):
             raise RuntimeError("Bybit PIT feature provenance kind is invalid")
@@ -234,6 +258,62 @@ class BybitPITFeatureSource:
                 if event_dates != {str(record["trading_date"])}:
                     raise RuntimeError("historical archive feature day provenance mismatch")
                 archive_provenance.append(record)
+        api_frame = frame[frame["provenance_kind"] == "historical_api_replay"].copy()
+        api_provenance: list[dict[str, object]] = []
+        api_response_provenance: list[dict[str, object]] = []
+        if not api_frame.empty:
+            if api_frame["api_batch_id"].isna().any():
+                raise RuntimeError("historical API feature has no api_batch_id")
+            api_batch_ids = tuple(sorted(set(api_frame["api_batch_id"].astype(str))))
+            api_placeholders = ",".join("?" for _ in api_batch_ids)
+            with closing(self._connect()) as connection:
+                api_rows = connection.execute(
+                    f"""SELECT batch_id,data_kind,market,symbol,trading_date,
+                                endpoint_group,requested_at,completed_at,
+                                first_event_time,last_event_time,response_count,
+                                rows_read,feature_observation_count,
+                                request_manifest_sha256,status
+                           FROM bybit_historical_api_batches
+                          WHERE batch_id IN ({api_placeholders})""",
+                    api_batch_ids,
+                ).fetchall()
+                response_rows = connection.execute(
+                    f"""SELECT response_id,batch_id,request_url,requested_at,
+                                received_at,http_status,content_length,
+                                content_sha256,rows_read,ret_code
+                           FROM bybit_historical_api_responses
+                          WHERE batch_id IN ({api_placeholders})
+                          ORDER BY batch_id,response_id""",
+                    api_batch_ids,
+                ).fetchall()
+            api_by_id = {str(row["batch_id"]): dict(row) for row in api_rows}
+            if set(api_batch_ids).difference(api_by_id):
+                raise RuntimeError("historical API feature provenance record is missing")
+            responses_by_batch: dict[str, list[dict[str, object]]] = {}
+            for row in response_rows:
+                record = dict(row)
+                responses_by_batch.setdefault(str(record["batch_id"]), []).append(record)
+            for batch_id, group in api_frame.groupby("api_batch_id", sort=True):
+                record = api_by_id[str(batch_id)]
+                if str(record["status"]) != "completed":
+                    raise RuntimeError("historical API feature references an incomplete batch")
+                if set(group["symbol"].astype(str)) != {str(record["symbol"])}:
+                    raise RuntimeError("historical API feature symbol provenance mismatch")
+                if set(group["event_time"].dt.date.astype(str)) != {
+                    str(record["trading_date"])
+                }:
+                    raise RuntimeError("historical API feature day provenance mismatch")
+                responses = responses_by_batch.get(str(batch_id), [])
+                if len(responses) != int(record["response_count"]):
+                    raise RuntimeError("historical API response provenance count mismatch")
+                if any(
+                    int(response["http_status"]) != 200
+                    or int(response["ret_code"]) != 0
+                    for response in responses
+                ):
+                    raise RuntimeError("historical API batch contains a failed response")
+                api_provenance.append(record)
+                api_response_provenance.extend(responses)
         expected_units = {
             name: self.registry.require(name).unit for name in requested
         }
@@ -276,7 +356,7 @@ class BybitPITFeatureSource:
             "rejected_low_quality_count": rejected_low_quality_count,
             "rejected_source_contract_count": rejected_source_contract_count,
             "feature_source_contracts": {
-                name: BYBIT_FEATURE_SOURCE_CONTRACTS[name] for name in requested
+                name: list(BYBIT_FEATURE_ALLOWED_SOURCES[name]) for name in requested
             },
             "provenance_observation_counts": {
                 str(kind): int(count)
@@ -287,6 +367,15 @@ class BybitPITFeatureSource:
             "historical_archive_claim": (
                 "exchange-event-time replay with conservative simulated availability; not live capture"
                 if archive_provenance
+                else None
+            ),
+            "historical_api_batches": api_provenance,
+            "historical_api_batch_count": len(api_provenance),
+            "historical_api_responses": api_response_provenance,
+            "historical_api_response_count": len(api_response_provenance),
+            "historical_api_claim": (
+                "exchange-event-time replay from hashed official REST responses with conservative simulated availability; not live capture"
+                if api_provenance
                 else None
             ),
             "snapshot_maximum_sequence": frozen_sequence,
@@ -358,20 +447,21 @@ class BybitPITFeatureSource:
         with closing(self._connect()) as connection:
             for name in names:
                 definition = self.registry.require(name)
-                expected_source = BYBIT_FEATURE_SOURCE_CONTRACTS.get(name)
-                if expected_source is None:
+                expected_sources = BYBIT_FEATURE_ALLOWED_SOURCES.get(name)
+                if expected_sources is None:
                     raise ValueError(f"Bybit PIT feature has no source contract: {name}")
                 maximum_age = definition.maximum_age_sec
+                source_placeholders = ",".join("?" for _ in expected_sources)
                 row = connection.execute(
-                    """SELECT value,unit,event_time,available_at,ingested_at,quality,source
+                    f"""SELECT value,unit,event_time,available_at,ingested_at,quality,source
                          FROM bybit_feature_observations
-                         WHERE symbol=? AND name=? AND source=?
+                         WHERE symbol=? AND name=? AND source IN ({source_placeholders})
                            AND available_at<=? AND quality>=?
                          ORDER BY available_at DESC,sequence DESC LIMIT 1""",
                     (
                         normalized_symbol,
                         name,
-                        expected_source,
+                        *expected_sources,
                         decision.isoformat().replace("+00:00", "Z"),
                         definition.minimum_quality,
                     ),
@@ -404,6 +494,7 @@ class BybitPITFeatureSource:
 
 
 __all__: Sequence[str] = (
+    "BYBIT_FEATURE_ALLOWED_SOURCES",
     "BYBIT_FEATURE_SOURCE_CONTRACTS",
     "BybitPITFeatureSource",
 )

@@ -92,7 +92,7 @@ flowchart TB
 |---|---|---|---|
 | Bybit orderbook delta、spread、depth、microprice | Bybit 官方 orderbook 历史归档和 V5 public orderbook 增量快照 | 交易时可见；短周期方向和执行成本 | 官方归档回放与实时采集已实现并用真实文件验算；正式多币种覆盖和消融未完成 |
 | public trades、OFI、CVD | Bybit 官方 public trades 历史归档和实时流 | 交易时可见；主动买卖流 | 官方归档回放与实时采集已实现并用真实文件验算；正式多币种覆盖和消融未完成 |
-| basis、funding、OI、liquidations | Binance/Bybit 合约公开接口；本地 Coinglass wrapper 只作补充 | 使用交易所事件时间和本地 available_at | 历史不完整，未进入正式集 |
+| basis、funding、OI、liquidations | Bybit 官方 funding/OI/mark/index 历史接口；实时 liquidation 流；本地 Coinglass wrapper 只作补充 | 使用交易所事件时间和保守 available_at | funding/OI/basis 历史回放已实现并真实验算；liquidation 无官方历史 REST，正式组仍不完整且未进入正式集 |
 | fill probability、slippage | Bybit 私有 ExecutionReceipt + 同时刻盘口；shadow/testnet 成交样本 | 只使用当时可得盘口与后续成交标签 | 历史盘口可计算 top-5 深度扫单完成比例和 VWAP 滑点，但它不是排队成交概率；真实 fill/partial fill 仍缺 shadow/testnet 回执证据 |
 | SPY、QQQ、VIX | 正规证券行情源 | 美股交易时段和发布延迟对齐 | 缺统一 PIT 历史，未进入正式集 |
 | TLT、real yield、UUP | 证券行情 + FRED/ALFRED vintage | 利率和美元环境；宏观值按 vintage | 缺完整 vintage，未进入正式集 |
@@ -118,9 +118,21 @@ python ai_bot3\ai_bot3\scripts\backfill_bybit_historical_archive.py `
   --report ai_bot3\ai_bot3\model_results\evaluation\bybit_archive_backfill_report.json
 ```
 
-默认覆盖 BTCUSDT、ETHUSDT、XRPUSDT、SOLUSDT、1000PEPEUSDT 的 orderbook 和 public trades。归档回放只提供当时盘口/逐笔的可审计市场事实：其中 `fill_probability` 兼容字段当前表示给定名义金额在 top-5 深度内的双边扫单完成比例，不代表 maker 排队成交概率，也不构成 execution evidence。OI、funding、basis 和 liquidation 仍必须由各自 PIT 数据源补齐；尤其不能用 OHLCV 或普通成交量反推爆仓后宣称数据完整。
+默认覆盖 BTCUSDT、ETHUSDT、XRPUSDT、SOLUSDT、1000PEPEUSDT 的 orderbook 和 public trades。归档回放只提供当时盘口/逐笔的可审计市场事实：其中 `fill_probability` 兼容字段当前表示给定名义金额在 top-5 深度内的双边扫单完成比例，不代表 maker 排队成交概率，也不构成 execution evidence。OI、funding、basis 和 liquidation 必须由各自 PIT 数据源补齐；前三者已有下述官方 REST 回放，liquidation 仍缺足量历史。尤其不能用 OHLCV 或普通成交量反推爆仓后宣称数据完整。
 
 2026-08-24 的隔离库实测使用 Bybit 官方 2026-08-01 1000PEPEUSDT 文件：读取 528,558 条订单簿事件和 118,194 条逐笔成交，写入 45,656 条订单簿特征、7,670 条逐笔特征；PIT 时间违规为 0，两个归档文件的 SHA-256 和完成清单均可追溯。这证明适配器真实读取了官方数据，不代表 37 天五币种正式覆盖、消融或盈利门禁已经完成。
+
+同一天的官方衍生品历史 REST 回填入口如下：
+
+```powershell
+python ai_bot3\ai_bot3\scripts\backfill_bybit_historical_derivatives.py `
+  --start 2026-07-15 `
+  --end 2026-08-20 `
+  --database ai_bot3\ai_bot3\data\bybit_public_pit.sqlite3 `
+  --report ai_bot3\ai_bot3\model_results\evaluation\bybit_derivatives_backfill_report.json
+```
+
+它逐日读取实际结算 funding、5 分钟 OI 以及 1 分钟 mark/index kline，并从严格向后的 1 小时 OI 和同时刻 mark/index 计算 `open_interest_change_1h` 与 `perpetual_basis_bps`。每个请求的 URL、响应 SHA-256、行数和时间都会绑定到原子提交的日批次。2026-08-01 的 1000PEPEUSDT 真实隔离烟测得到 funding 3 条、OI 变化 288 条、basis 1,440 条，共 1,731 条，7 个官方 REST 响应，PIT 时间违规为 0。该接口没有历史 liquidation，因此 liquidation 只允许从已经按事件时间持续采集的官方实时流或有审计合同的历史源补齐。
 
 ## 盈利门禁
 
@@ -178,7 +190,7 @@ python scripts/run_profitability_rebuild.py `
 
 历史正式真实库评估使用 5 个 horizon、15 个 walk-forward fold；development/lockbox 行数分别为 25,058/4,422、25,060/4,420、25,060/4,420、25,060/4,420、17,330/3,740。旧运行在保守的费用后下界门禁下没有产生信号或交易，因此净收益、回撤和成本压力显示为 0；这不是“低回撤盈利”，而是“没有可交易 Alpha”。现在零交易消融会明确标记 `FAILED_INSUFFICIENT_OOS_TRADES`，不得再算作已评估或进入正式特征集。
 
-截至 2026-08-24，预测侧回归 179 项通过，交易侧 hardening、HTTP→shadow→receipt 和依赖漏洞审计继续通过；真实 Bybit 官方归档一日回放也已通过隔离库验算。但 37 天五币种覆盖、OI/funding/basis/liquidation、真实成交回执、全部因子 OOS 消融以及未消费的新 development 证据仍未完成，所以当前状态仍是 FAILED / SHADOW_ONLY，而不是可部署 candidate。
+截至 2026-08-24，预测侧回归 182 项通过，交易侧 hardening、HTTP→shadow→receipt 和依赖漏洞审计继续通过；真实 Bybit 官方 orderbook/trades 归档与 funding/OI/basis REST 一日回放也已通过隔离库验算。但 37 天五币种覆盖、liquidation、真实成交回执、全部因子 OOS 消融以及未消费的新 development 证据仍未完成，所以当前状态仍是 FAILED / SHADOW_ONLY，而不是可部署 candidate。
 
 本次 lockbox 指纹是 `893488f8cee82c568316cd54c6ec0017bf39d685ea17dc1aab95ed4a9a299741`，已在 trial ledger 中一次性登记，不会再次用于调参或评估。运行后核对发现命令行声明的完整 commit 字符串存在人工抄写错误；实际运行代码是提交 `7579fb63f93f0e77cf311ec73777de0291b361f8`。本次没有重跑 lockbox，而是以 append-only correction 记录声明值和实际值，计算结果不变；运行器也已增加 HEAD 强校验，防止再次发生。
 

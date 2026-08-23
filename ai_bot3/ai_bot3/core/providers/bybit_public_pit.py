@@ -137,6 +137,42 @@ class BybitPublicPITStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_bybit_archive_status
                     ON bybit_historical_archive_files(status,data_kind,trading_date,symbol);
+                CREATE TABLE IF NOT EXISTS bybit_historical_api_batches(
+                    batch_id TEXT PRIMARY KEY,
+                    data_kind TEXT NOT NULL,
+                    market TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    trading_date TEXT NOT NULL,
+                    endpoint_group TEXT NOT NULL,
+                    requested_at TEXT NOT NULL,
+                    completed_at TEXT NOT NULL,
+                    first_event_time TEXT,
+                    last_event_time TEXT,
+                    response_count INTEGER NOT NULL,
+                    rows_read INTEGER NOT NULL,
+                    feature_observation_count INTEGER NOT NULL,
+                    request_manifest_sha256 TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    error TEXT,
+                    UNIQUE(data_kind,market,symbol,trading_date)
+                );
+                CREATE INDEX IF NOT EXISTS idx_bybit_api_batch_status
+                    ON bybit_historical_api_batches(status,data_kind,trading_date,symbol);
+                CREATE TABLE IF NOT EXISTS bybit_historical_api_responses(
+                    response_id TEXT PRIMARY KEY,
+                    batch_id TEXT NOT NULL,
+                    request_url TEXT NOT NULL,
+                    requested_at TEXT NOT NULL,
+                    received_at TEXT NOT NULL,
+                    http_status INTEGER NOT NULL,
+                    content_length INTEGER NOT NULL,
+                    content_sha256 TEXT NOT NULL,
+                    rows_read INTEGER NOT NULL,
+                    ret_code INTEGER NOT NULL,
+                    UNIQUE(batch_id,request_url)
+                );
+                CREATE INDEX IF NOT EXISTS idx_bybit_api_response_batch
+                    ON bybit_historical_api_responses(batch_id,response_id);
                 """
             )
             feature_columns = {
@@ -154,6 +190,11 @@ class BybitPublicPITStore:
                 connection.execute(
                     """ALTER TABLE bybit_feature_observations
                        ADD COLUMN archive_id TEXT"""
+                )
+            if "api_batch_id" not in feature_columns:
+                connection.execute(
+                    """ALTER TABLE bybit_feature_observations
+                       ADD COLUMN api_batch_id TEXT"""
                 )
         if self.batch_writes:
             self._batch_connection = self.connect()
@@ -406,11 +447,29 @@ class BybitPublicPITStore:
         observations: Sequence[Mapping[str, object]],
         *,
         archive_record: Mapping[str, object] | None = None,
+        api_batch_record: Mapping[str, object] | None = None,
+        api_response_records: Sequence[Mapping[str, object]] = (),
     ) -> int:
-        """Atomically append one validated archive file's derived observations."""
+        """Atomically append one validated historical source unit and its features."""
 
-        if not observations and archive_record is None:
+        if archive_record is not None and api_batch_record is not None:
+            raise ValueError("a feature batch cannot have two historical provenance records")
+        if api_response_records and api_batch_record is None:
+            raise ValueError("API response provenance requires an API batch record")
+        if not observations and archive_record is None and api_batch_record is None:
             return 0
+        if archive_record is not None:
+            provenance_kind = "historical_archive_replay"
+            archive_id = str(archive_record["archive_id"])
+            api_batch_id = None
+        elif api_batch_record is not None:
+            provenance_kind = "historical_api_replay"
+            archive_id = None
+            api_batch_id = str(api_batch_record["batch_id"])
+        else:
+            provenance_kind = "live_capture"
+            archive_id = None
+            api_batch_id = None
         self.flush()
         inserted = 0
         with self.connect() as connection:
@@ -446,17 +505,11 @@ class BybitPublicPITStore:
                     "ingested_at": _iso(ingested_at),
                     "source": source,
                     "quality": quality,
-                    "provenance_kind": (
-                        "historical_archive_replay"
-                        if archive_record is not None
-                        else "live_capture"
-                    ),
-                    "archive_id": (
-                        str(archive_record["archive_id"])
-                        if archive_record is not None
-                        else None
-                    ),
+                    "provenance_kind": provenance_kind,
+                    "archive_id": archive_id,
                 }
+                if api_batch_id is not None:
+                    payload["api_batch_id"] = api_batch_id
                 digest = hashlib.sha256(_canonical(payload).encode()).hexdigest()
                 row = connection.execute(
                     "SELECT payload_sha256 FROM bybit_feature_observations WHERE observation_id=?",
@@ -471,8 +524,9 @@ class BybitPublicPITStore:
                 connection.execute(
                     """INSERT INTO bybit_feature_observations(
                            observation_id,symbol,name,value,unit,event_time,available_at,
-                           ingested_at,source,quality,payload_sha256,provenance_kind,archive_id
-                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                           ingested_at,source,quality,payload_sha256,provenance_kind,
+                           archive_id,api_batch_id
+                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         observation_id,
                         symbol,
@@ -487,6 +541,7 @@ class BybitPublicPITStore:
                         digest,
                         payload["provenance_kind"],
                         payload["archive_id"],
+                        payload.get("api_batch_id"),
                     ),
                 )
                 inserted += 1
@@ -532,6 +587,80 @@ class BybitPublicPITStore:
                         archive_record["last_event_time"],
                         int(archive_record["rows_read"]),
                         inserted,
+                        "completed",
+                        None,
+                    ),
+                )
+            if api_batch_record is not None:
+                expected_response_count = int(api_batch_record["response_count"])
+                if len(api_response_records) != expected_response_count:
+                    raise ValueError("API response provenance count does not match batch")
+                for response in api_response_records:
+                    if str(response["batch_id"]) != str(api_batch_record["batch_id"]):
+                        raise ValueError("API response references another batch")
+                    connection.execute(
+                        """INSERT INTO bybit_historical_api_responses(
+                               response_id,batch_id,request_url,requested_at,received_at,
+                               http_status,content_length,content_sha256,rows_read,ret_code
+                           ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                           ON CONFLICT(response_id) DO UPDATE SET
+                               batch_id=excluded.batch_id,
+                               request_url=excluded.request_url,
+                               requested_at=excluded.requested_at,
+                               received_at=excluded.received_at,
+                               http_status=excluded.http_status,
+                               content_length=excluded.content_length,
+                               content_sha256=excluded.content_sha256,
+                               rows_read=excluded.rows_read,
+                               ret_code=excluded.ret_code""",
+                        (
+                            response["response_id"],
+                            response["batch_id"],
+                            response["request_url"],
+                            response["requested_at"],
+                            response["received_at"],
+                            int(response["http_status"]),
+                            int(response["content_length"]),
+                            response["content_sha256"],
+                            int(response["rows_read"]),
+                            int(response["ret_code"]),
+                        ),
+                    )
+                connection.execute(
+                    """INSERT INTO bybit_historical_api_batches(
+                           batch_id,data_kind,market,symbol,trading_date,endpoint_group,
+                           requested_at,completed_at,first_event_time,last_event_time,
+                           response_count,rows_read,feature_observation_count,
+                           request_manifest_sha256,status,error
+                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(data_kind,market,symbol,trading_date) DO UPDATE SET
+                           batch_id=excluded.batch_id,
+                           endpoint_group=excluded.endpoint_group,
+                           requested_at=excluded.requested_at,
+                           completed_at=excluded.completed_at,
+                           first_event_time=excluded.first_event_time,
+                           last_event_time=excluded.last_event_time,
+                           response_count=excluded.response_count,
+                           rows_read=excluded.rows_read,
+                           feature_observation_count=excluded.feature_observation_count,
+                           request_manifest_sha256=excluded.request_manifest_sha256,
+                           status=excluded.status,
+                           error=excluded.error""",
+                    (
+                        api_batch_record["batch_id"],
+                        api_batch_record["data_kind"],
+                        api_batch_record["market"],
+                        api_batch_record["symbol"],
+                        api_batch_record["trading_date"],
+                        api_batch_record["endpoint_group"],
+                        api_batch_record["requested_at"],
+                        api_batch_record["completed_at"],
+                        api_batch_record.get("first_event_time"),
+                        api_batch_record.get("last_event_time"),
+                        expected_response_count,
+                        int(api_batch_record["rows_read"]),
+                        inserted,
+                        api_batch_record["request_manifest_sha256"],
                         "completed",
                         None,
                     ),
