@@ -6,6 +6,7 @@ import sqlite3
 import sys
 import tempfile
 from contextlib import closing
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -17,10 +18,18 @@ from contracts.strategy_release_v1 import StrategyReleaseBundle
 from core.release.strategy_bundle import canonical_bundle_hash
 
 
+def _iso(point: datetime) -> str:
+    return point.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def _prediction(stage: str, release_id: str = "sr_result_gate_test_001") -> dict:
+    # Ticket generation is intentionally time-gated.  Tests must provide a
+    # currently valid forecast instead of relying on a historical wall-clock
+    # literal that eventually expires on CI.
+    generated_at = datetime.now(timezone.utc)
     return {
-        "generated_at": "2026-08-21T08:00:00Z",
-        "latest_kline_ts": "2026-08-21T07:59:55Z",
+        "generated_at": _iso(generated_at),
+        "latest_kline_ts": _iso(generated_at - timedelta(seconds=5)),
         "trend": "up",
         "calibrated_trend": "up",
         "calibration_status": "valid",
@@ -68,7 +77,7 @@ def _bundle(stage: str, release_id: str = "sr_result_gate_test_001") -> Strategy
     payload = {
         "strategy_release_id": release_id,
         "release_stage": stage,
-        "created_at": "2026-08-21T07:00:00Z",
+        "created_at": _iso(datetime.now(timezone.utc) - timedelta(hours=1)),
         "code_commit": "1234567",
         "artifacts": hashes,
         "approval_id": "approval-test-001",
