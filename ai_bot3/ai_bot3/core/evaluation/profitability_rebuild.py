@@ -237,11 +237,14 @@ def _panel_rows(frame: pd.DataFrame, horizon_sec: int, bars: Sequence[MarketBar]
         "ret_1", "ret_2", "ret_3", "ret_6", "ret_12", "ret_24",
         "range_pct", "body_pct", "volume_zscore", "momentum_vol_ratio", "ma_gap_8_24",
     )
+    next_allowed_decision_at: datetime | None = None
     for index in range(48, len(features) - 1):
         row = features.iloc[index]
         if row[list(feature_names) + ["volatility", "liquidity"]].isna().any():
             continue
         signal_at = row["close_at"].to_pydatetime()
+        if next_allowed_decision_at is not None and signal_at < next_allowed_decision_at:
+            continue
         reference = float(row["close"])
         volatility_bps = max(20.0, min(300.0, float(row["volatility"]) * 10_000.0))
         stop_bps = max(25.0, volatility_bps * 1.25)
@@ -252,6 +255,10 @@ def _panel_rows(frame: pd.DataFrame, horizon_sec: int, bars: Sequence[MarketBar]
         # copies of the rest of history.
         max_wait_sec = max(30, min(300, horizon_sec // 2))
         path_end_time = signal_at + timedelta(seconds=max_wait_sec + horizon_sec)
+        # Decisions for the same symbol/horizon are scheduled on disjoint
+        # maximum execution windows.  BUY/SELL rows below are paired action
+        # alternatives at one decision, not independent opportunities.
+        next_allowed_decision_at = path_end_time
         path_end = index + 1
         while path_end < len(bars) and bars[path_end].open_time <= path_end_time:
             path_end += 1
@@ -560,6 +567,8 @@ class ProfitabilityRebuild:
                 rows.extend(_panel_rows(enriched, horizon, bars))
                 source_evidence[f"{symbol}:{horizon}"] = {
                     "timeframe": timeframe,
+                    "decision_sampling": "non_overlapping_max_execution_windows",
+                    "paired_side_alternatives": True,
                     **coverage,
                 }
             panels[horizon] = pd.DataFrame(rows)
