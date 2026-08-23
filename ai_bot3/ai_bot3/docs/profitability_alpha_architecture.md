@@ -22,11 +22,13 @@ flowchart TD
     C[Bybit 公共 WS / 官方 archive / 官方 REST] --> D[Bybit PIT SQLite<br/>event / available / ingested / hash]
     E[参考 data_service canonical panel<br/>PASS SHA + 显式资产白名单 + 30h lag] --> F[跨资产 PIT returns]
     G[FRED / ALFRED 官方 API<br/>output 4 初值 + output 3 修订] --> H[宏观 vintage PIT SQLite<br/>原始响应哈希]
+    AC[Coin Metrics Community API<br/>USDC + USDT SplyCur] --> AD[稳定币发行 flow PIT SQLite<br/>48h lag + 原始响应哈希]
 
     B --> I[Triple Barrier 全持仓路径标签]
     D --> J[按 symbol + available_at as-of join]
     F --> K[全局 available_at as-of join]
     H --> K
+    AD --> K
     I --> L[跨币种 pooled panel<br/>180 / 900 / 7200 / 14400 / 86400]
     J --> L
     K --> L
@@ -56,7 +58,7 @@ flowchart TD
 | 层 | 主要模块 | 只负责什么 | 不允许做什么 |
 |---|---|---|---|
 | 原始数据 | `core/providers/*` | 抓取、解析、哈希、PIT 时间和 append-only 证据 | 训练、调参、生成交易信号 |
-| PIT 接入 | `core/training/bybit_pit_panel.py`、`macro_pit_panel.py`、`pit_factor_panel.py` | 冻结 sequence/SHA，按决策时间 as-of join，执行 staleness 和来源契约 | 广播当前值到历史、填造缺失因子 |
+| PIT 接入 | `core/training/bybit_pit_panel.py`、`macro_pit_panel.py`、`flow_pit_panel.py`、`pit_factor_panel.py` | 冻结 sequence/SHA，按决策时间 as-of join，执行 staleness 和来源契约 | 广播当前值到历史、填造缺失因子 |
 | 标签 | `core/labels/triple_barrier.py` | entry fill、TP/SL、max holding、费用、MAE/MFE、partial fill、exit reason | close-to-close 冒充成交结果 |
 | 数据集 | `core/training/pooled_panel.py` | pooled panel、因果 regime、purge、embargo、sealed lockbox | 使用全样本定义 regime、物化封存 lockbox 标签 |
 | 选模 | `core/training/nested_walk_forward.py` | inner OOS 选参，outer OOS 只评分一次 | 用 outer OOS 调参 |
@@ -126,11 +128,13 @@ flowchart TD
 
 所有宏观响应都保存原始内容 SHA-256；API key 不写入 URL descriptor、数据库、报告或异常。
 
-### 5.5 尚未合格的 flow
+### 5.5 Flow
 
-- DefiLlama stablecoin 历史是当前抓取时得到的重建 stock history，只能以 fetch-time 为可用时间；不能冒充历史 exchange netflow。
-- CoinShares 当前公开页只能从首次本地观察日起向前积累；不是历史 vintage archive，也不是 issuer-level ETF cash flow。
-- 因此 flow 组当前必须 `FAILED_DATA_UNAVAILABLE` 或 forward-only collecting，不能进入正式 feature set。
+- 稳定币组使用 Coin Metrics Community API 的 USDC/USDT `SplyCur` 链上供应，派生 1 日/7 日净发行额和 7 日供应变化率。语义是发行/赎回，不是交易所净流入；available_at 使用 metric day + 48h，官方原始响应与 SHA-256 一并冻结，后续发现历史值冲突即失败关闭。
+- DefiLlama 的当前重建 stock history 不作为这组历史 PIT 的证据，也不再使用误导性的 `stablecoin_exchange_netflow_1h` 名称。
+- 数字资产 fund flow 使用 CoinShares 官方历史周报：sitemap、每篇原文、明确 `Published on` 日期和 SHA-256 全部保留，形成 `digital_asset_fund_flow_weekly_usd`。它是全球数字资产投资产品周净流量，不是每日 issuer-level ETF creation/redemption；年度汇总页和语义不明确页必须排除。
+- parser 修正采用 append-only 新版本；旧错误解析不删除，而是写入失效记录。训练 loader 对同一发布时间只选择最高有效 sequence，并验证其原文哈希。
+- 稳定币与 fund flow 分开消融，不能互相替代；只有真实 OOS 足量交易且费用后稳定增益的组才能进入正式 feature set。
 
 ## 6. 防泄漏与过拟合控制
 

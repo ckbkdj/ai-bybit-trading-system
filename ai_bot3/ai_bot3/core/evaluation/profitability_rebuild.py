@@ -50,6 +50,10 @@ from core.training.macro_pit_panel import (
     MACRO_FEATURE_CONTRACTS,
     MacroPITFeatureSource,
 )
+from core.training.flow_pit_panel import (
+    FLOW_FEATURE_CONTRACTS,
+    FlowPITFeatureSource,
+)
 from core.training.pit_factor_panel import TradPanelHistorySource
 
 
@@ -77,7 +81,10 @@ LONG_FACTOR_GROUPS: Mapping[str, tuple[str, ...]] = {
     "healthcare": ("xlv_return", "ibb_return"),
     "china": ("fxi_return", "kweb_return"),
     "crypto_equities": ("coin_return", "mstr_return"),
-    "flows": ("crypto_etf_netflow_daily", "stablecoin_exchange_netflow_1h"),
+    "stablecoin_flows": tuple(
+        name for name in FLOW_FEATURE_CONTRACTS if name.startswith("stablecoin_")
+    ),
+    "fund_flows": ("digital_asset_fund_flow_weekly_usd",),
     "macro_vintage": (
         "fred_cpi_first_release_yoy_ratio",
         "fred_payrolls_first_release_change_thousands",
@@ -105,6 +112,8 @@ class ProfitabilityRebuildConfig:
     bybit_pit_store_path: Path | None = None
     macro_pit_store_path: Path | None = None
     verify_macro_raw_hashes: bool = True
+    flow_pit_store_path: Path | None = None
+    verify_flow_raw_hashes: bool = True
     max_bars_per_symbol: int = 200_000
     walk_forward_folds: int = 3
     lockbox_fraction: float = 0.15
@@ -1161,6 +1170,12 @@ class ProfitabilityRebuild:
                 config.macro_pit_store_path,
                 verify_raw_hashes=config.verify_macro_raw_hashes,
             ).maximum_sequence()
+        self.flow_pit_snapshot_maximum_sequence = None
+        if config.flow_pit_store_path is not None:
+            self.flow_pit_snapshot_maximum_sequence = FlowPITFeatureSource(
+                config.flow_pit_store_path,
+                verify_raw_hashes=config.verify_flow_raw_hashes,
+            ).maximum_sequence()
         feature_store_stat = config.feature_store_path.stat()
         run_payload = {
             "code_commit": config.code_commit,
@@ -1184,6 +1199,13 @@ class ProfitabilityRebuild:
             ),
             "macro_pit_snapshot_maximum_sequence": self.macro_pit_snapshot_maximum_sequence,
             "verify_macro_raw_hashes": config.verify_macro_raw_hashes,
+            "flow_pit_store": (
+                str(config.flow_pit_store_path.resolve())
+                if config.flow_pit_store_path
+                else None
+            ),
+            "flow_pit_snapshot_maximum_sequence": self.flow_pit_snapshot_maximum_sequence,
+            "verify_flow_raw_hashes": config.verify_flow_raw_hashes,
             "max_bars_per_symbol": config.max_bars_per_symbol,
             "horizons": HORIZONS_SEC,
             "symbols": SYMBOLS,
@@ -1283,6 +1305,25 @@ class ProfitabilityRebuild:
                 )
             source_evidence["fred_alfred_pit"] = macro_pit_evidence
 
+        flow_source: FlowPITFeatureSource | None = None
+        flow_history: pd.DataFrame | None = None
+        flow_pit_evidence: dict[str, object] | None = None
+        if self.config.flow_pit_store_path is not None:
+            flow_names = tuple(FLOW_FEATURE_CONTRACTS)
+            flow_source = FlowPITFeatureSource(
+                self.config.flow_pit_store_path,
+                verify_raw_hashes=self.config.verify_flow_raw_hashes,
+            )
+            flow_history, flow_pit_evidence = flow_source.load(
+                flow_names,
+                maximum_sequence=self.flow_pit_snapshot_maximum_sequence,
+            )
+            for horizon in HORIZONS_SEC:
+                panels[horizon] = flow_source.join(
+                    panels[horizon], names=flow_names, history=flow_history
+                )
+            source_evidence["coinmetrics_stablecoin_pit"] = flow_pit_evidence
+
         bybit_source: BybitPITFeatureSource | None = None
         bybit_history: pd.DataFrame | None = None
         bybit_names: tuple[str, ...] = ()
@@ -1361,7 +1402,11 @@ class ProfitabilityRebuild:
         evaluated_factor_groups = _evaluate_legacy_technical_ablation(
             datasets, market, selector, ablation_backtest
         )
-        if trad_panel_evidence is not None or macro_pit_evidence is not None:
+        if (
+            trad_panel_evidence is not None
+            or macro_pit_evidence is not None
+            or flow_pit_evidence is not None
+        ):
             evaluated_factor_groups.update(
                 _evaluate_long_factor_ablation(
                     datasets, market, selector, ablation_backtest

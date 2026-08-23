@@ -1,0 +1,196 @@
+from __future__ import annotations
+
+import hashlib
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+from core.providers.coinshares_fund_flow_pit import (
+    FEATURE_NAME,
+    SITEMAP_URL,
+    CoinSharesFundFlowPITStore,
+    HTTPPayload,
+    backfill_coinshares_fund_flow_pit,
+    _weekly_flow,
+)
+from core.training.flow_pit_panel import FlowPITFeatureSource
+
+
+UTC = timezone.utc
+FETCHED = datetime(2026, 8, 24, tzinfo=UTC)
+START = date(2025, 1, 6)
+
+
+def _ordinal(day: int) -> str:
+    if 10 <= day % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+    return f"{day}{suffix}"
+
+
+def _article(index: int, *, parsable: bool = True) -> bytes:
+    published = START + timedelta(days=index * 7)
+    published_text = f"{published.strftime('%b')} {_ordinal(published.day)}, {published.year}"
+    if parsable:
+        direction = "inflows" if index % 2 == 0 else "outflows"
+        flow = f"US${100 + index}m"
+        paragraph = (
+            f"Digital asset investment products saw {direction} totalling {flow} "
+            "last week."
+        )
+    else:
+        paragraph = "Digital asset investment products had an uneventful week."
+    return (
+        '<html><body><div class="article-content__main"><p>'
+        + paragraph
+        + '</p></div><p class="published-on">Published on<span>'
+        + published_text
+        + "</span></p></body></html>"
+    ).encode()
+
+
+def _sitemap() -> bytes:
+    urls = "".join(
+        (
+            "<url><loc>https://coinshares.test/insights/research-data/"
+            f"fund-flows-{index:03d}/</loc></url>"
+        )
+        for index in range(60)
+    )
+    return (
+        '<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        + urls
+        + "</urlset>"
+    ).encode()
+
+
+def _requester(url: str, timeout_sec: float) -> HTTPPayload:
+    assert timeout_sec > 0
+    body = _sitemap() if url == SITEMAP_URL else _article(int(url.rstrip("/").rsplit("-", 1)[-1]))
+    return HTTPPayload(
+        body=body,
+        requested_at=FETCHED - timedelta(seconds=1),
+        received_at=FETCHED,
+        http_status=200,
+    )
+
+
+def test_coinshares_backfill_uses_published_date_raw_hashes_and_signed_weekly_flow(
+    tmp_path: Path,
+):
+    database = tmp_path / "flows.sqlite3"
+    cache = tmp_path / "raw"
+    report = backfill_coinshares_fund_flow_pit(
+        CoinSharesFundFlowPITStore(database),
+        cache_dir=cache,
+        publication_start=START,
+        publication_end=START + timedelta(days=59 * 7),
+        workers=2,
+        requester=_requester,
+    )
+
+    assert report["status"] == "PASS"
+    assert report["feature_observation_count"] == 60
+    assert report["excluded_count"] == 0
+    assert "not daily issuer-level" in report["semantic_scope"]
+    with CoinSharesFundFlowPITStore(database).connect() as connection:
+        responses = connection.execute(
+            "SELECT * FROM coinshares_responses"
+        ).fetchall()
+        observations = connection.execute(
+            "SELECT * FROM flow_pit_observations ORDER BY available_at"
+        ).fetchall()
+    assert len(responses) == 60
+    assert len(observations) == 60
+    assert observations[0]["value"] == 100_000_000
+    assert observations[1]["value"] == -101_000_000
+    assert all(row["event_time"] <= row["available_at"] <= row["ingested_at"] for row in observations)
+    for response in responses:
+        raw_path = Path(response["raw_response_path"])
+        assert hashlib.sha256(raw_path.read_bytes()).hexdigest() == response[
+            "content_sha256"
+        ]
+
+    source = FlowPITFeatureSource(database)
+    history, evidence = source.load(
+        [FEATURE_NAME], maximum_sequence=source.maximum_sequence()
+    )
+    assert evidence["response_count"] == 60
+    decisions = pd.DataFrame(
+        {
+            "decision_at": [
+                datetime.combine(START, datetime.min.time(), UTC),
+                datetime.combine(START + timedelta(days=1), datetime.min.time(), UTC),
+            ]
+        }
+    )
+    joined = source.join(decisions, names=[FEATURE_NAME], history=history)
+    assert pd.isna(joined.loc[0, FEATURE_NAME])
+    assert joined.loc[1, FEATURE_NAME] == 100_000_000
+    assert joined.loc[1, f"{FEATURE_NAME}__available_at"] <= joined.loc[1, "decision_at"]
+
+
+def test_coinshares_unparsable_article_is_explicitly_excluded(tmp_path: Path):
+    def requester(url: str, timeout_sec: float) -> HTTPPayload:
+        if url == SITEMAP_URL:
+            body = _sitemap()
+        else:
+            index = int(url.rstrip("/").rsplit("-", 1)[-1])
+            body = _article(index, parsable=index != 7)
+        return HTTPPayload(
+            body=body,
+            requested_at=FETCHED - timedelta(seconds=1),
+            received_at=FETCHED,
+            http_status=200,
+        )
+
+    report = backfill_coinshares_fund_flow_pit(
+        CoinSharesFundFlowPITStore(tmp_path / "flows.sqlite3"),
+        cache_dir=tmp_path / "raw",
+        publication_start=START,
+        publication_end=START + timedelta(days=59 * 7),
+        requester=requester,
+    )
+    assert report["status"] == "PASS_WITH_EXCLUSIONS"
+    assert report["feature_observation_count"] == 59
+    assert report["excluded_count"] == 1
+    assert "no parsable global weekly flow" in report["exclusions"][0]["reason"]
+
+
+def test_coinshares_parser_separates_headline_cumulative_and_nearest_direction():
+    body = b"""
+        <html><body>
+        <h2>US ETFs reached US$62.9bn in cumulative net inflows</h2>
+        <p>Digital asset investment products rebounded from the previous week's
+        outflows, recording inflows of US$882m last week and bringing YTD
+        inflows to US$6.7bn.</p>
+        </body></html>
+    """
+    value, sentence = _weekly_flow(body)
+    assert value == 882_000_000
+    assert "US$882m" in sentence
+
+    body = b"""
+        <html><body>
+        <h2>Record outflows of US$3.8bn over three weeks</h2>
+        <p>Digital asset investment products saw the largest weekly outflows
+        on record at US$2.9bn, bringing the three-week total to US$3.8bn.</p>
+        </body></html>
+    """
+    value, _ = _weekly_flow(body)
+    assert value == -2_900_000_000
+
+    value, _ = _weekly_flow(
+        b"<p>Digital asset investment products experienced weekly outflows "
+        b"totalling US$725,7m.</p>"
+    )
+    assert value == -725_700_000
+
+    with pytest.raises(ValueError, match="annual aggregate"):
+        _weekly_flow(
+            b"<p>Digital asset investment products finished 2025 with global "
+            b"inflows totalling US$47.2B, below the 2024 record.</p>"
+        )

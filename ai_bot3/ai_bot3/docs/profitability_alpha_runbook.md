@@ -77,6 +77,33 @@ python scripts/backfill_fred_alfred_pit.py `
 
 ## 4. Bybit public-only 实时采集
 
+在启动 Bybit 采集前，可先回填无需密钥的稳定币链上发行 flow：
+
+```powershell
+python scripts/backfill_coinmetrics_stablecoin_pit.py `
+  --start 2018-01-01 `
+  --end 2026-08-20 `
+  --database data/flow_pit.sqlite3 `
+  --cache-dir data/coinmetrics_cache `
+  --report model_results/evaluation/coinmetrics_stablecoin_backfill_report.json
+```
+
+审计必须确认原始响应长度/SHA 一致、时序违规为 0、descriptor 无 key，并明确这些列是 USDC/USDT 发行/赎回变化而不是 exchange netflow。任何后续抓取与既有历史值冲突都应失败关闭，不能覆盖旧证据。
+
+数字资产投资产品周 flow 使用 CoinShares 官方历史发布物：
+
+```powershell
+python scripts/backfill_coinshares_fund_flow_pit.py `
+  --start 2024-01-01 `
+  --end 2026-08-20 `
+  --database data/flow_pit.sqlite3 `
+  --cache-dir data/coinshares_cache `
+  --workers 4 `
+  --report model_results/evaluation/coinshares_fund_flow_backfill_report.json
+```
+
+检查 sitemap 文章数、成功解析数、exclusions、发布日期唯一性、最大周度间隔、正负号和极值。累计/YTD/年度金额不得当成周流量；parser 修正必须新增版本和失效记录，不能删除旧错误证据。该列不是日度 issuer-level ETF creation/redemption，报告和模型卡中必须保留这一语义边界。
+
 启动命令只允许公开线性行情 endpoint，不含认证或交易参数：
 
 ```powershell
@@ -178,6 +205,7 @@ python -c "import sqlite3; c=sqlite3.connect(r'data/bybit_public_pit.sqlite3', t
 python scripts/run_profitability_rebuild.py `
   --trad-panel-root D:\lh\trad_data_service_20260821\data_service `
   --macro-pit-store D:\Money\ai_bot3\ai_bot3\data\macro_pit.sqlite3 `
+  --flow-pit-store D:\Money\ai_bot3\ai_bot3\data\flow_pit.sqlite3 `
   --bybit-pit-store D:\Money\ai_bot3\ai_bot3\data\bybit_public_pit.sqlite3 `
   --max-bars-per-symbol 200000 `
   --walk-forward-folds 3
