@@ -133,6 +133,25 @@ def _atomic_json(path: Path, payload: object) -> None:
     temporary.replace(path)
 
 
+def _ablation_ledger_summary(result: Mapping[str, object]) -> dict[str, object]:
+    return {
+        key: result.get(key)
+        for key in (
+            "oos_ablation_status",
+            "evaluated",
+            "pit_observation_count",
+            "oos_fold_count",
+            "execution_evidence",
+            "mean_improvement",
+            "improved_fold_ratio",
+            "worst_fold_improvement",
+            "retained",
+            "formal_feature_set",
+        )
+        if key in result
+    }
+
+
 def _utc_ms(value: int) -> datetime:
     return datetime.fromtimestamp(int(value) / 1000.0, timezone.utc)
 
@@ -771,12 +790,14 @@ def _evaluate_long_factor_ablation(
     market: Mapping[str, Sequence[MarketBar]],
     selector: NestedWalkForwardSelector,
     backtest: EventDrivenBacktest,
+    *,
+    factor_groups: Mapping[str, tuple[str, ...]] = LONG_FACTOR_GROUPS,
 ) -> dict[str, dict[str, object]]:
     results: dict[str, dict[str, object]] = {}
     long_datasets = {
         horizon: dataset for horizon, dataset in datasets.items() if horizon >= 7200
     }
-    for group, required_columns in LONG_FACTOR_GROUPS.items():
+    for group, required_columns in factor_groups.items():
         columns = tuple(
             column
             for column in required_columns
@@ -968,13 +989,14 @@ def _evaluate_bybit_pit_ablation(
     backtest: EventDrivenBacktest,
     source_evidence: Mapping[str, object],
     *,
+    factor_groups: Mapping[str, tuple[str, ...]] = SHORT_FACTOR_GROUPS,
     minimum_history_days: float = 30.0,
 ) -> dict[str, dict[str, object]]:
     """Ablate real short-horizon features only after sufficient PIT history exists."""
 
     results: dict[str, dict[str, object]] = {}
     coverage = dict(source_evidence.get("feature_coverage") or {})
-    for group, columns in SHORT_FACTOR_GROUPS.items():
+    for group, columns in factor_groups.items():
         required_coverage = [
             coverage.get(f"{symbol}:{column}")
             for symbol in SYMBOLS
@@ -1399,29 +1421,89 @@ class ProfitabilityRebuild:
         ablation_backtest = EventDrivenBacktest(
             BacktestConfig(require_positive_lower_bound_edge=False)
         )
-        evaluated_factor_groups = _evaluate_legacy_technical_ablation(
+        evaluated_factor_groups: dict[str, dict[str, object]] = {}
+        self.ledger.append_event(
+            self.trial_id,
+            "running",
+            {
+                "phase": "factor_ablation_group_started",
+                "factor_group": "legacy_brain_technical",
+            },
+        )
+        legacy_result = _evaluate_legacy_technical_ablation(
             datasets, market, selector, ablation_backtest
+        )
+        evaluated_factor_groups.update(legacy_result)
+        self.ledger.append_event(
+            self.trial_id,
+            "running",
+            {
+                "phase": "factor_ablation_group_completed",
+                "factor_group": "legacy_brain_technical",
+                "result": _ablation_ledger_summary(
+                    legacy_result["legacy_brain_technical"]
+                ),
+            },
         )
         if (
             trad_panel_evidence is not None
             or macro_pit_evidence is not None
             or flow_pit_evidence is not None
         ):
-            evaluated_factor_groups.update(
-                _evaluate_long_factor_ablation(
-                    datasets, market, selector, ablation_backtest
+            for group, columns in LONG_FACTOR_GROUPS.items():
+                self.ledger.append_event(
+                    self.trial_id,
+                    "running",
+                    {
+                        "phase": "factor_ablation_group_started",
+                        "factor_group": group,
+                    },
                 )
-            )
+                result = _evaluate_long_factor_ablation(
+                    datasets,
+                    market,
+                    selector,
+                    ablation_backtest,
+                    factor_groups={group: columns},
+                )
+                evaluated_factor_groups.update(result)
+                self.ledger.append_event(
+                    self.trial_id,
+                    "running",
+                    {
+                        "phase": "factor_ablation_group_completed",
+                        "factor_group": group,
+                        "result": _ablation_ledger_summary(result[group]),
+                    },
+                )
         if bybit_pit_evidence is not None:
-            evaluated_factor_groups.update(
-                _evaluate_bybit_pit_ablation(
+            for group, columns in SHORT_FACTOR_GROUPS.items():
+                self.ledger.append_event(
+                    self.trial_id,
+                    "running",
+                    {
+                        "phase": "factor_ablation_group_started",
+                        "factor_group": group,
+                    },
+                )
+                result = _evaluate_bybit_pit_ablation(
                     datasets,
                     market,
                     selector,
                     ablation_backtest,
                     bybit_pit_evidence,
+                    factor_groups={group: columns},
                 )
-            )
+                evaluated_factor_groups.update(result)
+                self.ledger.append_event(
+                    self.trial_id,
+                    "running",
+                    {
+                        "phase": "factor_ablation_group_completed",
+                        "factor_group": group,
+                        "result": _ablation_ledger_summary(result[group]),
+                    },
+                )
         factor_report = _factor_ablation_report(evaluated_factor_groups)
         self.ledger.append_event(
             self.trial_id,
