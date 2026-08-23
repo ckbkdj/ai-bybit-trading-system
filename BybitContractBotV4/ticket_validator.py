@@ -36,7 +36,18 @@ class TicketValidator:
                 "UNAPPROVED_STRATEGY_RELEASE",
                 "ticket strategy_release_id is not the configured approved release",
             )
-        if ticket.intent.action in {"OPEN", "INCREASE", "REPLACE"}:
+        if ticket.intent.action == "REPLACE":
+            # The contract reserves REPLACE for a future versioned amend or
+            # cancel/replace state machine.  The current executor can create a
+            # new order but cannot prove that the target order was atomically
+            # amended or terminally cancelled first.  Accepting it would permit
+            # both orders to remain live and could double the intended exposure.
+            return ValidationResult(
+                False,
+                "REPLACE_NOT_IMPLEMENTED",
+                "REPLACE is blocked until target-order cancellation/amendment and recovery are atomic and tested",
+            )
+        if ticket.intent.action in {"OPEN", "INCREASE"}:
             if ticket.entry is None or ticket.protection is None or ticket.protection.stop_loss is None:
                 return ValidationResult(False, "MISSING_RISK_FIELDS", "entry and stop loss are required")
         return ValidationResult(True, "VALID", "ticket contract and validity checks passed")
