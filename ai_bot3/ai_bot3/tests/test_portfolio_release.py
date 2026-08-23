@@ -72,6 +72,8 @@ def test_multi_horizon_signal_book_nets_once_and_ticket_references_decision():
     assert ticket.intent.side == "BUY"
     assert ticket.guards.execution_market == "bybit"
     assert ticket.guards.forecast_market == "binance"
+    assert ticket.created_at == intent.created_at
+    assert ticket.expires_at <= intent.valid_until
 
 
 def test_one_horizon_event_block_vetoes_the_whole_portfolio():
