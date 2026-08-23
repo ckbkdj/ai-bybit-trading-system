@@ -33,7 +33,17 @@ class TicketBuilder:
         stop_price = reference_price * (1 - direction * stop_bps / 10_000)
         take_profit_bps = max(decision.gross_edge_bps, stop_bps * cfg.default_take_profit_multiple)
         take_profit_price = reference_price * (1 + direction * take_profit_bps / 10_000)
-        created_at = forecast.time.created_at
+        created_at = (
+            portfolio_intent.created_at
+            if portfolio_intent is not None
+            else forecast.time.created_at
+        )
+        expires_at = created_at + timedelta(seconds=cfg.ticket_ttl_sec)
+        if portfolio_intent is not None:
+            # The executable ticket cannot outlive the multi-horizon decision
+            # that authorized it.  The shortest contributing horizon therefore
+            # remains a hard upper bound even when the normal ticket TTL is longer.
+            expires_at = min(expires_at, portfolio_intent.valid_until)
         ticket_id = deterministic_id(
             "tk",
             portfolio_intent.portfolio_decision_id if portfolio_intent else forecast.forecast_id,
@@ -65,7 +75,7 @@ class TicketBuilder:
                 "supersedes_ticket_id": supersedes_ticket_id,
                 "created_at": created_at,
                 "valid_from": created_at,
-                "expires_at": created_at + timedelta(seconds=cfg.ticket_ttl_sec),
+                "expires_at": expires_at,
                 "instrument": {"symbol": forecast.instrument.symbol},
                 "intent": {
                     "action": "OPEN" if supersedes_ticket_id is None else "REPLACE",

@@ -138,9 +138,16 @@ class TradingSettings:
         route = value("PREDICTION_API_ROUTE", "/results/{symbol}")
         if "{symbol}" not in route:
             raise SettingsError("PREDICTION_API_ROUTE must contain {symbol}")
-        position_mode = value("BYBIT_POSITION_MODE", "hedge").lower()
+        # The active ledger is intentionally net-position based.  Until orders,
+        # fills, snapshots and ownership checks are keyed by positionIdx/leg,
+        # two simultaneous hedge legs cannot be represented without ambiguity.
+        position_mode = value("BYBIT_POSITION_MODE", "one_way").lower()
         if position_mode not in {"hedge", "one_way"}:
             raise SettingsError("BYBIT_POSITION_MODE must be hedge or one_way")
+        if mode in {TradingMode.TESTNET, TradingMode.LIVE} and position_mode == "hedge":
+            raise SettingsError(
+                f"{mode.value} hedge mode is blocked until the execution ledger is positionIdx-aware"
+            )
         dedicated_subaccount = _truthy(value("BYBIT_DEDICATED_SUBACCOUNT", "false"))
         position_owner_id = value("POSITION_OWNER_ID", "shadow-primary-owner")
         allow_manual_orders = _truthy(value("BYBIT_ALLOW_MANUAL_ORDERS", "false"))
