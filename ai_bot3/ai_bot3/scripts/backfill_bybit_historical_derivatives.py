@@ -84,7 +84,7 @@ def main() -> int:
     if not symbols or any(not SYMBOL_PATTERN.fullmatch(symbol) for symbol in symbols):
         raise SystemExit("--symbols contains an invalid linear USDT symbol")
     kinds = tuple(dict.fromkeys(args.kinds))
-    store = BybitPublicPITStore(args.database)
+    store = BybitPublicPITStore(args.database, busy_timeout_sec=300.0)
     records: list[dict[str, object]] = []
     attempted = 0
     completed = 0

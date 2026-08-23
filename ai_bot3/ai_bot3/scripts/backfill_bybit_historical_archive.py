@@ -111,6 +111,7 @@ def main() -> int:
         batch_writes=True,
         batch_max_operations=160,
         batch_max_interval_sec=0.10,
+        busy_timeout_sec=300.0,
     )
     args.cache_dir.mkdir(parents=True, exist_ok=True)
     started_at = datetime.now(timezone.utc)

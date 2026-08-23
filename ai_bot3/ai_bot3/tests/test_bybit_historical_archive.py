@@ -174,6 +174,12 @@ def test_archive_downloader_rejects_non_allowlisted_hosts_before_network(tmp_pat
         raise AssertionError("untrusted archive host was accepted")
 
 
+def test_backfill_store_can_use_a_bounded_extended_sqlite_busy_timeout(tmp_path):
+    store = BybitPublicPITStore(tmp_path / "pit.sqlite3", busy_timeout_sec=45.0)
+    with store.connect() as connection:
+        assert connection.execute("PRAGMA busy_timeout").fetchone()[0] == 45_000
+
+
 def test_invalid_archive_is_rejected_before_any_feature_rows_are_committed(tmp_path):
     database = tmp_path / "pit.sqlite3"
     archive = tmp_path / "invalid-book.zip"

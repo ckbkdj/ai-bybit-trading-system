@@ -57,14 +57,20 @@ class BybitPublicPITStore:
         batch_writes: bool = False,
         batch_max_operations: int = 1_000,
         batch_max_interval_sec: float = 0.25,
+        busy_timeout_sec: float = 30.0,
     ) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        if batch_max_operations <= 0 or batch_max_interval_sec <= 0:
+        if (
+            batch_max_operations <= 0
+            or batch_max_interval_sec <= 0
+            or not 0 < busy_timeout_sec <= 600
+        ):
             raise ValueError("invalid public PIT batch configuration")
         self.batch_writes = bool(batch_writes)
         self.batch_max_operations = int(batch_max_operations)
         self.batch_max_interval_sec = float(batch_max_interval_sec)
+        self.busy_timeout_sec = float(busy_timeout_sec)
         self._batch_connection: sqlite3.Connection | None = None
         self._pending_operations = 0
         self._last_batch_commit = time.monotonic()
@@ -258,11 +264,12 @@ class BybitPublicPITStore:
             self._batch_connection = None
 
     def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(str(self.path), timeout=30)
+        timeout_ms = max(1, int(round(self.busy_timeout_sec * 1_000)))
+        connection = sqlite3.connect(str(self.path), timeout=self.busy_timeout_sec)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=FULL")
-        connection.execute("PRAGMA busy_timeout=30000")
+        connection.execute(f"PRAGMA busy_timeout={timeout_ms}")
         return connection
 
     def start_session(
