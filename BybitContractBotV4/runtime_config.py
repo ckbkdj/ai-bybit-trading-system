@@ -68,6 +68,11 @@ class TradingSettings:
     health_host: str
     health_port: int
     position_mode: str
+    dedicated_subaccount: bool
+    position_owner_id: str
+    allow_manual_orders: bool
+    approved_strategy_release_id: str
+    app_code_commit: str
 
     @classmethod
     def load(
@@ -136,6 +141,28 @@ class TradingSettings:
         position_mode = value("BYBIT_POSITION_MODE", "hedge").lower()
         if position_mode not in {"hedge", "one_way"}:
             raise SettingsError("BYBIT_POSITION_MODE must be hedge or one_way")
+        dedicated_subaccount = _truthy(value("BYBIT_DEDICATED_SUBACCOUNT", "false"))
+        position_owner_id = value("POSITION_OWNER_ID", "shadow-primary-owner")
+        allow_manual_orders = _truthy(value("BYBIT_ALLOW_MANUAL_ORDERS", "false"))
+        approved_strategy_release_id = value("APPROVED_STRATEGY_RELEASE_ID")
+        app_code_commit = value("APP_CODE_COMMIT")
+        if mode in {TradingMode.TESTNET, TradingMode.LIVE}:
+            if not dedicated_subaccount:
+                raise SettingsError(
+                    f"{mode.value} requires BYBIT_DEDICATED_SUBACCOUNT=true"
+                )
+            if len(position_owner_id) < 8:
+                raise SettingsError(f"{mode.value} requires a stable POSITION_OWNER_ID")
+            if allow_manual_orders:
+                raise SettingsError(
+                    f"{mode.value} dedicated execution account forbids manual orders"
+                )
+            if len(approved_strategy_release_id) < 8:
+                raise SettingsError(
+                    f"{mode.value} requires APPROVED_STRATEGY_RELEASE_ID"
+                )
+            if len(app_code_commit) < 7 or app_code_commit == "workspace-uncommitted":
+                raise SettingsError(f"{mode.value} requires a deployed APP_CODE_COMMIT")
 
         return cls(
             root=service_root,
@@ -186,6 +213,11 @@ class TradingSettings:
             health_host=value("HEALTH_HOST", "127.0.0.1"),
             health_port=health_port,
             position_mode=position_mode,
+            dedicated_subaccount=dedicated_subaccount,
+            position_owner_id=position_owner_id,
+            allow_manual_orders=allow_manual_orders,
+            approved_strategy_release_id=approved_strategy_release_id,
+            app_code_commit=app_code_commit,
         )
 
     @property

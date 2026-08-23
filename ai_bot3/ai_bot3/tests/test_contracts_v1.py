@@ -28,6 +28,8 @@ def operation_payload():
         "ticket_id": "tk_01k2contracttest",
         "forecast_id": "fc_01k2contracttest",
         "forecast_revision": 1,
+        "portfolio_decision_id": "pd_01k2contracttest",
+        "strategy_release_id": "sr_01k2contracttest",
         "created_at": NOW,
         "valid_from": NOW,
         "expires_at": NOW + timedelta(minutes=5),

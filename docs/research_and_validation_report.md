@@ -42,13 +42,13 @@
 
 | 验证 | 结果 |
 |---|---|
-| 预测端全量 pytest | 112 passed |
-| 交易端全量 pytest | 43 passed |
+| 预测端全量 pytest | 121 passed |
+| 交易端全量 pytest | 59 passed |
 | 本机 HTTP 影子闭环 | 1 ticket、1 shadow order、1 receipt，PASS |
 | 参考 data_service 原测试 | 3 passed |
 | 新特征库完整性 | quick_check=ok；raw/enhanced 各 2,587,737 行 |
 | 外部 2.2 GB Parquet 真值适配 | SHA 验证通过；最新更新状态降级；24 个字段仅影子 |
-| Brain 全组合强制重训 | 20 shadow、5 rejected、0 candidate、0 live |
+| Brain 旧缓存强制重训 | 20 shadow、5 rejected、0 candidate、0 live；已确认为旧短缓存路径，不代表新特征库评估 |
 | 旧历史费用后诊断 | -13.48%，不能证明真实交易收益 |
 
 ## 进入真钱前的最低证据
@@ -58,4 +58,3 @@
 - 故障注入覆盖断网、重复消息、丢消息、限流、时钟漂移、部分成交、撤单/成交竞争和进程重启。
 - 策略、数据、代码、模型、配置和批准 ID 可重现；任何一个 SHA 不一致都停止晋升。
 - 小流量 live 还需独立人工批准，且每日损失、净值回撤、保证金和 kill switch 都能实际阻断新风险。
-

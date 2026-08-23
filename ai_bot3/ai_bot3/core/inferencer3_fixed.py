@@ -381,8 +381,8 @@ def run_keras_inference_in_process(prepared_data: Dict[str, Any]) -> Dict[str, A
         "current_price_age_seconds": prepared_data.get("current_price_age_seconds"),
         "current_price_warning": prepared_data.get("current_price_warning"),
         "data_source_reliable": source_reliable,
-        "out_of_distribution_score": ood.score if ood is not None else 1.0,
-        "out_of_distribution_details": (
+        "range_guard_score": ood.score if ood is not None else 1.0,
+        "range_guard_details": (
             {
                 "method": ood.method,
                 "violation_fraction": ood.violation_fraction,

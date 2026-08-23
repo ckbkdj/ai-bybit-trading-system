@@ -30,6 +30,8 @@ class PrivateStreamHandler:
         self.connected = False
         self.last_message_at: Optional[datetime] = None
         self.ignored_records = 0
+        self.connection_count = 0
+        self.disconnect_count = 0
         self._connection_probe: Optional[Callable[[], bool]] = None
 
     def set_connection_probe(self, probe: Callable[[], bool]) -> None:
@@ -51,10 +53,14 @@ class PrivateStreamHandler:
         return healthy
 
     def mark_connected(self) -> None:
+        if not self.connected:
+            self.connection_count += 1
         self.connected = True
         self.last_message_at = datetime.now(timezone.utc)
 
     def mark_disconnected(self) -> None:
+        if self.connected:
+            self.disconnect_count += 1
         self.connected = False
 
     def on_order(self, message: dict[str, Any]) -> None:

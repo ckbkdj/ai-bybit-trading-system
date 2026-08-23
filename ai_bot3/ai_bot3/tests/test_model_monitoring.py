@@ -9,7 +9,14 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from core.model_monitoring import factor_group_scores, scaled_feature_ood_score, source_is_reliable
+from core.model_monitoring import (
+    factor_group_scores,
+    population_stability_index,
+    predictive_health_metrics,
+    quantile_wasserstein_distance,
+    scaled_feature_ood_score,
+    source_is_reliable,
+)
 
 
 class _MinMaxScaler:
@@ -36,3 +43,20 @@ def test_source_reliability_and_factor_scores_are_explicit_and_bounded():
     )
     assert all(-1.0 <= score <= 1.0 for score in scores.values())
 
+
+def test_distribution_and_predictive_health_are_separate_metrics():
+    reference = np.linspace(-1, 1, 1000)
+    shifted = reference + 0.5
+    assert population_stability_index(reference, shifted) > 0
+    assert quantile_wasserstein_distance(reference, shifted) > 0.49
+    metrics = predictive_health_metrics(
+        [[0.8, 0.2], [0.3, 0.7], [0.6, 0.4]],
+        [0, 1, 1],
+        residuals=[0.1, -0.2, 0.05],
+        conformal_contains=[True, True, False],
+        regimes=["risk_on", "risk_on", "risk_off"],
+    )
+    assert 0 <= metrics["expected_calibration_error"] <= 1
+    assert metrics["brier_score"] > 0
+    assert metrics["conformal_coverage"] == 2 / 3
+    assert metrics["regime_sample_coverage"]["risk_on"] == 2

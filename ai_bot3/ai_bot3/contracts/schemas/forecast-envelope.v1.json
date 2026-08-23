@@ -180,9 +180,16 @@
           "minLength": 1,
           "title": "Model Bundle Id",
           "type": "string"
+        },
+        "strategy_release_id": {
+          "maxLength": 120,
+          "minLength": 8,
+          "title": "Strategy Release Id",
+          "type": "string"
         }
       },
       "required": [
+        "strategy_release_id",
         "model_bundle_id",
         "feature_set_id",
         "calibration_model_id",
@@ -210,6 +217,17 @@
           "title": "Data Coverage",
           "type": "number"
         },
+        "data_health_status": {
+          "default": "unknown",
+          "enum": [
+            "valid",
+            "degraded",
+            "invalid",
+            "unknown"
+          ],
+          "title": "Data Health Status",
+          "type": "string"
+        },
         "data_quality": {
           "maximum": 1,
           "minimum": 0,
@@ -220,12 +238,6 @@
           "minimum": 0,
           "title": "Max Feature Age Sec",
           "type": "integer"
-        },
-        "out_of_distribution_score": {
-          "maximum": 1,
-          "minimum": 0,
-          "title": "Out Of Distribution Score",
-          "type": "number"
         },
         "prediction_interval_coverage_target": {
           "anyOf": [
@@ -240,6 +252,23 @@
           ],
           "default": null,
           "title": "Prediction Interval Coverage Target"
+        },
+        "predictive_health_status": {
+          "default": "unknown",
+          "enum": [
+            "valid",
+            "degraded",
+            "invalid",
+            "unknown"
+          ],
+          "title": "Predictive Health Status",
+          "type": "string"
+        },
+        "range_guard_score": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Range Guard Score",
+          "type": "number"
         },
         "source_status": {
           "default": "ok",
@@ -257,7 +286,7 @@
         "data_coverage",
         "data_quality",
         "calibration_status",
-        "out_of_distribution_score",
+        "range_guard_score",
         "max_feature_age_sec"
       ],
       "title": "ForecastQuality",

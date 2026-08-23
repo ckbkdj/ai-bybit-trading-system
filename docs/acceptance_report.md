@@ -28,23 +28,34 @@
 | 20 | 交易端不导入预测内部模块 | PASS | `test_execution_code_does_not_import_prediction_internals` |
 | 21 | LSTM holdout 从未参与 fit，窗口级 purge | PASS | `test_kline_only_training_anti_leakage`、`test_purged_model_validation` |
 | 22 | Brain 训练/验证间按 horizon purge | PASS | `test_purged_model_validation`、Brain governance tests |
-| 23 | 未显式校准/OOD/可靠来源失败关闭 | PASS | `test_model_monitoring`、ticket policy tests |
+| 23 | 未显式校准/range guard/可靠来源失败关闭 | PASS | `test_model_monitoring`、ticket policy tests |
 | 24 | 默认只有 live Brain 可生成交易票 | PASS | `test_result_manager_ticket_gate` |
 | 25 | 研究试验追加写、重复试验计数、DSR | PASS | `test_statistical_governance` |
 | 26 | 历史成本复放去重叠并报告证据限制 | PASS | `test_historical_strategy_audit` |
 | 27 | 净值高水位跨重启且回撤熔断 | PASS | `test_equity_high_water_*` |
+| 28 | 多 horizon 先合成 PortfolioIntent 再出票 | PASS | `test_portfolio_release` |
+| 29 | StrategyReleaseBundle 每个 artifact 和 manifest 校验 | PASS | `test_strategy_release_loader_*` |
+| 30 | 旧 worker 在 epoch takeover 后不能预留订单 | PASS | stale fencing token tests |
+| 31 | 专用子账户未知订单/仓位进入人工接管 | PASS | ownership/incident tests |
+| 32 | entry/TP/stop/close/cancel/revision 确定性 ID/命令账本 | PASS | execution engine tests |
+| 33 | 258 万行特征库语义和 25 组重算 | PASS | `feature_store_semantic_audit_20260823.json` |
+| 34 | 独立 train/validation/test + 两处 purge | PASS | split/attrition tests and audit |
+| 35 | fill ratio/TTF/MFE/MAE/成本标签与收据成本模型 | PASS | `test_execution_labels` |
+| 36 | 短期 soak 必须 BLOCKED，不洁重启只计一次 | PASS | `test_soak_monitor` |
+| 37 | 高于程序支持版本的 DB 拒绝启动 | PASS | schema migration gate tests |
+| 38 | testnet/live 必须白名单 release id | PASS | runtime config + ticket validator tests |
 
 额外已通过：claim lease、游标 outbox、不可变冲突、费用后门槛、REDUCE/CLOSE、CANCEL、cancel/fill 竞争、止损附带、幂等止盈子单、限流头、kill switch、研究 checkpoint/revision/Tier A blackout、PIT vintage、因子语义、walk-forward/purge/embargo、成本回测和因子组消融。
 
 本机 HTTP 影子 E2E 结果要求并已观测：`cursor=1`、`state=SUBMITTED`、`shadow_order_count=1`、`control_plane_receipt_count=1`。
 
-最终全量回归：预测端 `pytest` 为 **112 passed / 0 failed**；交易端 `pytest` 为 **43 passed / 0 failed**。本机 HTTP 影子闭环再次通过。
+最终全量回归：预测端 `pytest` 为 **121 passed / 0 failed**；交易端 `pytest` 为 **59 passed / 0 failed**。本机 HTTP 影子闭环再次通过。
 
 新增数据验收：损坏特征库已非破坏重建，raw/enhanced 各 **2,587,737 行、25 组**且 `quick_check=ok`，生产路径未切换；参考 `trad_data_service` 2.2 GB canonical 面板的 SHA 已按最后 PASS 收据验证，但最新更新任务为 BLOCKED，适配结果保持 degraded/shadow-only。
 
 历史策略证据：3,255 条 settled 预测在严格 live 门禁下因缺 recorded direction 而得到 0 笔合格交易，不能证明盈利。仅供诊断的旧方向推断得到 304 笔，计 11 bps 双边手续费与 6 bps 往返滑点后约 **-13.48%**，收盘到收盘最大回撤约 **13.48%**；没有 intrabar 和真实 fills，不能当作实盘回测。结论为 `profitability_not_demonstrated`。
 
-Brain 强制重训证据：25 组合得到 **20 shadow / 5 rejected / 0 candidate / 0 live**；没有任何模型达到真钱发布资格。
+旧短缓存强制重训证据为 **20 shadow / 5 rejected / 0 candidate / 0 live**。已确认它绕过版本化特征库，因此只作为历史失败证据，不是新管线评估。新管线尚未生成 candidate/live bundle。
 
 ## 外部测试网门禁
 

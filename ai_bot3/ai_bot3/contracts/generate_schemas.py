@@ -6,14 +6,26 @@ import tempfile
 from pathlib import Path
 
 from .execution_receipt_v1 import ExecutionReceipt
+from .execution_label_v1 import ExecutionAwareLabel
 from .forecast_v1 import ForecastEnvelope
 from .operation_ticket_v1 import OperationTicket
+from .portfolio_intent_v1 import PortfolioIntent
+from .strategy_release_v1 import StrategyReleaseBundle
 
 
 SCHEMAS = {
     "forecast-envelope.v1.json": (ForecastEnvelope, "forecast-envelope.v1"),
     "operation-ticket.v1.json": (OperationTicket, "operation-ticket.v1"),
     "execution-receipt.v1.json": (ExecutionReceipt, "execution-receipt.v1"),
+    "execution-aware-label.v1.json": (
+        ExecutionAwareLabel,
+        "execution-aware-label.v1",
+    ),
+    "portfolio-intent.v1.json": (PortfolioIntent, "portfolio-intent.v1"),
+    "strategy-release-bundle.v1.json": (
+        StrategyReleaseBundle,
+        "strategy-release-bundle.v1",
+    ),
 }
 
 

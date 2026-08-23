@@ -14,6 +14,7 @@ from core.kline_feature_store import (
     ModeSpec,
     add_kline_derived_features,
 )
+from core.feature_store_audit import FeatureStoreSemanticAuditor
 
 
 def cfg():
@@ -182,6 +183,31 @@ def test_training_and_inference_share_nonzero_kline_feature_definition():
     assert set(KLINE_DERIVED_FEATURES).issubset(augmented.columns)
     assert augmented["ret_1"].dropna().abs().sum() > 0
     assert augmented["trend_strength"].dropna().abs().sum() > 0
+
+
+def test_semantic_audit_and_attrition_explain_model_rows(tmp_path):
+    c = cfg()
+    c["general"]["symbols"] = ["BTCUSDT"]
+    c["modes"] = {"scalping": ["5m", 1000, 32]}
+    c["training"]["multi_timeframe"]["enabled"] = False
+    store = KlineFeatureStore(tmp_path / "kfs.sqlite", c)
+    store.upsert_raw_frame("BTCUSDT", "5m", raw("2024-01-01", 140, "5min", 100))
+    spec = store.spec_for("BTCUSDT", "scalping")
+    store.update_enhanced_kline("BTCUSDT", "5m", spec)
+
+    read_only = KlineFeatureStore(tmp_path / "kfs.sqlite", c, read_only=True)
+    audit = FeatureStoreSemanticAuditor(read_only).audit()
+    assert audit["status"] == "PASS"
+    assert audit["raw_rows"] == 140
+    assert audit["random_recomputations"][0]["status"] == "PASS"
+
+    attrition = read_only.dataset_attrition(spec)
+    assert attrition.raw_rows == 140
+    assert attrition.model_input_window_rows == 140
+    assert attrition.eligible_rows < attrition.model_input_window_rows
+    assert attrition.train_rows > 0
+    assert attrition.validation_rows > 0
+    assert attrition.test_rows > 0
 
 
 def test_existing_non_sqlite_feature_store_fails_integrity_gate(tmp_path):

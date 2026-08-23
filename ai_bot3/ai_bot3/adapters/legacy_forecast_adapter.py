@@ -130,7 +130,10 @@ class LegacyForecastAdapter:
             {
                 "forecast_id": forecast_id,
                 "revision": int(legacy.get("revision") or 1),
-                "instrument": {"symbol": normalized_symbol},
+                "instrument": {
+                    "symbol": normalized_symbol,
+                    "exchange": str(legacy.get("forecast_market") or "binance").lower(),
+                },
                 "time": {
                     "created_at": generated_at,
                     "data_cutoff": data_cutoff,
@@ -155,13 +158,39 @@ class LegacyForecastAdapter:
                     "data_coverage": quality,
                     "data_quality": quality,
                     "calibration_status": calibration_status,
-                    "out_of_distribution_score": max(0.0, min(1.0, _float(legacy.get("out_of_distribution_score"), 1.0))),
+                    "range_guard_score": max(
+                        0.0,
+                        min(
+                            1.0,
+                            _float(
+                                legacy.get("range_guard_score")
+                                if legacy.get("range_guard_score") is not None
+                                else legacy.get("out_of_distribution_score"),
+                                1.0,
+                            ),
+                        ),
+                    ),
                     "max_feature_age_sec": max(0, feature_age_sec),
                     "source_status": source_status,
+                    "data_health_status": (
+                        "valid"
+                        if reliable and quality >= 0.9
+                        else "degraded" if source_status in {"ok", "degraded"} else "invalid"
+                    ),
+                    "predictive_health_status": (
+                        "valid"
+                        if calibration_status == "valid"
+                        else "degraded" if calibration_status in {"degraded", "unknown"} else "invalid"
+                    ),
                 },
                 "factor_scores": dict(legacy.get("factor_scores") or {}),
                 "evidence": {"warnings": warnings},
                 "lineage": {
+                    "strategy_release_id": str(
+                        legacy.get("strategy_release_id")
+                        or brain.get("strategy_release_id")
+                        or f"legacy-{model_bundle}"
+                    ),
                     "model_bundle_id": model_bundle,
                     "feature_set_id": str(legacy.get("feature_set_id") or "legacy-feature-set"),
                     "calibration_model_id": str(legacy.get("calibration_model_id") or "legacy-calibration"),

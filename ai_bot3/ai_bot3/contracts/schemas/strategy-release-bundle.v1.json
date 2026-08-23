@@ -1,0 +1,151 @@
+{
+  "$defs": {
+    "StrategyArtifactHashes": {
+      "additionalProperties": false,
+      "properties": {
+        "brain_model_sha256": {
+          "title": "Brain Model Sha256",
+          "type": "string"
+        },
+        "calibration_sha256": {
+          "title": "Calibration Sha256",
+          "type": "string"
+        },
+        "cost_policy_sha256": {
+          "title": "Cost Policy Sha256",
+          "type": "string"
+        },
+        "evidence_bundle_sha256": {
+          "title": "Evidence Bundle Sha256",
+          "type": "string"
+        },
+        "execution_policy_sha256": {
+          "title": "Execution Policy Sha256",
+          "type": "string"
+        },
+        "factor_weights_sha256": {
+          "title": "Factor Weights Sha256",
+          "type": "string"
+        },
+        "feature_schema_sha256": {
+          "title": "Feature Schema Sha256",
+          "type": "string"
+        },
+        "lstm_model_sha256": {
+          "title": "Lstm Model Sha256",
+          "type": "string"
+        },
+        "scaler_sha256": {
+          "title": "Scaler Sha256",
+          "type": "string"
+        },
+        "ticket_policy_sha256": {
+          "title": "Ticket Policy Sha256",
+          "type": "string"
+        },
+        "training_snapshot_sha256": {
+          "title": "Training Snapshot Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "brain_model_sha256",
+        "lstm_model_sha256",
+        "scaler_sha256",
+        "calibration_sha256",
+        "feature_schema_sha256",
+        "factor_weights_sha256",
+        "cost_policy_sha256",
+        "ticket_policy_sha256",
+        "execution_policy_sha256",
+        "training_snapshot_sha256",
+        "evidence_bundle_sha256"
+      ],
+      "title": "StrategyArtifactHashes",
+      "type": "object"
+    }
+  },
+  "$id": "strategy-release-bundle.v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "approval_id": {
+      "maxLength": 120,
+      "minLength": 8,
+      "title": "Approval Id",
+      "type": "string"
+    },
+    "approved_by": {
+      "maxLength": 120,
+      "minLength": 3,
+      "title": "Approved By",
+      "type": "string"
+    },
+    "artifact_paths": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "title": "Artifact Paths",
+      "type": "object"
+    },
+    "artifacts": {
+      "$ref": "#/$defs/StrategyArtifactHashes"
+    },
+    "bundle_sha256": {
+      "title": "Bundle Sha256",
+      "type": "string"
+    },
+    "code_commit": {
+      "maxLength": 80,
+      "minLength": 7,
+      "title": "Code Commit",
+      "type": "string"
+    },
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "immutable_limits": {
+      "additionalProperties": {
+        "type": "number"
+      },
+      "title": "Immutable Limits",
+      "type": "object"
+    },
+    "release_stage": {
+      "enum": [
+        "shadow",
+        "candidate",
+        "live",
+        "retired"
+      ],
+      "title": "Release Stage",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "strategy-release-bundle.v1",
+      "default": "strategy-release-bundle.v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "strategy_release_id": {
+      "maxLength": 120,
+      "minLength": 8,
+      "title": "Strategy Release Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "strategy_release_id",
+    "release_stage",
+    "created_at",
+    "code_commit",
+    "artifacts",
+    "approval_id",
+    "approved_by",
+    "bundle_sha256"
+  ],
+  "title": "StrategyReleaseBundle",
+  "type": "object"
+}

@@ -74,7 +74,11 @@ def create_control_plane_router(project_root: Path) -> APIRouter:
         return {
             "status": "ok",
             "schema_versions": [
-                "forecast-envelope.v1", "operation-ticket.v1", "execution-receipt.v1"
+                "forecast-envelope.v1",
+                "portfolio-intent.v1",
+                "strategy-release-bundle.v1",
+                "operation-ticket.v1",
+                "execution-receipt.v1",
             ],
             "tickets_enabled": os.environ.get("AI_BOT_TICKETS_ENABLED", "true").lower()
             not in {"0", "false", "off"},
@@ -136,12 +140,17 @@ def create_control_plane_router(project_root: Path) -> APIRouter:
 
     @router.post("/tickets/{ticket_id}/claim")
     def claim(ticket_id: str, request: ClaimRequest):
-        claimed = control.claim(
+        claim_epoch = control.claim(
             ticket_id, request.consumer_id, request.lease_token, request.lease_sec
         )
-        if not claimed:
+        if claim_epoch is None:
             raise HTTPException(status_code=409, detail="ticket claim is unavailable")
-        return {"claimed": True, "ticket_id": ticket_id, "consumer_id": request.consumer_id}
+        return {
+            "claimed": True,
+            "ticket_id": ticket_id,
+            "consumer_id": request.consumer_id,
+            "claim_epoch": claim_epoch,
+        }
 
     @router.post("/tickets/{ticket_id}/events")
     def ticket_event(ticket_id: str, request: TicketEventRequest):

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import Optional
+from typing import Iterable, Optional
 
 from contracts.common import deterministic_id
 from contracts.forecast_v1 import ForecastEnvelope
 from contracts.operation_ticket_v1 import OperationTicket
+from contracts.portfolio_intent_v1 import PortfolioIntent
 
 from .ticket_policy import TicketPolicy, TicketPolicyConfig
 
@@ -21,6 +22,7 @@ class TicketBuilder:
         reference_price: float,
         required_position_version: int,
         supersedes_ticket_id: str | None = None,
+        portfolio_intent: PortfolioIntent | None = None,
     ) -> Optional[OperationTicket]:
         decision = self.policy.decide(forecast)
         if decision is None:
@@ -34,7 +36,7 @@ class TicketBuilder:
         created_at = forecast.time.created_at
         ticket_id = deterministic_id(
             "tk",
-            forecast.forecast_id,
+            portfolio_intent.portfolio_decision_id if portfolio_intent else forecast.forecast_id,
             forecast.revision,
             decision.side,
             reference_price,
@@ -50,6 +52,16 @@ class TicketBuilder:
                 "ticket_id": ticket_id,
                 "forecast_id": forecast.forecast_id,
                 "forecast_revision": forecast.revision,
+                "portfolio_decision_id": (
+                    portfolio_intent.portfolio_decision_id
+                    if portfolio_intent
+                    else deterministic_id("pd", "single-forecast-fixture", forecast.forecast_id)
+                ),
+                "strategy_release_id": (
+                    portfolio_intent.strategy_release_id
+                    if portfolio_intent
+                    else forecast.lineage.strategy_release_id
+                ),
                 "supersedes_ticket_id": supersedes_ticket_id,
                 "created_at": created_at,
                 "valid_from": created_at,
@@ -59,8 +71,14 @@ class TicketBuilder:
                     "action": "OPEN" if supersedes_ticket_id is None else "REPLACE",
                     "side": decision.side,
                     "position_effect": "OPEN_OR_INCREASE" if supersedes_ticket_id is None else "REPLACE_ONLY",
-                    "target_exposure_pct": cfg.target_exposure_pct,
-                    "risk_budget_pct": cfg.risk_budget_pct,
+                    "target_exposure_pct": (
+                        abs(portfolio_intent.target_net_exposure_pct)
+                        if portfolio_intent
+                        else cfg.target_exposure_pct
+                    ),
+                    "risk_budget_pct": (
+                        portfolio_intent.risk_budget_pct if portfolio_intent else cfg.risk_budget_pct
+                    ),
                     "max_notional_usdt": cfg.max_notional_usdt,
                     "leverage_cap": cfg.leverage_cap,
                 },
@@ -100,8 +118,12 @@ class TicketBuilder:
                     "required_market_regime": [forecast.regime.market_regime],
                     "observed_market_regime": forecast.regime.market_regime,
                     "event_blackout": forecast.regime.event_regime == "blackout",
+                    "provisional_reduce_only": forecast.regime.event_regime == "reduce_only",
                     "require_flat_position": supersedes_ticket_id is None,
                     "required_position_version": required_position_version,
+                    "forecast_market": forecast.instrument.exchange,
+                    "execution_market": "bybit",
+                    "require_cross_exchange_basis_check": forecast.time.horizon_sec <= 900,
                 },
                 "reason": {
                     "regime": forecast.regime.market_regime,
@@ -110,6 +132,38 @@ class TicketBuilder:
                     "warnings": forecast.evidence.warnings,
                 },
             }
+        )
+
+    def build_portfolio_ticket(
+        self,
+        portfolio_intent: PortfolioIntent,
+        forecasts: Iterable[ForecastEnvelope],
+        *,
+        reference_price: float,
+        required_position_version: int,
+        supersedes_ticket_id: str | None = None,
+    ) -> Optional[OperationTicket]:
+        if abs(portfolio_intent.target_net_exposure_pct) <= 1e-12:
+            return None
+        expected_side = "BUY" if portfolio_intent.target_net_exposure_pct > 0 else "SELL"
+        by_key = {(item.forecast_id, item.revision): item for item in forecasts}
+        candidates = []
+        for contribution in portfolio_intent.contributions:
+            forecast = by_key.get((contribution.forecast_id, contribution.forecast_revision))
+            if not forecast or forecast.instrument.symbol != portfolio_intent.symbol:
+                continue
+            decision = self.policy.decide(forecast)
+            if decision and decision.side == expected_side:
+                candidates.append((abs(contribution.weighted_score), forecast))
+        if not candidates:
+            return None
+        representative = max(candidates, key=lambda item: item[0])[1]
+        return self.build_open_ticket(
+            representative,
+            reference_price=reference_price,
+            required_position_version=required_position_version,
+            supersedes_ticket_id=supersedes_ticket_id,
+            portfolio_intent=portfolio_intent,
         )
 
 

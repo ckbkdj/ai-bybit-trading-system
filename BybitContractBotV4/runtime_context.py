@@ -26,6 +26,7 @@ class BybitRuntimeContext:
         regime_provider: Optional[Callable[[str], str]] = None,
         data_health_provider: Optional[Callable[[], bool]] = None,
         correlated_symbols: Optional[set[str]] = None,
+        position_owner_id: str = "legacy-unowned",
     ):
         self.public_exchange = public_exchange
         self.account_client = account_client
@@ -35,6 +36,7 @@ class BybitRuntimeContext:
         self.regime_provider = regime_provider
         self.data_health_provider = data_health_provider
         self.correlated_symbols = {item.upper() for item in (correlated_symbols or set())}
+        self.position_owner_id = position_owner_id
 
     def market(self, ticket: OperationTicket) -> MarketSnapshot:
         ticker = self.public_exchange.fetch_ticker(ticket.instrument.symbol)
@@ -46,8 +48,17 @@ class BybitRuntimeContext:
             bid = float(book["bids"][0][0]) if book.get("bids") else 0
             ask = float(book["asks"][0][0]) if book.get("asks") else 0
         regime = self.regime_provider(ticket.instrument.symbol) if self.regime_provider else "unknown"
+        basis = None
+        if ticket.entry and ticket.entry.reference_price > 0:
+            basis = abs(last - ticket.entry.reference_price) / ticket.entry.reference_price * 10_000
         return MarketSnapshot(
-            ticket.instrument.symbol, last, bid, ask, regime, datetime.now(timezone.utc)
+            ticket.instrument.symbol,
+            last,
+            bid,
+            ask,
+            regime,
+            datetime.now(timezone.utc),
+            cross_exchange_basis_bps=basis,
         )
 
     def account(self, ticket: OperationTicket) -> AccountSnapshot:
@@ -134,8 +145,11 @@ class BybitRuntimeContext:
             avg_price=target_avg,
             notional_usdt=target_notional,
             source="bybit-reconcile",
+            position_owner_id=self.position_owner_id,
         )
-        return PortfolioSnapshot(gross, correlated, version, target_qty)
+        return PortfolioSnapshot(
+            gross, correlated, version, target_qty, position_owner_id=self.position_owner_id
+        )
 
     @staticmethod
     def _linear_symbol_id(value: object) -> str:
@@ -152,12 +166,15 @@ class BybitRuntimeContext:
             drift = float("inf")
         data_healthy = bool(self.data_health_provider and self.data_health_provider())
         websocket = bool(self.private_stream and self.private_stream.health_confirmed())
+        runtime = self.store.system_runtime()
         return SystemHealth(
             self.mode,
             self.store.kill_switch_enabled(),
             websocket,
             data_healthy,
             drift,
+            incident_mode=str(runtime.get("incident_mode") or "MANUAL_HANDOVER"),
+            reconciliation_complete=bool(runtime.get("reconciliation_complete")),
         )
 
     @staticmethod

@@ -110,6 +110,11 @@
           "title": "Quantity",
           "type": "number"
         },
+        "role": {
+          "default": "entry",
+          "title": "Role",
+          "type": "string"
+        },
         "side": {
           "enum": [
             "BUY",

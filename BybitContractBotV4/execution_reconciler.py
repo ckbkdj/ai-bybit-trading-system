@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
 
+from contracts.common import order_link_id
 from execution_state import ExecutionState
 from ticket_store import ExecutionStore, parse_time
 
@@ -82,6 +83,9 @@ class ExecutionReconciler:
             ).strip().upper()
             if remote_status in {"CANCELED", "CANCELLED", "DEACTIVATED"}:
                 self.store.confirm_cancellation(ticket_id, target_link_id, remote)
+                command_id = order_link_id(ticket_id, "cancel_1")
+                if self.store.command(command_id):
+                    self.store.confirm_command(command_id, "CONFIRMED", remote)
                 return self.store.state(ticket_id)
             age = (current_time - parse_time(record["updated_at"])).total_seconds()
             if age > self.grace_seconds:
@@ -141,6 +145,20 @@ class ExecutionReconciler:
                     or "RECONCILED"
                 )
                 self.store.acknowledge_order(order["order_link_id"], remote_status, remote)
+                if order["role"] == "entry":
+                    command_roles = []
+                    if ticket.protection and ticket.protection.stop_loss:
+                        command_roles.append("stop_loss_1")
+                    if ticket.intent.action == "CLOSE":
+                        command_roles.append("close_1")
+                    if ticket.intent.action == "REPLACE":
+                        command_roles.append("revision_1")
+                    for role in command_roles:
+                        command_id = order_link_id(ticket_id, role)
+                        if self.store.command(command_id):
+                            self.store.confirm_command(
+                                command_id, "REST_ACCEPTED", remote
+                            )
             for fill in self.gateway.fetch_executions(ticket.instrument.symbol, order["order_link_id"]):
                 exec_time = fill.get("execTime")
                 try:
@@ -169,6 +187,14 @@ class ExecutionReconciler:
                     reason_code="AMBIGUOUS_SUBMISSION_NOT_FOUND",
                     reason_detail="order was not found by deterministic orderLinkId after grace period",
                 )
+                for role in ("stop_loss_1", "close_1", "revision_1"):
+                    command_id = order_link_id(ticket_id, role)
+                    if self.store.command(command_id):
+                        self.store.confirm_command(
+                            command_id,
+                            "FAILED",
+                            {"reason": "primary order not found during reconciliation"},
+                        )
         return self.store.state(ticket_id)
 
     def recover_all(self, *, now: datetime | None = None) -> dict[str, ExecutionState]:

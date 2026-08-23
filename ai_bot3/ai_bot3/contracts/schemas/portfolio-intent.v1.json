@@ -1,0 +1,189 @@
+{
+  "$defs": {
+    "HorizonContribution": {
+      "additionalProperties": false,
+      "properties": {
+        "direction_score": {
+          "maximum": 1,
+          "minimum": -1,
+          "title": "Direction Score",
+          "type": "number"
+        },
+        "expected_return_bps": {
+          "title": "Expected Return Bps",
+          "type": "number"
+        },
+        "forecast_id": {
+          "maxLength": 80,
+          "minLength": 8,
+          "title": "Forecast Id",
+          "type": "string"
+        },
+        "forecast_revision": {
+          "minimum": 1,
+          "title": "Forecast Revision",
+          "type": "integer"
+        },
+        "horizon_sec": {
+          "exclusiveMinimum": 0,
+          "maximum": 31536000,
+          "title": "Horizon Sec",
+          "type": "integer"
+        },
+        "horizon_weight": {
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "title": "Horizon Weight",
+          "type": "number"
+        },
+        "quality_weight": {
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "title": "Quality Weight",
+          "type": "number"
+        },
+        "weighted_score": {
+          "maximum": 1,
+          "minimum": -1,
+          "title": "Weighted Score",
+          "type": "number"
+        }
+      },
+      "required": [
+        "forecast_id",
+        "forecast_revision",
+        "horizon_sec",
+        "direction_score",
+        "expected_return_bps",
+        "quality_weight",
+        "horizon_weight",
+        "weighted_score"
+      ],
+      "title": "HorizonContribution",
+      "type": "object"
+    }
+  },
+  "$id": "portfolio-intent.v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "One netted portfolio decision built from several forecast horizons.\n\nThis is deliberately an exposure target, not an order request.  The execution\nplanner may create one or more tickets from it, but individual horizons must\nnever bypass this boundary.",
+  "properties": {
+    "contributions": {
+      "items": {
+        "$ref": "#/$defs/HorizonContribution"
+      },
+      "maxItems": 16,
+      "minItems": 2,
+      "title": "Contributions",
+      "type": "array"
+    },
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "decision_version": {
+      "minimum": 1,
+      "title": "Decision Version",
+      "type": "integer"
+    },
+    "hedge_mode": {
+      "default": "DISABLED",
+      "enum": [
+        "DISABLED",
+        "EXPLICIT"
+      ],
+      "title": "Hedge Mode",
+      "type": "string"
+    },
+    "hedge_owner_id": {
+      "anyOf": [
+        {
+          "maxLength": 120,
+          "minLength": 8,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Hedge Owner Id"
+    },
+    "max_turnover_pct": {
+      "maximum": 1,
+      "minimum": 0,
+      "title": "Max Turnover Pct",
+      "type": "number"
+    },
+    "portfolio_decision_id": {
+      "maxLength": 80,
+      "minLength": 8,
+      "title": "Portfolio Decision Id",
+      "type": "string"
+    },
+    "risk_budget_pct": {
+      "maximum": 0.1,
+      "minimum": 0,
+      "title": "Risk Budget Pct",
+      "type": "number"
+    },
+    "schema_version": {
+      "const": "portfolio-intent.v1",
+      "default": "portfolio-intent.v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "strategy_release_id": {
+      "maxLength": 120,
+      "minLength": 8,
+      "title": "Strategy Release Id",
+      "type": "string"
+    },
+    "symbol": {
+      "maxLength": 40,
+      "minLength": 3,
+      "title": "Symbol",
+      "type": "string"
+    },
+    "target_long_exposure_pct": {
+      "maximum": 1,
+      "minimum": 0,
+      "title": "Target Long Exposure Pct",
+      "type": "number"
+    },
+    "target_net_exposure_pct": {
+      "maximum": 1,
+      "minimum": -1,
+      "title": "Target Net Exposure Pct",
+      "type": "number"
+    },
+    "target_short_exposure_pct": {
+      "maximum": 1,
+      "minimum": 0,
+      "title": "Target Short Exposure Pct",
+      "type": "number"
+    },
+    "valid_until": {
+      "format": "date-time",
+      "title": "Valid Until",
+      "type": "string"
+    }
+  },
+  "required": [
+    "portfolio_decision_id",
+    "strategy_release_id",
+    "symbol",
+    "created_at",
+    "valid_until",
+    "decision_version",
+    "target_net_exposure_pct",
+    "target_long_exposure_pct",
+    "target_short_exposure_pct",
+    "risk_budget_pct",
+    "max_turnover_pct",
+    "contributions"
+  ],
+  "title": "PortfolioIntent",
+  "type": "object"
+}

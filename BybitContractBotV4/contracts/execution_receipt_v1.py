@@ -17,6 +17,7 @@ ExecutionStatus = Literal[
 
 class ReceiptOrder(ContractModel):
     order_link_id: str
+    role: str = "entry"
     bybit_order_id: Optional[str] = None
     order_status: str
     side: Literal["BUY", "SELL"]

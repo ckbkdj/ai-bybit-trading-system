@@ -47,6 +47,7 @@ class EventImpactVector(ContractModel):
     affected_assets: Dict[str, AssetImpact]
     scenarios: List[EventScenario]
     event_blackout: bool = False
+    risk_directive: Literal["NONE", "REDUCE_ONLY", "BLACKOUT"] = "NONE"
     blackout_until: Optional[datetime] = None
     evidence_source_ids: List[str] = Field(default_factory=list)
     warnings: List[str] = Field(default_factory=list)
@@ -62,6 +63,10 @@ class EventImpactVector(ContractModel):
             raise ValueError("scenario probabilities must sum to one")
         if self.event_blackout and self.blackout_until is None:
             raise ValueError("event blackout requires blackout_until")
+        if self.event_blackout != (self.risk_directive == "BLACKOUT"):
+            raise ValueError("event_blackout and BLACKOUT risk directive must be consistent")
+        if self.risk_directive == "REDUCE_ONLY" and self.primary_source_verified:
+            raise ValueError("verified Tier A evidence must use a final NONE/BLACKOUT directive")
         if self.blackout_until is not None and self.blackout_until <= self.created_at:
             raise ValueError("blackout_until must be after creation")
         return self

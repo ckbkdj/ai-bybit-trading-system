@@ -39,6 +39,7 @@ BybitContractBotV4/*.sqlite3
 BybitContractBotV4/*.sqlite3-*
 BybitContractBotV4/*.ini
 BybitContractBotV4/*.log
+BybitContractBotV4/logs/
 
 # Historical bots are retained on disk but excluded from the first safe baseline.
 # The active migration target is v4_1 only.

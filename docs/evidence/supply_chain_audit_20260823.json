@@ -1,0 +1,149 @@
+{
+  "status": "BLOCKED",
+  "blockers": [
+    "python dependencies are not fully locked",
+    "current vulnerability scan attestation is not attached"
+  ],
+  "python_dependency_pinning": {
+    "files": [
+      {
+        "path": "ai_bot3\\ai_bot3\\requirements.txt",
+        "sha256": "342ee7cbbb2c5c8951649f46d7127065a6e4607fc9271230a20c652458bfc954"
+      },
+      {
+        "path": "ai_bot3\\ai_bot3\\requirements-dev.txt",
+        "sha256": "ac00dae0305772014fb66677670fac5e3fd9e19de66f941978f939c68c49a164"
+      },
+      {
+        "path": "BybitContractBotV4\\requirements.txt",
+        "sha256": "e0d0e89aa0afbe96932e23155680917a6ee41c78e4702025ea76125a4abb80a0"
+      }
+    ],
+    "unpinned_entries": [
+      {
+        "path": "ai_bot3\\ai_bot3\\requirements.txt",
+        "line": 7
+      },
+      {
+        "path": "ai_bot3\\ai_bot3\\requirements.txt",
+        "line": 8
+      },
+      {
+        "path": "ai_bot3\\ai_bot3\\requirements.txt",
+        "line": 9
+      },
+      {
+        "path": "ai_bot3\\ai_bot3\\requirements.txt",
+        "line": 12
+      },
+      {
+        "path": "ai_bot3\\ai_bot3\\requirements.txt",
+        "line": 13
+      },
+      {
+        "path": "ai_bot3\\ai_bot3\\requirements.txt",
+        "line": 16
+      },
+      {
+        "path": "ai_bot3\\ai_bot3\\requirements.txt",
+        "line": 17
+      },
+      {
+        "path": "ai_bot3\\ai_bot3\\requirements.txt",
+        "line": 18
+      },
+      {
+        "path": "ai_bot3\\ai_bot3\\requirements.txt",
+        "line": 21
+      },
+      {
+        "path": "ai_bot3\\ai_bot3\\requirements.txt",
+        "line": 24
+      },
+      {
+        "path": "ai_bot3\\ai_bot3\\requirements.txt",
+        "line": 25
+      },
+      {
+        "path": "ai_bot3\\ai_bot3\\requirements.txt",
+        "line": 26
+      },
+      {
+        "path": "ai_bot3\\ai_bot3\\requirements.txt",
+        "line": 27
+      },
+      {
+        "path": "ai_bot3\\ai_bot3\\requirements.txt",
+        "line": 28
+      },
+      {
+        "path": "ai_bot3\\ai_bot3\\requirements.txt",
+        "line": 29
+      },
+      {
+        "path": "ai_bot3\\ai_bot3\\requirements.txt",
+        "line": 30
+      },
+      {
+        "path": "ai_bot3\\ai_bot3\\requirements.txt",
+        "line": 31
+      },
+      {
+        "path": "ai_bot3\\ai_bot3\\requirements.txt",
+        "line": 34
+      },
+      {
+        "path": "ai_bot3\\ai_bot3\\requirements.txt",
+        "line": 35
+      },
+      {
+        "path": "ai_bot3\\ai_bot3\\requirements.txt",
+        "line": 36
+      },
+      {
+        "path": "ai_bot3\\ai_bot3\\requirements-dev.txt",
+        "line": 2
+      },
+      {
+        "path": "ai_bot3\\ai_bot3\\requirements-dev.txt",
+        "line": 3
+      },
+      {
+        "path": "BybitContractBotV4\\requirements.txt",
+        "line": 1
+      },
+      {
+        "path": "BybitContractBotV4\\requirements.txt",
+        "line": 2
+      },
+      {
+        "path": "BybitContractBotV4\\requirements.txt",
+        "line": 3
+      },
+      {
+        "path": "BybitContractBotV4\\requirements.txt",
+        "line": 4
+      },
+      {
+        "path": "BybitContractBotV4\\requirements.txt",
+        "line": 5
+      }
+    ]
+  },
+  "node_lock_integrity": {
+    "files": [
+      {
+        "path": "ai_bot3\\ai_bot3\\package-lock.json",
+        "sha256": "3d89fce0f726c22c943ea4caa66cc09116d34179fdfedf32e7083c25bfa37af7",
+        "lockfile_version": 3
+      }
+    ],
+    "missing_integrity_entries": []
+  },
+  "tracked_secret_scan": {
+    "finding_count": 0,
+    "findings_without_values": [],
+    "tracked_sensitive_paths": []
+  },
+  "vulnerability_scan": "NOT_RUN_ATTESTATION_REQUIRED"
+}

@@ -97,9 +97,13 @@ class TicketAndOutboxTests(unittest.TestCase):
                 forecast, reference_price=100000, required_position_version=1
             )
             repository.publish(forecast, ticket)
-            self.assertTrue(repository.claim(ticket.ticket_id, "consumer-a", "lease-a", 60))
-            self.assertFalse(repository.claim(ticket.ticket_id, "consumer-b", "lease-b", 60))
-            self.assertTrue(repository.claim(ticket.ticket_id, "consumer-a", "lease-renewed", 60))
+            first_epoch = repository.claim(ticket.ticket_id, "consumer-a", "lease-a", 60)
+            self.assertEqual(first_epoch, 1)
+            self.assertIsNone(repository.claim(ticket.ticket_id, "consumer-b", "lease-b", 60))
+            self.assertEqual(
+                repository.claim(ticket.ticket_id, "consumer-a", "lease-a", 60),
+                first_epoch,
+            )
 
     def test_replacement_is_a_new_immutable_ticket(self):
         forecast = actionable_forecast()

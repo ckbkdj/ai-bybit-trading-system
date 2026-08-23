@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT))
 from core.evaluation.time_series_split import (
     PurgedWalkForwardSplit,
     purged_holdout_boundary,
+    purged_three_way_boundary,
 )
 
 
@@ -53,6 +54,22 @@ class PurgedModelValidationTests(unittest.TestCase):
             self.assertGreaterEqual(min(fold.test_indices) - max(fold.train_indices) - 1, 5)
         for previous, current in zip(folds, folds[1:]):
             self.assertGreaterEqual(min(current.test_indices) - max(previous.test_indices) - 1, 3)
+
+    def test_three_way_split_has_independent_purged_test_set(self):
+        boundary = purged_three_way_boundary(
+            1000,
+            validation_fraction=0.15,
+            test_fraction=0.15,
+            minimum_train_size=500,
+            minimum_validation_size=100,
+            minimum_test_size=100,
+            purge_size=50,
+        )
+        self.assertEqual(boundary.train_size, 600)
+        self.assertEqual(boundary.validation_size, 150)
+        self.assertEqual(boundary.test_size, 150)
+        self.assertEqual(boundary.validation_start - boundary.train_end, 50)
+        self.assertEqual(boundary.test_start - boundary.validation_end, 50)
 
 
 if __name__ == "__main__":

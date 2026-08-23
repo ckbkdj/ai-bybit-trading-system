@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 from typing import Protocol
 
 from bybit_executor import AmbiguousSubmission, BybitExecutor
-from contracts.common import sortable_id
 from contracts.operation_ticket_v1 import OperationTicket
 from execution_state import ExecutionState, TERMINAL_STATES
 from risk_guard import (
@@ -44,11 +43,19 @@ class TicketConsumer:
         self.store = store
         self.context = context
         self.executor = executor
+        self.executor.uid = consumer_id
         self.validator = validator or TicketValidator()
         self.risk_guard = risk_guard or RiskGuard()
         self.sizer = sizer or PositionSizer(self.risk_guard.limits)
 
-    def process(self, ticket: OperationTicket, *, now: datetime | None = None) -> ExecutionState:
+    def process(
+        self,
+        ticket: OperationTicket,
+        *,
+        now: datetime | None = None,
+        claim_epoch: int | None = None,
+        lease_token: str | None = None,
+    ) -> ExecutionState:
         current_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
         self.store.receive(ticket)
         state = self.store.state(ticket.ticket_id)
@@ -76,14 +83,16 @@ class TicketConsumer:
             state = ExecutionState.VALIDATED
 
         if state in {ExecutionState.VALIDATED, ExecutionState.CLAIMED, ExecutionState.RISK_APPROVED}:
-            claimed = self.store.claim(
+            local_epoch = self.store.claim(
                 ticket.ticket_id,
                 self.consumer_id,
-                sortable_id("lease"),
+                lease_token or self.executor.operation_lease_token(ticket.ticket_id),
                 lease_sec=60,
+                claim_epoch=claim_epoch,
             )
-            if not claimed:
+            if local_epoch is None:
                 return self.store.state(ticket.ticket_id)
+            claim_epoch = local_epoch
             state = self.store.state(ticket.ticket_id)
 
         market = self.context.market(ticket)
@@ -106,6 +115,8 @@ class TicketConsumer:
                     {"checks": list(decision.checks)},
                     reason_code=decision.reason_code,
                     reason_detail=decision.reason_detail,
+                    fence_owner=self.consumer_id,
+                    fence_epoch=int(claim_epoch),
                 )
                 return target
             self.store.transition(
@@ -113,13 +124,19 @@ class TicketConsumer:
                 ExecutionState.RISK_APPROVED,
                 "risk_approved",
                 {"checks": list(decision.checks)},
+                fence_owner=self.consumer_id,
+                fence_epoch=claim_epoch,
             )
             state = ExecutionState.RISK_APPROVED
 
         if state == ExecutionState.RISK_APPROVED:
             if ticket.intent.action == "CANCEL":
                 try:
-                    self.executor.cancel_target(ticket)
+                    self.executor.cancel_target(
+                        ticket,
+                        claim_owner=self.consumer_id,
+                        claim_epoch=int(claim_epoch),
+                    )
                 except AmbiguousSubmission:
                     return ExecutionState.SUBMITTING
                 except ValueError as exc:
@@ -129,6 +146,8 @@ class TicketConsumer:
                         "cancellation_rejected",
                         reason_code="CANCELLATION_REJECTED",
                         reason_detail=str(exc),
+                        fence_owner=self.consumer_id,
+                        fence_epoch=int(claim_epoch),
                     )
                     return ExecutionState.RISK_BLOCKED
                 return self.store.state(ticket.ticket_id)
@@ -143,10 +162,17 @@ class TicketConsumer:
                     "sizing_rejected",
                     reason_code="SIZING_REJECTED",
                     reason_detail=str(exc),
+                    fence_owner=self.consumer_id,
+                    fence_epoch=int(claim_epoch),
                 )
                 return ExecutionState.RISK_BLOCKED
             try:
-                self.executor.submit_entry(ticket, plan)
+                self.executor.submit_entry(
+                    ticket,
+                    plan,
+                    claim_owner=self.consumer_id,
+                    claim_epoch=int(claim_epoch),
+                )
             except AmbiguousSubmission:
                 # Leave SUBMITTING for deterministic reconciliation; never retry create blindly.
                 return ExecutionState.SUBMITTING

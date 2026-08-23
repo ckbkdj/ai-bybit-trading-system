@@ -82,7 +82,9 @@ class TicketHttpClient:
             )
         return result
 
-    def claim(self, ticket_id: str, consumer_id: str, lease_token: str, lease_sec: int = 60) -> bool:
+    def claim(
+        self, ticket_id: str, consumer_id: str, lease_token: str, lease_sec: int = 60
+    ) -> Optional[int]:
         response = self._get_session().post(
             f"{self.base_url}/v1/tickets/{ticket_id}/claim",
             json={"consumer_id": consumer_id, "lease_token": lease_token, "lease_sec": lease_sec},
@@ -91,9 +93,15 @@ class TicketHttpClient:
             verify=self.verify,
         )
         if response.status_code == 409:
-            return False
+            return None
         response.raise_for_status()
-        return bool(response.json().get("claimed"))
+        payload = response.json()
+        if not payload.get("claimed"):
+            return None
+        claim_epoch = payload.get("claim_epoch")
+        if not isinstance(claim_epoch, int) or claim_epoch < 1:
+            raise TicketApiError("claim response has no valid fencing epoch")
+        return claim_epoch
 
     def health(self) -> bool:
         try:
@@ -142,6 +150,12 @@ class TicketHttpClient:
             self._session = None
 
 
-def deterministic_lease_token(consumer_id: str, ticket_id: str) -> str:
-    digest = hashlib.sha256(f"{consumer_id}:{ticket_id}".encode()).hexdigest()
+def deterministic_lease_token(
+    consumer_id: str, ticket_id: str, service_session_id: str = "legacy-session"
+) -> str:
+    """Return a retry-stable token that changes whenever the process restarts."""
+
+    digest = hashlib.sha256(
+        f"{consumer_id}:{service_session_id}:{ticket_id}".encode()
+    ).hexdigest()
     return f"lease_{digest[:40]}"

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Dict, List, Literal, Optional
+from typing import Annotated, Dict, List, Literal, Optional, Union
 
 from pydantic import Field, field_validator, model_validator
 
@@ -20,12 +20,8 @@ class TicketInstrument(ContractModel):
         return value.strip().upper()
 
 
-class TicketIntent(ContractModel):
-    action: Literal["OPEN", "INCREASE", "REDUCE", "CLOSE", "CANCEL", "REPLACE"]
+class IntentCore(ContractModel):
     side: Literal["BUY", "SELL"]
-    position_effect: Literal[
-        "OPEN_OR_INCREASE", "REDUCE_ONLY", "CLOSE_ONLY", "CANCEL_ONLY", "REPLACE_ONLY"
-    ]
     target_exposure_pct: float = Field(ge=0, le=1)
     risk_budget_pct: float = Field(ge=0, le=0.1)
     max_notional_usdt: float = Field(gt=0)
@@ -33,13 +29,66 @@ class TicketIntent(ContractModel):
     reduce_fraction: Optional[float] = Field(default=None, gt=0, le=1)
     target_order_link_id: Optional[str] = Field(default=None, min_length=8, max_length=36)
 
+
+class OpenIntent(IntentCore):
+    action: Literal["OPEN"]
+    position_effect: Literal["OPEN_OR_INCREASE"]
+
     @model_validator(mode="after")
-    def action_targets(self):
-        if self.action == "REDUCE" and self.reduce_fraction is None:
-            raise ValueError("REDUCE requires reduce_fraction")
-        if self.action == "CANCEL" and self.target_order_link_id is None:
-            raise ValueError("CANCEL requires target_order_link_id")
+    def positive_risk(self):
+        if self.target_exposure_pct <= 0 or self.risk_budget_pct <= 0:
+            raise ValueError("OPEN requires positive target exposure and risk budget")
         return self
+
+
+class IncreaseIntent(OpenIntent):
+    action: Literal["INCREASE"]
+
+
+class ReduceIntent(IntentCore):
+    action: Literal["REDUCE"]
+    position_effect: Literal["REDUCE_ONLY"]
+    reduce_fraction: float = Field(gt=0, le=1)
+
+    @model_validator(mode="after")
+    def no_new_risk(self):
+        if self.risk_budget_pct != 0:
+            raise ValueError("REDUCE cannot allocate new risk")
+        return self
+
+
+class CloseIntent(IntentCore):
+    action: Literal["CLOSE"]
+    position_effect: Literal["CLOSE_ONLY"]
+
+    @model_validator(mode="after")
+    def closes_to_flat(self):
+        if self.target_exposure_pct != 0 or self.risk_budget_pct != 0:
+            raise ValueError("CLOSE must target zero exposure with zero new risk")
+        return self
+
+
+class CancelIntent(IntentCore):
+    action: Literal["CANCEL"]
+    position_effect: Literal["CANCEL_ONLY"]
+    target_order_link_id: str = Field(min_length=8, max_length=36)
+
+    @model_validator(mode="after")
+    def no_new_risk(self):
+        if self.target_exposure_pct != 0 or self.risk_budget_pct != 0:
+            raise ValueError("CANCEL cannot allocate exposure or risk")
+        return self
+
+
+class ReplaceIntent(OpenIntent):
+    action: Literal["REPLACE"]
+    position_effect: Literal["REPLACE_ONLY"]
+
+
+TicketIntent = Annotated[
+    Union[OpenIntent, IncreaseIntent, ReduceIntent, CloseIntent, CancelIntent, ReplaceIntent],
+    Field(discriminator="action"),
+]
 
 
 class TicketEntry(ContractModel):
@@ -124,8 +173,14 @@ class TicketGuards(ContractModel):
     required_market_regime: List[str] = Field(default_factory=list)
     observed_market_regime: str
     event_blackout: bool = False
+    provisional_reduce_only: bool = False
     require_flat_position: bool = False
     required_position_version: int = Field(ge=0)
+    execution_market: Literal["bybit"] = "bybit"
+    forecast_market: str = "binance"
+    require_cross_exchange_basis_check: bool = False
+    max_cross_exchange_basis_bps: float = Field(default=25.0, ge=0)
+    observed_cross_exchange_basis_bps: Optional[float] = Field(default=None, ge=0)
 
 
 class TicketReason(ContractModel):
@@ -140,6 +195,8 @@ class OperationTicket(ContractModel):
     ticket_id: str = Field(min_length=8, max_length=80)
     forecast_id: str = Field(min_length=8, max_length=80)
     forecast_revision: int = Field(ge=1)
+    portfolio_decision_id: str = Field(min_length=8, max_length=80)
+    strategy_release_id: str = Field(min_length=8, max_length=120)
     supersedes_ticket_id: Optional[str] = Field(default=None, min_length=8, max_length=80)
     created_at: datetime
     valid_from: datetime
@@ -163,6 +220,8 @@ class OperationTicket(ContractModel):
             raise ValueError("ticket validity interval is invalid")
         if self.supersedes_ticket_id == self.ticket_id:
             raise ValueError("a ticket cannot supersede itself")
+        if self.intent.action == "REPLACE" and not self.supersedes_ticket_id:
+            raise ValueError("REPLACE requires supersedes_ticket_id")
         if self.intent.action in {"OPEN", "INCREASE", "REPLACE"}:
             if self.entry is None or self.protection is None or self.protection.stop_loss is None:
                 raise ValueError("risk-increasing tickets require entry and stop_loss")
@@ -176,4 +235,6 @@ class OperationTicket(ContractModel):
                 raise ValueError("observed feature age exceeds the ticket maximum")
         if self.intent.action in {"REDUCE", "CLOSE"} and self.entry is None:
             raise ValueError("risk-reducing tickets require a live reference entry")
+        if self.intent.action == "CANCEL" and (self.entry is not None or self.protection is not None):
+            raise ValueError("CANCEL cannot carry entry or protection instructions")
         return self

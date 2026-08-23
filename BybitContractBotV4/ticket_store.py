@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import threading
 from contextlib import closing, contextmanager
@@ -11,6 +12,7 @@ from typing import Any, Iterator, Optional
 
 from contracts.operation_ticket_v1 import OperationTicket
 from execution_state import ExecutionState, TERMINAL_STATES, require_transition
+from incident_modes import IncidentMode
 
 
 def utc_now() -> datetime:
@@ -34,11 +36,23 @@ class TicketConflict(RuntimeError):
     pass
 
 
+class StaleFencingToken(TicketConflict):
+    pass
+
+
+SCHEMA_VERSION = 5
+SCHEMA_CHECKSUM = hashlib.sha256(
+    b"execution-store:v5:claim-epoch:commands:position-owner:incident-runtime:soak-metrics"
+).hexdigest()
+CODE_COMMIT = os.environ.get("APP_CODE_COMMIT", "workspace-uncommitted")
+
+
 class ExecutionStore:
     """Durable single-writer boundary for tickets, orders, fills and positions."""
 
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, *, code_commit: str | None = None):
         self.db_path = Path(db_path)
+        self.code_commit = (code_commit or CODE_COMMIT).strip()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._migration_lock = threading.Lock()
         self.migrate()
@@ -67,6 +81,31 @@ class ExecutionStore:
 
     def migrate(self) -> None:
         with self._migration_lock, self.transaction(immediate=True) as connection:
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS schema_migrations(
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                )"""
+            )
+            current = connection.execute(
+                "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations"
+            ).fetchone()["version"]
+            if int(current) > SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"execution DB schema {current} is newer than supported {SCHEMA_VERSION}"
+                )
+            migration_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(schema_migrations)")
+            }
+            for name, declaration in (
+                ("migration_id", "TEXT"),
+                ("code_commit", "TEXT"),
+                ("schema_checksum", "TEXT"),
+            ):
+                if name not in migration_columns:
+                    connection.execute(
+                        f"ALTER TABLE schema_migrations ADD COLUMN {name} {declaration}"
+                    )
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS schema_migrations(
@@ -85,6 +124,7 @@ class ExecutionStore:
                     consumer_id TEXT,
                     lease_token TEXT,
                     lease_expires_at TEXT,
+                    claim_epoch INTEGER NOT NULL DEFAULT 0,
                     reason_code TEXT,
                     reason_detail TEXT,
                     created_at TEXT NOT NULL,
@@ -132,6 +172,21 @@ class ExecutionStore:
                     raw_json TEXT NOT NULL,
                     FOREIGN KEY(order_link_id) REFERENCES execution_orders(order_link_id)
                 );
+                CREATE TABLE IF NOT EXISTS execution_commands(
+                    command_id TEXT PRIMARY KEY,
+                    ticket_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    target_order_link_id TEXT,
+                    status TEXT NOT NULL,
+                    claim_owner TEXT NOT NULL,
+                    claim_epoch INTEGER NOT NULL,
+                    raw_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(ticket_id) REFERENCES tickets(ticket_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_commands_ticket
+                    ON execution_commands(ticket_id, role);
                 CREATE TABLE IF NOT EXISTS position_snapshots(
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT NOT NULL,
@@ -141,6 +196,7 @@ class ExecutionStore:
                     avg_price REAL,
                     notional_usdt REAL NOT NULL,
                     source TEXT NOT NULL,
+                    position_owner_id TEXT NOT NULL DEFAULT 'legacy-unowned',
                     captured_at TEXT NOT NULL,
                     UNIQUE(symbol, version)
                 );
@@ -174,12 +230,70 @@ class ExecutionStore:
                     cursor INTEGER NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS system_runtime(
+                    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                    incident_mode TEXT NOT NULL,
+                    reconciliation_complete INTEGER NOT NULL,
+                    reason TEXT,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS service_runs(
+                    run_id TEXT PRIMARY KEY,
+                    started_at TEXT NOT NULL,
+                    stopped_at TEXT,
+                    clean_shutdown INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS runtime_metrics(
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    captured_at TEXT NOT NULL,
+                    metric_name TEXT NOT NULL,
+                    metric_value REAL NOT NULL,
+                    labels_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_runtime_metrics_name_time
+                    ON runtime_metrics(metric_name,captured_at);
                 """
             )
+            ticket_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(tickets)")
+            }
+            if "claim_epoch" not in ticket_columns:
+                connection.execute(
+                    "ALTER TABLE tickets ADD COLUMN claim_epoch INTEGER NOT NULL DEFAULT 0"
+                )
+            position_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(position_snapshots)")
+            }
+            if "position_owner_id" not in position_columns:
+                connection.execute(
+                    """ALTER TABLE position_snapshots ADD COLUMN position_owner_id TEXT
+                       NOT NULL DEFAULT 'legacy-unowned'"""
+                )
             connection.execute(
-                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, ?)",
-                (iso(utc_now()),),
+                """INSERT OR IGNORE INTO system_runtime(
+                    singleton, incident_mode, reconciliation_complete, reason, updated_at
+                ) VALUES (1, ?, 0, ?, ?)""",
+                (IncidentMode.NORMAL.value, "startup reconciliation has not completed", iso(utc_now())),
             )
+            connection.execute(
+                """INSERT OR IGNORE INTO schema_migrations(
+                    version, applied_at, migration_id, code_commit, schema_checksum
+                ) VALUES (?, ?, ?, ?, ?)""",
+                (
+                    SCHEMA_VERSION,
+                    iso(utc_now()),
+                    "execution-store-v5",
+                    self.code_commit,
+                    SCHEMA_CHECKSUM,
+                ),
+            )
+            recorded = connection.execute(
+                "SELECT schema_checksum FROM schema_migrations WHERE version=?",
+                (SCHEMA_VERSION,),
+            ).fetchone()
+            if not recorded or recorded["schema_checksum"] != SCHEMA_CHECKSUM:
+                raise RuntimeError("execution DB schema checksum does not match this build")
 
     @staticmethod
     def _event_id(ticket_id: str, event_type: str, payload: dict[str, Any], now: datetime) -> str:
@@ -297,12 +411,31 @@ class ExecutionStore:
         *,
         reason_code: Optional[str] = None,
         reason_detail: Optional[str] = None,
+        fence_owner: Optional[str] = None,
+        fence_epoch: Optional[int] = None,
     ) -> bool:
         now = utc_now()
         with self.transaction(immediate=True) as connection:
-            row = connection.execute("SELECT state FROM tickets WHERE ticket_id=?", (ticket_id,)).fetchone()
+            row = connection.execute(
+                """SELECT state, consumer_id, claim_epoch, lease_expires_at
+                   FROM tickets WHERE ticket_id=?""",
+                (ticket_id,),
+            ).fetchone()
             if not row:
                 raise KeyError(ticket_id)
+            if fence_owner is not None or fence_epoch is not None:
+                if fence_owner is None or fence_epoch is None:
+                    raise ValueError("both fence_owner and fence_epoch are required")
+                lease_expiry = (
+                    parse_time(row["lease_expires_at"]) if row["lease_expires_at"] else None
+                )
+                if (
+                    row["consumer_id"] != fence_owner
+                    or int(row["claim_epoch"] or 0) != int(fence_epoch)
+                    or lease_expiry is None
+                    or lease_expiry <= now
+                ):
+                    raise StaleFencingToken("ticket transition rejected stale fencing token")
             current = ExecutionState(row["state"])
             if current == target:
                 return False
@@ -315,41 +448,77 @@ class ExecutionStore:
             self._append_event(connection, ticket_id, current, target, event_type, payload, now)
             return True
 
-    def claim(self, ticket_id: str, consumer_id: str, lease_token: str, lease_sec: int = 30) -> bool:
+    def claim(
+        self,
+        ticket_id: str,
+        consumer_id: str,
+        lease_token: str,
+        lease_sec: int = 30,
+        *,
+        claim_epoch: Optional[int] = None,
+    ) -> Optional[int]:
         now = utc_now()
         expiry = now + timedelta(seconds=max(5, min(int(lease_sec), 3600)))
         with self.transaction(immediate=True) as connection:
             row = connection.execute(
-                "SELECT state, consumer_id, lease_expires_at FROM tickets WHERE ticket_id=?", (ticket_id,)
+                """SELECT state, consumer_id, lease_token, lease_expires_at, claim_epoch
+                   FROM tickets WHERE ticket_id=?""",
+                (ticket_id,),
             ).fetchone()
             if not row:
-                return False
+                return None
             state = ExecutionState(row["state"])
             existing_expiry = parse_time(row["lease_expires_at"]) if row["lease_expires_at"] else None
-            if row["consumer_id"] and row["consumer_id"] != consumer_id and existing_expiry and existing_expiry > now:
-                return False
+            same_lease = (
+                row["consumer_id"] == consumer_id and row["lease_token"] == lease_token
+            )
+            if existing_expiry and existing_expiry > now and row["consumer_id"] and not same_lease:
+                return None
+            current_epoch = int(row["claim_epoch"] or 0)
+            next_epoch = current_epoch if same_lease else current_epoch + 1
+            if claim_epoch is not None:
+                if same_lease and int(claim_epoch) != current_epoch:
+                    return None
+                if not same_lease and int(claim_epoch) <= current_epoch:
+                    return None
+                next_epoch = int(claim_epoch)
             if state == ExecutionState.VALIDATED:
                 require_transition(state, ExecutionState.CLAIMED)
                 connection.execute(
-                    """UPDATE tickets SET state=?, consumer_id=?, lease_token=?, lease_expires_at=?, updated_at=?
+                    """UPDATE tickets SET state=?, consumer_id=?, lease_token=?, lease_expires_at=?,
+                       claim_epoch=?, updated_at=?
                        WHERE ticket_id=?""",
-                    (ExecutionState.CLAIMED.value, consumer_id, lease_token, iso(expiry), iso(now), ticket_id),
+                    (
+                        ExecutionState.CLAIMED.value,
+                        consumer_id,
+                        lease_token,
+                        iso(expiry),
+                        next_epoch,
+                        iso(now),
+                        ticket_id,
+                    ),
                 )
                 self._append_event(
                     connection, ticket_id, state, ExecutionState.CLAIMED, "ticket_claimed",
-                    {"consumer_id": consumer_id, "lease_expires_at": iso(expiry)}, now,
+                    {
+                        "consumer_id": consumer_id,
+                        "lease_expires_at": iso(expiry),
+                        "claim_epoch": next_epoch,
+                    },
+                    now,
                 )
-                return True
+                return next_epoch
             if state in {ExecutionState.CLAIMED, ExecutionState.RISK_APPROVED} and (
-                row["consumer_id"] == consumer_id or not existing_expiry or existing_expiry <= now
+                same_lease or not existing_expiry or existing_expiry <= now
             ):
                 connection.execute(
-                    """UPDATE tickets SET consumer_id=?, lease_token=?, lease_expires_at=?, updated_at=?
+                    """UPDATE tickets SET consumer_id=?, lease_token=?, lease_expires_at=?,
+                       claim_epoch=?, updated_at=?
                        WHERE ticket_id=?""",
-                    (consumer_id, lease_token, iso(expiry), iso(now), ticket_id),
+                    (consumer_id, lease_token, iso(expiry), next_epoch, iso(now), ticket_id),
                 )
-                return True
-            return False
+                return next_epoch
+            return None
 
     def claim_owner(self, ticket_id: str) -> Optional[str]:
         with closing(self.connect()) as connection:
@@ -359,6 +528,157 @@ class ExecutionStore:
         if not row or not row["consumer_id"] or not row["lease_expires_at"]:
             return None
         return row["consumer_id"] if parse_time(row["lease_expires_at"]) > utc_now() else None
+
+    def current_fence(self, ticket_id: str) -> Optional[tuple[str, int]]:
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                """SELECT consumer_id, claim_epoch, lease_expires_at
+                   FROM tickets WHERE ticket_id=?""",
+                (ticket_id,),
+            ).fetchone()
+        if not row or not row["consumer_id"] or not row["lease_expires_at"]:
+            return None
+        if parse_time(row["lease_expires_at"]) <= utc_now():
+            return None
+        return str(row["consumer_id"]), int(row["claim_epoch"] or 0)
+
+    def claim_operation(
+        self,
+        ticket_id: str,
+        consumer_id: str,
+        lease_token: str,
+        lease_sec: int = 60,
+    ) -> Optional[int]:
+        """Acquire a fencing epoch for child/cancel operations in any ticket state.
+
+        A new service instance must use a new lease token.  That makes an expired
+        worker's epoch permanently stale even when the configured consumer id is
+        unchanged across restarts.
+        """
+
+        now = utc_now()
+        expiry = now + timedelta(seconds=max(5, min(int(lease_sec), 3600)))
+        with self.transaction(immediate=True) as connection:
+            row = connection.execute(
+                """SELECT consumer_id,lease_token,lease_expires_at,claim_epoch
+                   FROM tickets WHERE ticket_id=?""",
+                (ticket_id,),
+            ).fetchone()
+            if not row:
+                return None
+            existing_expiry = (
+                parse_time(row["lease_expires_at"]) if row["lease_expires_at"] else None
+            )
+            same_lease = (
+                row["consumer_id"] == consumer_id and row["lease_token"] == lease_token
+            )
+            if existing_expiry and existing_expiry > now and row["consumer_id"] and not same_lease:
+                return None
+            current_epoch = int(row["claim_epoch"] or 0)
+            next_epoch = current_epoch if same_lease else current_epoch + 1
+            connection.execute(
+                """UPDATE tickets SET consumer_id=?,lease_token=?,lease_expires_at=?,
+                   claim_epoch=?,updated_at=? WHERE ticket_id=?""",
+                (
+                    consumer_id,
+                    lease_token,
+                    iso(expiry),
+                    next_epoch,
+                    iso(now),
+                    ticket_id,
+                ),
+            )
+            return next_epoch
+
+    @staticmethod
+    def _require_fence(
+        row: sqlite3.Row,
+        claim_owner: str,
+        claim_epoch: int,
+        now: datetime,
+        operation: str,
+    ) -> None:
+        expiry = parse_time(row["lease_expires_at"]) if row["lease_expires_at"] else None
+        if (
+            row["consumer_id"] != claim_owner
+            or int(row["claim_epoch"] or 0) != int(claim_epoch)
+            or expiry is None
+            or expiry <= now
+        ):
+            raise StaleFencingToken(f"{operation} rejected stale fencing token")
+
+    def reserve_command(
+        self,
+        ticket_id: str,
+        command_id: str,
+        *,
+        role: str,
+        claim_owner: str,
+        claim_epoch: int,
+        target_order_link_id: Optional[str] = None,
+    ) -> bool:
+        """Journal a non-order operation before its first network side effect."""
+
+        now = utc_now()
+        with self.transaction(immediate=True) as connection:
+            existing = connection.execute(
+                "SELECT ticket_id,role FROM execution_commands WHERE command_id=?",
+                (command_id,),
+            ).fetchone()
+            if existing:
+                if existing["ticket_id"] != ticket_id or existing["role"] != role:
+                    raise TicketConflict("command_id is already assigned to another operation")
+                return False
+            row = connection.execute(
+                """SELECT state,consumer_id,claim_epoch,lease_expires_at
+                   FROM tickets WHERE ticket_id=?""",
+                (ticket_id,),
+            ).fetchone()
+            if not row:
+                raise KeyError(ticket_id)
+            self._require_fence(row, claim_owner, claim_epoch, now, "command reservation")
+            connection.execute(
+                """INSERT INTO execution_commands(
+                    command_id,ticket_id,role,target_order_link_id,status,
+                    claim_owner,claim_epoch,raw_json,created_at,updated_at
+                ) VALUES (?, ?, ?, ?, 'RESERVED', ?, ?, '{}', ?, ?)""",
+                (
+                    command_id,
+                    ticket_id,
+                    role,
+                    target_order_link_id,
+                    claim_owner,
+                    int(claim_epoch),
+                    iso(now),
+                    iso(now),
+                ),
+            )
+            return True
+
+    def confirm_command(
+        self,
+        command_id: str,
+        status: str,
+        raw: Optional[dict[str, Any]] = None,
+    ) -> None:
+        normalized = str(status).strip().upper()
+        if normalized not in {"REST_ACCEPTED", "CONFIRMED", "FAILED", "UNKNOWN"}:
+            raise ValueError("invalid execution command status")
+        with self.transaction(immediate=True) as connection:
+            result = connection.execute(
+                """UPDATE execution_commands SET status=?,raw_json=?,updated_at=?
+                   WHERE command_id=?""",
+                (normalized, canonical(raw or {})[0], iso(utc_now()), command_id),
+            )
+            if result.rowcount != 1:
+                raise KeyError(command_id)
+
+    def command(self, command_id: str) -> Optional[dict[str, Any]]:
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM execution_commands WHERE command_id=?", (command_id,)
+            ).fetchone()
+        return dict(row) if row else None
 
     def reserve_order(
         self,
@@ -370,6 +690,8 @@ class ExecutionStore:
         order_type: str,
         quantity: float,
         price: Optional[float],
+        claim_owner: str,
+        claim_epoch: int,
     ) -> bool:
         now = utc_now()
         with self.transaction(immediate=True) as connection:
@@ -380,9 +702,14 @@ class ExecutionStore:
                 if existing["ticket_id"] != ticket_id:
                     raise TicketConflict("order_link_id is already assigned to another ticket")
                 return False
-            row = connection.execute("SELECT state FROM tickets WHERE ticket_id=?", (ticket_id,)).fetchone()
+            row = connection.execute(
+                """SELECT state, consumer_id, claim_epoch, lease_expires_at
+                   FROM tickets WHERE ticket_id=?""",
+                (ticket_id,),
+            ).fetchone()
             if not row:
                 raise KeyError(ticket_id)
+            self._require_fence(row, claim_owner, claim_epoch, now, "order reservation")
             current = ExecutionState(row["state"])
             require_transition(current, ExecutionState.SUBMITTING)
             connection.execute(
@@ -412,6 +739,8 @@ class ExecutionStore:
         order_type: str,
         quantity: float,
         price: Optional[float],
+        claim_owner: str,
+        claim_epoch: int,
     ) -> bool:
         """Reserve a deterministic child exit without changing the completed entry state."""
         if not role.startswith(("take_profit_", "trailing_", "stop_loss_", "time_exit_")):
@@ -425,9 +754,14 @@ class ExecutionStore:
                 if existing["ticket_id"] != ticket_id:
                     raise TicketConflict("order_link_id is already assigned to another ticket")
                 return False
-            row = connection.execute("SELECT state FROM tickets WHERE ticket_id=?", (ticket_id,)).fetchone()
+            row = connection.execute(
+                """SELECT state,consumer_id,claim_epoch,lease_expires_at
+                   FROM tickets WHERE ticket_id=?""",
+                (ticket_id,),
+            ).fetchone()
             if not row:
                 raise KeyError(ticket_id)
+            self._require_fence(row, claim_owner, claim_epoch, now, "exit reservation")
             current = ExecutionState(row["state"])
             if current not in {ExecutionState.PARTIALLY_FILLED, ExecutionState.FILLED}:
                 raise TicketConflict("exit protection can be reserved only after an entry fill")
@@ -854,7 +1188,8 @@ class ExecutionStore:
         return {
             "symbol": symbol.strip().upper(), "version": 0, "side": None,
             "quantity": 0.0, "avg_price": None, "notional_usdt": 0.0,
-            "source": "empty", "captured_at": iso(utc_now()),
+            "source": "empty", "position_owner_id": "unowned",
+            "captured_at": iso(utc_now()),
         }
 
     def save_position(
@@ -866,6 +1201,7 @@ class ExecutionStore:
         avg_price: Optional[float],
         notional_usdt: float,
         source: str,
+        position_owner_id: str = "legacy-unowned",
     ) -> int:
         normalized = symbol.strip().upper()
         now = utc_now()
@@ -876,9 +1212,20 @@ class ExecutionStore:
             version = int(row["version"] or 0) + 1
             connection.execute(
                 """INSERT INTO position_snapshots(
-                    symbol, version, side, quantity, avg_price, notional_usdt, source, captured_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (normalized, version, side, quantity, avg_price, notional_usdt, source, iso(now)),
+                    symbol, version, side, quantity, avg_price, notional_usdt, source,
+                    position_owner_id, captured_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    normalized,
+                    version,
+                    side,
+                    quantity,
+                    avg_price,
+                    notional_usdt,
+                    source,
+                    position_owner_id,
+                    iso(now),
+                ),
             )
             return version
 
@@ -891,6 +1238,7 @@ class ExecutionStore:
         avg_price: Optional[float],
         notional_usdt: float,
         source: str,
+        position_owner_id: str = "legacy-unowned",
     ) -> int:
         previous = self.latest_position(symbol)
         unchanged = (
@@ -898,6 +1246,7 @@ class ExecutionStore:
             and abs(float(previous.get("quantity") or 0) - float(quantity)) <= 1e-12
             and abs(float(previous.get("avg_price") or 0) - float(avg_price or 0)) <= 1e-12
             and abs(float(previous.get("notional_usdt") or 0) - float(notional_usdt)) <= 1e-8
+            and str(previous.get("position_owner_id") or "") == str(position_owner_id)
         )
         if unchanged:
             return int(previous["version"])
@@ -908,7 +1257,156 @@ class ExecutionStore:
             avg_price=avg_price,
             notional_usdt=notional_usdt,
             source=source,
+            position_owner_id=position_owner_id,
         )
+
+    def adopt_position(
+        self,
+        symbol: str,
+        *,
+        side: Optional[str],
+        quantity: float,
+        avg_price: Optional[float],
+        notional_usdt: float,
+        position_owner_id: str,
+        approval_id: str,
+    ) -> int:
+        if len(position_owner_id.strip()) < 8 or len(approval_id.strip()) < 8:
+            raise ValueError("position adoption requires explicit owner and approval identifiers")
+        return self.save_position(
+            symbol,
+            side=side,
+            quantity=quantity,
+            avg_price=avg_price,
+            notional_usdt=notional_usdt,
+            source=f"manual-adoption:{approval_id.strip()}",
+            position_owner_id=position_owner_id.strip(),
+        )
+
+    def known_order_link_ids(self) -> set[str]:
+        with closing(self.connect()) as connection:
+            rows = connection.execute("SELECT order_link_id FROM execution_orders").fetchall()
+        return {str(row["order_link_id"]) for row in rows}
+
+    def local_position_quantity(self, symbol: str) -> float:
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                """SELECT COALESCE(SUM(
+                       CASE WHEN UPPER(o.side)='BUY' THEN o.cum_exec_qty ELSE -o.cum_exec_qty END
+                   ), 0) AS quantity
+                   FROM execution_orders o
+                   JOIN tickets t ON t.ticket_id=o.ticket_id
+                   WHERE t.symbol=?""",
+                (symbol.strip().upper(),),
+            ).fetchone()
+        return float(row["quantity"] or 0)
+
+    def set_incident_mode(self, mode: IncidentMode | str, reason: str = "") -> None:
+        normalized = IncidentMode(str(getattr(mode, "value", mode)).upper())
+        with self.transaction(immediate=True) as connection:
+            connection.execute(
+                """UPDATE system_runtime SET incident_mode=?, reason=?, updated_at=?
+                   WHERE singleton=1""",
+                (normalized.value, reason or None, iso(utc_now())),
+            )
+
+    def set_reconciliation_complete(self, complete: bool, reason: str = "") -> None:
+        with self.transaction(immediate=True) as connection:
+            connection.execute(
+                """UPDATE system_runtime SET reconciliation_complete=?, reason=?, updated_at=?
+                   WHERE singleton=1""",
+                (int(bool(complete)), reason or None, iso(utc_now())),
+            )
+
+    def system_runtime(self) -> dict[str, Any]:
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM system_runtime WHERE singleton=1"
+            ).fetchone()
+        return dict(row) if row else {
+            "incident_mode": IncidentMode.MANUAL_HANDOVER.value,
+            "reconciliation_complete": 0,
+            "reason": "system runtime row is missing",
+        }
+
+    def begin_service_run(self, run_id: str) -> bool:
+        """Start a run and report whether the previous run lacked a clean shutdown."""
+
+        now = iso(utc_now())
+        with self.transaction(immediate=True) as connection:
+            previous = connection.execute(
+                "SELECT run_id FROM service_runs WHERE stopped_at IS NULL ORDER BY started_at DESC LIMIT 1"
+            ).fetchone()
+            unexpected_restart = previous is not None
+            if unexpected_restart:
+                connection.execute(
+                    """UPDATE service_runs SET stopped_at=?,clean_shutdown=0
+                       WHERE run_id=? AND stopped_at IS NULL""",
+                    (now, previous["run_id"]),
+                )
+            connection.execute(
+                "INSERT INTO service_runs(run_id,started_at) VALUES (?, ?)",
+                (run_id, now),
+            )
+            if unexpected_restart:
+                connection.execute(
+                    """INSERT INTO runtime_metrics(
+                        captured_at,metric_name,metric_value,labels_json
+                    ) VALUES (?, 'unexpected_restart', 1, ?)""",
+                    (now, canonical({"previous_run_id": previous["run_id"]})[0]),
+                )
+        return unexpected_restart
+
+    def finish_service_run(self, run_id: str) -> None:
+        with self.transaction(immediate=True) as connection:
+            connection.execute(
+                """UPDATE service_runs SET stopped_at=?, clean_shutdown=1
+                   WHERE run_id=? AND stopped_at IS NULL""",
+                (iso(utc_now()), run_id),
+            )
+
+    def record_runtime_metrics(
+        self, metrics: dict[str, float], labels: Optional[dict[str, Any]] = None
+    ) -> None:
+        now = iso(utc_now())
+        labels_json = canonical(labels or {})[0]
+        rows = [
+            (now, str(name), float(value), labels_json)
+            for name, value in metrics.items()
+        ]
+        with self.transaction(immediate=True) as connection:
+            connection.executemany(
+                """INSERT INTO runtime_metrics(
+                    captured_at,metric_name,metric_value,labels_json
+                ) VALUES (?, ?, ?, ?)""",
+                rows,
+            )
+
+    def operational_counts(self) -> dict[str, int]:
+        with closing(self.connect()) as connection:
+            pending_receipts = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM receipt_outbox WHERE delivered_at IS NULL"
+                ).fetchone()[0]
+            )
+            incomplete = len(self.incomplete_ticket_ids())
+            failed = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM tickets WHERE state='FAILED'"
+                ).fetchone()[0]
+            )
+            order_count = int(connection.execute("SELECT COUNT(*) FROM execution_orders").fetchone()[0])
+            distinct_orders = int(
+                connection.execute(
+                    "SELECT COUNT(DISTINCT order_link_id) FROM execution_orders"
+                ).fetchone()[0]
+            )
+        return {
+            "receipt_outbox_backlog": pending_receipts,
+            "incomplete_ticket_count": incomplete,
+            "failed_ticket_count": failed,
+            "duplicate_order_count": order_count - distinct_orders,
+        }
 
     def set_kill_switch(self, enabled: bool) -> None:
         today = utc_now().date().isoformat()

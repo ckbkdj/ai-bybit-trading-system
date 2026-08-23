@@ -49,7 +49,7 @@ API key、secret、token 和 webhook 只在安全机器上通过环境或 `.env.
 - testnet/live 的私有 WebSocket 必须 connected；
 - incomplete ticket 数量不能持续增长；
 - last error、last poll 和 receipt outbox 是否滞留；
-- Brain inference/release stage、校准状态、OOD、数据质量和拒票原因；
+- Brain inference/release stage、校准状态、range guard、数据质量和拒票原因；
 - 账户净值高水位、当前 drawdown、日亏损和保证金；
 - 机器 UTC 时间与 Bybit 时间漂移。
 

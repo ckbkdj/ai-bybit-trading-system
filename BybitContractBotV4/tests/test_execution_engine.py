@@ -7,6 +7,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +22,7 @@ from contracts.operation_ticket_v1 import OperationTicket
 from execution_reconciler import ExecutionReconciler
 from execution_reporter import ExecutionReporter
 from execution_state import ExecutionState
+from incident_modes import IncidentMode
 from private_stream import PrivateStreamHandler
 from rate_limiter import EndpointRateLimiter, RateLimitBlocked
 from risk_guard import (
@@ -32,9 +34,11 @@ from risk_guard import (
 )
 from sizing import InstrumentRules, PositionSizer
 from runtime_context import BybitRuntimeContext
+from runtime_config import TradingMode
 from service_main import TradingExecutionService
 from ticket_consumer import TicketConsumer
-from ticket_store import ExecutionStore
+from ticket_store import ExecutionStore, StaleFencingToken, iso
+from ticket_validator import TicketValidator
 
 
 NOW = datetime(2026, 8, 22, 8, 0, tzinfo=timezone.utc)
@@ -45,6 +49,8 @@ def ticket_payload(ticket_id="tk_execution_test_001", *, position_version=3, ref
         "ticket_id": ticket_id,
         "forecast_id": "fc_execution_test_001",
         "forecast_revision": 1,
+        "portfolio_decision_id": f"pd_{ticket_id}",
+        "strategy_release_id": "sr_execution_test_001",
         "created_at": NOW,
         "valid_from": NOW,
         "expires_at": NOW + timedelta(minutes=5),
@@ -183,6 +189,10 @@ class ExecutionEngineTests(unittest.TestCase):
         params = self.client.exchange.orders[0]["params"]
         self.assertEqual(Decimal(params["stopLoss"]), Decimal("99000"))
         self.assertEqual(params["slTriggerBy"], "MarkPrice")
+        stop_command = self.store.command(
+            order_link_id(ticket.ticket_id, "stop_loss_1")
+        )
+        self.assertEqual(stop_command["status"], "REST_ACCEPTED")
 
     def test_equity_high_water_drawdown_blocks_new_risk(self):
         ticket = OperationTicket.model_validate(ticket_payload("tk_drawdown_guard_001"))
@@ -242,6 +252,11 @@ class ExecutionEngineTests(unittest.TestCase):
         stream.set_connection_probe(lambda: True)
         stream.mark_connected()
         self.assertTrue(stream.health_confirmed())
+        self.assertEqual(stream.connection_count, 1)
+        stream.mark_disconnected()
+        stream.mark_connected()
+        self.assertEqual(stream.connection_count, 2)
+        self.assertEqual(stream.disconnect_count, 1)
         stream.on_order({"data": [{"orderLinkId": "manual-order-123", "orderStatus": "New"}]})
         stream.on_execution(
             {"data": [{"execId": "manual-exec", "orderLinkId": "manual-order-123"}]}
@@ -352,8 +367,14 @@ class ExecutionEngineTests(unittest.TestCase):
         ticket = OperationTicket.model_validate(ticket_payload())
         self.store.receive(ticket)
         self.store.transition(ticket.ticket_id, ExecutionState.VALIDATED, "validated")
-        self.store.claim(ticket.ticket_id, "consumer-a", "lease", 60)
-        self.store.transition(ticket.ticket_id, ExecutionState.RISK_APPROVED, "risk_approved")
+        claim_epoch = self.store.claim(ticket.ticket_id, "consumer-a", "lease", 60)
+        self.store.transition(
+            ticket.ticket_id,
+            ExecutionState.RISK_APPROVED,
+            "risk_approved",
+            fence_owner="consumer-a",
+            fence_epoch=claim_epoch,
+        )
         plan = PositionSizer().calculate(
             ticket,
             self.context.account_snapshot,
@@ -369,6 +390,8 @@ class ExecutionEngineTests(unittest.TestCase):
             order_type=plan.order_type,
             quantity=float(plan.quantity),
             price=float(plan.price),
+            claim_owner="consumer-a",
+            claim_epoch=claim_epoch,
         )
         remote = {"id": "remote-order-1", "status": "open", "info": {"orderStatus": "New"}}
         reconciler = ExecutionReconciler(self.store, FakeReconciliationGateway(remote=remote))
@@ -527,6 +550,18 @@ class ExecutionEngineTests(unittest.TestCase):
         self.assertEqual(self.store.order(target_link_id)["order_status"], "CANCELLED")
         self.assertEqual(len(self.client.exchange.orders), 1)
         self.assertEqual(self.client.exchange.orders[0]["status"], "canceled")
+        cancel_command = self.store.command(
+            order_link_id(cancel.ticket_id, "cancel_1")
+        )
+        self.assertEqual(cancel_command["status"], "CONFIRMED")
+
+    def test_unapproved_strategy_release_is_rejected_before_risk(self):
+        ticket = OperationTicket.model_validate(ticket_payload("tk_release_gate_001"))
+        result = TicketValidator("sr_different_approved_release").validate(
+            ticket, now=NOW
+        )
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason_code, "UNAPPROVED_STRATEGY_RELEASE")
 
     def test_expired_bad_quality_and_unconfirmed_testnet_are_fail_closed(self):
         expired_payload = ticket_payload("tk_expired_test_001")
@@ -618,6 +653,163 @@ class ExecutionEngineTests(unittest.TestCase):
         self.assertEqual(self.store.state(old.ticket_id), ExecutionState.SUPERSEDED)
         self.assertEqual(self.consumer.process(old, now=NOW), ExecutionState.SUPERSEDED)
         self.assertEqual(len(self.client.exchange.orders), 0)
+
+    def test_expired_worker_fence_cannot_reserve_exchange_order(self):
+        ticket = OperationTicket.model_validate(ticket_payload("tk_fencing_epoch_001"))
+        self.store.receive(ticket)
+        self.store.transition(ticket.ticket_id, ExecutionState.VALIDATED, "validated")
+        epoch_one = self.store.claim(ticket.ticket_id, "consumer-a", "lease-a", 60)
+        with self.store.transaction(immediate=True) as connection:
+            connection.execute(
+                "UPDATE tickets SET lease_expires_at=? WHERE ticket_id=?",
+                (iso(datetime.now(timezone.utc) - timedelta(seconds=1)), ticket.ticket_id),
+            )
+        epoch_two = self.store.claim(
+            ticket.ticket_id,
+            "consumer-b",
+            "lease-b",
+            60,
+            claim_epoch=int(epoch_one) + 1,
+        )
+        self.assertGreater(epoch_two, epoch_one)
+        self.store.transition(
+            ticket.ticket_id,
+            ExecutionState.RISK_APPROVED,
+            "risk_approved",
+            fence_owner="consumer-b",
+            fence_epoch=epoch_two,
+        )
+        plan = PositionSizer().calculate(
+            ticket,
+            self.context.account_snapshot,
+            self.context.portfolio_snapshot,
+            self.context.rules,
+        )
+        with self.assertRaises(StaleFencingToken):
+            self.store.reserve_order(
+                ticket.ticket_id,
+                order_link_id(ticket.ticket_id),
+                role="entry",
+                side=plan.side,
+                order_type=plan.order_type,
+                quantity=float(plan.quantity),
+                price=float(plan.price),
+                claim_owner="consumer-a",
+                claim_epoch=epoch_one,
+            )
+
+    def test_same_consumer_restart_requires_new_epoch_after_old_lease_expires(self):
+        ticket = OperationTicket.model_validate(ticket_payload("tk_same_uid_fence_001"))
+        self.store.receive(ticket)
+        self.store.transition(ticket.ticket_id, ExecutionState.VALIDATED, "validated")
+        old_epoch = self.store.claim(
+            ticket.ticket_id, "consumer-a", "lease-old-process", 60
+        )
+        self.assertIsNone(
+            self.store.claim_operation(
+                ticket.ticket_id, "consumer-a", "lease-new-process", 60
+            )
+        )
+        with self.store.transaction(immediate=True) as connection:
+            connection.execute(
+                "UPDATE tickets SET lease_expires_at=? WHERE ticket_id=?",
+                (iso(datetime.now(timezone.utc) - timedelta(seconds=1)), ticket.ticket_id),
+            )
+        new_epoch = self.store.claim_operation(
+            ticket.ticket_id, "consumer-a", "lease-new-process", 60
+        )
+        self.assertEqual(new_epoch, int(old_epoch) + 1)
+        with self.assertRaises(StaleFencingToken):
+            self.store.reserve_command(
+                ticket.ticket_id,
+                order_link_id(ticket.ticket_id, "cancel_1"),
+                role="cancel_1",
+                claim_owner="consumer-a",
+                claim_epoch=int(old_epoch),
+            )
+
+    def test_reconciliation_incident_and_basis_are_independent_fail_closed_gates(self):
+        ticket = OperationTicket.model_validate(ticket_payload("tk_runtime_gates_001"))
+        unreconciled = replace(self.context.health_snapshot, reconciliation_complete=False)
+        decision = RiskGuard().evaluate(
+            ticket,
+            self.context.market_snapshot,
+            self.context.account_snapshot,
+            self.context.portfolio_snapshot,
+            unreconciled,
+            now=NOW,
+        )
+        self.assertEqual(decision.reason_code, "RECONCILIATION_INCOMPLETE")
+
+        incident = replace(self.context.health_snapshot, incident_mode="FREEZE_NEW_RISK")
+        decision = RiskGuard().evaluate(
+            ticket,
+            self.context.market_snapshot,
+            self.context.account_snapshot,
+            self.context.portfolio_snapshot,
+            incident,
+            now=NOW,
+        )
+        self.assertEqual(decision.reason_code, "INCIDENT_MODE_BLOCK")
+
+        payload = ticket_payload("tk_basis_gate_001")
+        payload["guards"]["require_cross_exchange_basis_check"] = True
+        payload["guards"]["max_cross_exchange_basis_bps"] = 20
+        basis_ticket = OperationTicket.model_validate(payload)
+        decision = RiskGuard().evaluate(
+            basis_ticket,
+            replace(self.context.market_snapshot, cross_exchange_basis_bps=35),
+            self.context.account_snapshot,
+            self.context.portfolio_snapshot,
+            self.context.health_snapshot,
+            now=NOW,
+        )
+        self.assertEqual(decision.reason_code, "CROSS_EXCHANGE_BASIS")
+
+    def test_unknown_dedicated_account_state_forces_manual_handover(self):
+        class Account:
+            def get_all_open_orders(self):
+                return [
+                    {
+                        "id": "manual-1",
+                        "symbol": "BTCUSDT",
+                        "info": {"orderId": "manual-1", "orderLinkId": "manual-link"},
+                    }
+                ]
+
+            def get_all_open_positions(self):
+                return []
+
+        service = TradingExecutionService.__new__(TradingExecutionService)
+        service.settings = SimpleNamespace(
+            mode=TradingMode.TESTNET,
+            position_owner_id="owner-testnet-primary",
+        )
+        service.store = self.store
+        service.account_client = Account()
+        service.last_ownership_audit = None
+        with self.assertRaisesRegex(RuntimeError, "ownership check failed"):
+            service._verify_account_ownership()
+        runtime = self.store.system_runtime()
+        self.assertEqual(runtime["incident_mode"], "MANUAL_HANDOVER")
+        self.assertFalse(runtime["reconciliation_complete"])
+        self.assertTrue(self.store.kill_switch_enabled())
+
+    def test_health_is_degraded_until_reconciled_and_during_incident(self):
+        service = TradingExecutionService.__new__(TradingExecutionService)
+        service.store = self.store
+        service.settings = SimpleNamespace(mode=TradingMode.SHADOW)
+        service.stream_handler = PrivateStreamHandler(self.store)
+        service.last_error = None
+        service.last_ownership_audit = {"status": "shadow"}
+        service.last_poll_at = None
+        service.last_poll_result = None
+        service.soak_monitor = SimpleNamespace(run_id="run-health-test")
+        self.assertEqual(service.health_snapshot()["status"], "degraded")
+        self.store.set_reconciliation_complete(True, "test complete")
+        self.assertEqual(service.health_snapshot()["status"], "ok")
+        self.store.set_incident_mode(IncidentMode.FREEZE_NEW_RISK, "test incident")
+        self.assertEqual(service.health_snapshot()["status"], "degraded")
 
 
 class BybitEvidenceTests(unittest.TestCase):

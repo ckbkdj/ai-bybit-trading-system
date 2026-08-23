@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Optional, Sequence
 
 from contracts.operation_ticket_v1 import OperationTicket
+from incident_modes import action_allowed
 
 
 @dataclass(frozen=True)
@@ -15,6 +16,7 @@ class MarketSnapshot:
     ask_price: float
     market_regime: str
     captured_at: datetime
+    cross_exchange_basis_bps: Optional[float] = None
 
     @property
     def spread_bps(self) -> float:
@@ -45,6 +47,7 @@ class PortfolioSnapshot:
     same_direction_correlated_notional_usdt: float
     position_version: int
     current_position_qty: float
+    position_owner_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -54,6 +57,8 @@ class SystemHealth:
     websocket_confirmed: bool
     data_source_healthy: bool
     exchange_clock_drift_sec: float
+    incident_mode: str = "NORMAL"
+    reconciliation_complete: bool = True
 
 
 @dataclass(frozen=True)
@@ -97,6 +102,17 @@ class RiskGuard:
         def reject(code: str, detail: str) -> RiskDecision:
             return RiskDecision(False, code, detail, tuple(checks))
 
+        if not action_allowed(health.incident_mode, ticket.intent.action):
+            return reject(
+                "INCIDENT_MODE_BLOCK",
+                f"ticket action is blocked in incident mode {health.incident_mode}",
+            )
+        if risk_increasing and not health.reconciliation_complete:
+            return reject(
+                "RECONCILIATION_INCOMPLETE",
+                "startup/account reconciliation has not completed",
+            )
+        checks.append("incident_and_reconciliation")
         if risk_increasing and health.kill_switch:
             return reject("KILL_SWITCH", "system kill switch is enabled")
         checks.append("kill_switch_allows_risk_reduction" if health.kill_switch else "kill_switch")
@@ -107,6 +123,11 @@ class RiskGuard:
         checks.append("ticket_time")
         if risk_increasing and ticket.guards.event_blackout:
             return reject("EVENT_BLACKOUT", "ticket carries an active event blackout")
+        if risk_increasing and ticket.guards.provisional_reduce_only:
+            return reject(
+                "PROVISIONAL_REDUCE_ONLY",
+                "Tier B event evidence may reduce risk but cannot authorize new risk",
+            )
         checks.append("event_blackout")
         if risk_increasing and ticket.guards.observed_data_quality < ticket.guards.min_data_quality:
             return reject("BAD_DATA_QUALITY", "forecast data quality is below the ticket threshold")
@@ -139,6 +160,22 @@ class RiskGuard:
             return reject("PRICE_DEVIATION", f"live price deviation {deviation:.3f} bps exceeds limit")
         if risk_increasing and market.spread_bps > ticket.guards.max_live_spread_bps:
             return reject("SPREAD_TOO_WIDE", f"live spread {market.spread_bps:.3f} bps exceeds limit")
+        if risk_increasing and ticket.guards.execution_market != "bybit":
+            return reject("EXECUTION_MARKET_INVALID", "execution-related market data must be Bybit")
+        if risk_increasing and ticket.guards.require_cross_exchange_basis_check:
+            observed_basis = market.cross_exchange_basis_bps
+            if observed_basis is None:
+                observed_basis = ticket.guards.observed_cross_exchange_basis_bps
+            if observed_basis is None:
+                return reject(
+                    "BASIS_UNAVAILABLE",
+                    "required Bybit/forecast-market basis evidence is unavailable",
+                )
+            if observed_basis > ticket.guards.max_cross_exchange_basis_bps:
+                return reject(
+                    "CROSS_EXCHANGE_BASIS",
+                    f"cross-exchange basis {observed_basis:.3f} bps exceeds limit",
+                )
         checks.append("live_market")
         if risk_increasing and ticket.guards.required_market_regime and market.market_regime not in ticket.guards.required_market_regime:
             return reject("REGIME_MISMATCH", "live market regime is not allowed by ticket")

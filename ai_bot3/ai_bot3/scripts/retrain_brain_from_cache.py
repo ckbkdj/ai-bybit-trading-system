@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from core.brain_model import train_brain_from_df
+from core.kline_feature_store import KlineFeatureStore
 
 
 def _load_frame(db_path: Path, timeframe: str) -> pd.DataFrame:
@@ -42,6 +43,16 @@ def main() -> int:
     parser.add_argument("--modes", nargs="*")
     parser.add_argument("--force", action="store_true")
     parser.add_argument(
+        "--feature-store",
+        type=Path,
+        help="Versioned KlineFeatureStore path; defaults to general.kline_feature_store_path",
+    )
+    parser.add_argument(
+        "--legacy-cache-diagnostics",
+        action="store_true",
+        help="Inspect old per-symbol cache rows without training or promotion",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=ROOT / "model_results" / "evaluation" / "brain_retrain_report.json",
@@ -53,6 +64,16 @@ def main() -> int:
     db_dir = Path((config.get("general") or {}).get("db_dir") or ROOT / "data")
     if not db_dir.is_absolute():
         db_dir = ROOT / db_dir
+    feature_store_path = args.feature_store or Path(
+        (config.get("general") or {}).get("kline_feature_store_path")
+        or ROOT / "data" / "kline_feature_store.sqlite3"
+    )
+    if not feature_store_path.is_absolute():
+        feature_store_path = ROOT / feature_store_path
+    feature_store = None
+    if not args.legacy_cache_diagnostics:
+        # Corruption, missing schema, or feature-version mismatch must abort the run.
+        feature_store = KlineFeatureStore(feature_store_path, config, read_only=True)
 
     results: list[dict] = []
     for symbol in symbols:
@@ -64,7 +85,28 @@ def main() -> int:
                 continue
             timeframe = str(definition[0])
             try:
-                frame = _load_frame(db_path, timeframe)
+                if args.legacy_cache_diagnostics:
+                    frame = _load_frame(db_path, timeframe)
+                    results.append(
+                        {
+                            "symbol": symbol,
+                            "mode": mode,
+                            "status": "legacy_cache_diagnostic_only",
+                            "promote_decision": "shadow",
+                            "rows": int(len(frame)),
+                            "source_contract": "legacy_symbol_cache_non_deployable",
+                        }
+                    )
+                    continue
+                spec = feature_store.spec_for(symbol, mode)
+                attrition = feature_store.dataset_attrition(spec)
+                built = feature_store.build_mode_dataset(spec)
+                if attrition.split_status != "ready" or built.signature.row_count <= 0:
+                    raise RuntimeError(
+                        f"versioned dataset gate failed: {attrition.split_status} "
+                        f"rows={built.signature.row_count}"
+                    )
+                frame = built.df
                 metadata = train_brain_from_df(
                     frame,
                     symbol,
@@ -73,7 +115,17 @@ def main() -> int:
                     config,
                     force=args.force,
                 )
-                results.append({"symbol": symbol, "mode": mode, **metadata})
+                results.append(
+                    {
+                        "symbol": symbol,
+                        "mode": mode,
+                        "source_contract": "versioned_kline_feature_store",
+                        "feature_store": str(feature_store_path.resolve()),
+                        "feature_store_signature": built.signature.digest(),
+                        "dataset_attrition": attrition.__dict__,
+                        **metadata,
+                    }
+                )
             except Exception as exc:
                 results.append(
                     {
@@ -86,6 +138,7 @@ def main() -> int:
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "force": bool(args.force),
+        "legacy_cache_diagnostics": bool(args.legacy_cache_diagnostics),
         "results": results,
         "counts": {
             status: sum(1 for item in results if item.get("promote_decision") == status)

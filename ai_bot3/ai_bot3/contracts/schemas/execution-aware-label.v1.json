@@ -1,0 +1,187 @@
+{
+  "$id": "execution-aware-label.v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "entry_fill_fraction": {
+      "maximum": 1,
+      "minimum": 0,
+      "title": "Entry Fill Fraction",
+      "type": "number"
+    },
+    "exit_reason": {
+      "title": "Exit Reason",
+      "type": "string"
+    },
+    "fee_bps": {
+      "minimum": 0,
+      "title": "Fee Bps",
+      "type": "number"
+    },
+    "filled_quantity": {
+      "minimum": 0,
+      "title": "Filled Quantity",
+      "type": "number"
+    },
+    "first_barrier": {
+      "enum": [
+        "TAKE_PROFIT",
+        "STOP_LOSS",
+        "TIME",
+        "NONE",
+        "UNOBSERVED"
+      ],
+      "title": "First Barrier",
+      "type": "string"
+    },
+    "funding_bps": {
+      "title": "Funding Bps",
+      "type": "number"
+    },
+    "label_id": {
+      "maxLength": 80,
+      "minLength": 8,
+      "title": "Label Id",
+      "type": "string"
+    },
+    "mae_bps": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Mae Bps"
+    },
+    "mfe_bps": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Mfe Bps"
+    },
+    "partial_fill": {
+      "title": "Partial Fill",
+      "type": "boolean"
+    },
+    "portfolio_decision_id": {
+      "maxLength": 80,
+      "minLength": 8,
+      "title": "Portfolio Decision Id",
+      "type": "string"
+    },
+    "realised_cost_bps": {
+      "title": "Realised Cost Bps",
+      "type": "number"
+    },
+    "requested_quantity": {
+      "exclusiveMinimum": 0,
+      "title": "Requested Quantity",
+      "type": "number"
+    },
+    "schema_version": {
+      "const": "execution-aware-label.v1",
+      "default": "execution-aware-label.v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "side": {
+      "enum": [
+        "BUY",
+        "SELL"
+      ],
+      "title": "Side",
+      "type": "string"
+    },
+    "slippage_bps": {
+      "minimum": 0,
+      "title": "Slippage Bps",
+      "type": "number"
+    },
+    "source_receipt_id": {
+      "maxLength": 80,
+      "minLength": 8,
+      "title": "Source Receipt Id",
+      "type": "string"
+    },
+    "strategy_release_id": {
+      "maxLength": 120,
+      "minLength": 8,
+      "title": "Strategy Release Id",
+      "type": "string"
+    },
+    "symbol": {
+      "title": "Symbol",
+      "type": "string"
+    },
+    "ticket_id": {
+      "maxLength": 80,
+      "minLength": 8,
+      "title": "Ticket Id",
+      "type": "string"
+    },
+    "time_to_first_fill_sec": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Time To First Fill Sec"
+    },
+    "time_to_full_fill_sec": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Time To Full Fill Sec"
+    }
+  },
+  "required": [
+    "label_id",
+    "source_receipt_id",
+    "ticket_id",
+    "portfolio_decision_id",
+    "strategy_release_id",
+    "symbol",
+    "side",
+    "requested_quantity",
+    "filled_quantity",
+    "entry_fill_fraction",
+    "partial_fill",
+    "first_barrier",
+    "fee_bps",
+    "slippage_bps",
+    "funding_bps",
+    "realised_cost_bps",
+    "exit_reason",
+    "created_at"
+  ],
+  "title": "ExecutionAwareLabel",
+  "type": "object"
+}

@@ -1,18 +1,23 @@
 # Versioned AI-to-Bybit Trading System
 
-本目录现在包含一套默认 `shadow`、失败关闭、可回放的预测—执行系统。现用边界不再是旧预测 JSON 或共享数据库，而是三份不可变契约：`ForecastEnvelope v1`、`OperationTicket v1`、`ExecutionReceipt v1`。
+本目录现在包含一套默认 `shadow`、失败关闭、可回放的预测—执行系统。现用边界不再是旧预测 JSON 或共享数据库，而是版本化的 Forecast、PortfolioIntent、OperationTicket、ExecutionReceipt、ExecutionAwareLabel 和 StrategyReleaseBundle 契约。
+
+当前结论：**可部署的 shadow 工程候选，持续运行能力仍需长时间 soak 验证。**
 
 ## 入口
 
 - 预测控制面：`ai_bot3/ai_bot3/api/control_plane_main.py`
 - 交易执行服务：`BybitContractBotV4/bot_threshold_super_v4_1.py`
 - 跨项目影子验收：`scripts/run_shadow_e2e.py`
-- 可读版系统架构：`docs/architecture_v2_readable.md`
+- 可读版系统架构：`docs/architecture_v3_release_candidate.md`
+- 部署就绪度：`docs/deployment_readiness_20260823.md`
 - 完整 Bug 与证据审计：`docs/bug_and_evidence_audit.md`
 - 旧版经验和真实数据来源：`docs/legacy_reuse_and_data_sources.md`
-- 使用与迁移手册：`docs/user_guide_v2.md`
+- 使用与迁移手册：`docs/user_guide_v3.md`
+- 30 天 soak/SLO：`docs/soak_slo.md`
+- 供应链门禁：`docs/supply_chain_gate.md`
 - 部署与故障处理：`docs/operations_runbook.md`
-- 20 项验收矩阵：`docs/acceptance_report.md`
+- 验收矩阵：`docs/acceptance_report.md`
 - 主网上线门禁：`docs/mainnet_go_live_checklist.md`
 
 ## 安全状态

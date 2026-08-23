@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import uuid
 
 from execution_reporter import ExecutionReporter
 from ticket_client import TicketHttpClient, deterministic_lease_token
@@ -25,12 +26,17 @@ class TicketConsumerService:
         consumer: TicketConsumer,
         reporter: ExecutionReporter,
         store: ExecutionStore,
+        service_session_id: str | None = None,
     ):
         self.consumer_id = consumer_id
         self.client = client
         self.consumer = consumer
         self.reporter = reporter
         self.store = store
+        self.service_session_id = service_session_id or f"session_{uuid.uuid4().hex}"
+        self.consumer.executor.set_lease_session(
+            consumer_id, self.service_session_id
+        )
 
     def flush_receipts(self) -> int:
         # State may advance asynchronously through WebSocket/reconciliation after the
@@ -52,12 +58,21 @@ class TicketConsumerService:
         processed = 0
         conflicts = 0
         for item in items:
-            lease = deterministic_lease_token(self.consumer_id, item.ticket.ticket_id)
-            if not self.client.claim(item.ticket.ticket_id, self.consumer_id, lease, 60):
+            lease = deterministic_lease_token(
+                self.consumer_id, item.ticket.ticket_id, self.service_session_id
+            )
+            claim_epoch = self.client.claim(
+                item.ticket.ticket_id, self.consumer_id, lease, 60
+            )
+            if claim_epoch is None:
                 conflicts += 1
                 self.store.advance_consumer_cursor(self.consumer_id, item.cursor)
                 continue
-            self.consumer.process(item.ticket)
+            self.consumer.process(
+                item.ticket,
+                claim_epoch=claim_epoch,
+                lease_token=lease,
+            )
             receipt = self.reporter.build(item.ticket.ticket_id)
             try:
                 if self.client.post_receipt(receipt):

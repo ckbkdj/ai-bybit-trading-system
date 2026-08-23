@@ -260,6 +260,9 @@ class ExchangeGateway:
     def get_all_open_positions(self) -> list[dict[str, Any]]:
         return self.exchange.fetch_positions()
 
+    def get_all_open_orders(self) -> list[dict[str, Any]]:
+        return self.exchange.fetch_open_orders()
+
     def get_daily_risk_metrics(self, now=None) -> dict[str, Any]:
         """Replay today's official account ledger; partial evidence fails closed."""
 

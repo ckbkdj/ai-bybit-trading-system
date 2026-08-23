@@ -1,5 +1,501 @@
 {
   "$defs": {
+    "CancelIntent": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "CANCEL",
+          "title": "Action",
+          "type": "string"
+        },
+        "leverage_cap": {
+          "exclusiveMinimum": 0,
+          "maximum": 100,
+          "title": "Leverage Cap",
+          "type": "number"
+        },
+        "max_notional_usdt": {
+          "exclusiveMinimum": 0,
+          "title": "Max Notional Usdt",
+          "type": "number"
+        },
+        "position_effect": {
+          "const": "CANCEL_ONLY",
+          "title": "Position Effect",
+          "type": "string"
+        },
+        "reduce_fraction": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "maximum": 1,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reduce Fraction"
+        },
+        "risk_budget_pct": {
+          "maximum": 0.1,
+          "minimum": 0,
+          "title": "Risk Budget Pct",
+          "type": "number"
+        },
+        "side": {
+          "enum": [
+            "BUY",
+            "SELL"
+          ],
+          "title": "Side",
+          "type": "string"
+        },
+        "target_exposure_pct": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Target Exposure Pct",
+          "type": "number"
+        },
+        "target_order_link_id": {
+          "maxLength": 36,
+          "minLength": 8,
+          "title": "Target Order Link Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "side",
+        "target_exposure_pct",
+        "risk_budget_pct",
+        "max_notional_usdt",
+        "leverage_cap",
+        "target_order_link_id",
+        "action",
+        "position_effect"
+      ],
+      "title": "CancelIntent",
+      "type": "object"
+    },
+    "CloseIntent": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "CLOSE",
+          "title": "Action",
+          "type": "string"
+        },
+        "leverage_cap": {
+          "exclusiveMinimum": 0,
+          "maximum": 100,
+          "title": "Leverage Cap",
+          "type": "number"
+        },
+        "max_notional_usdt": {
+          "exclusiveMinimum": 0,
+          "title": "Max Notional Usdt",
+          "type": "number"
+        },
+        "position_effect": {
+          "const": "CLOSE_ONLY",
+          "title": "Position Effect",
+          "type": "string"
+        },
+        "reduce_fraction": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "maximum": 1,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reduce Fraction"
+        },
+        "risk_budget_pct": {
+          "maximum": 0.1,
+          "minimum": 0,
+          "title": "Risk Budget Pct",
+          "type": "number"
+        },
+        "side": {
+          "enum": [
+            "BUY",
+            "SELL"
+          ],
+          "title": "Side",
+          "type": "string"
+        },
+        "target_exposure_pct": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Target Exposure Pct",
+          "type": "number"
+        },
+        "target_order_link_id": {
+          "anyOf": [
+            {
+              "maxLength": 36,
+              "minLength": 8,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Target Order Link Id"
+        }
+      },
+      "required": [
+        "side",
+        "target_exposure_pct",
+        "risk_budget_pct",
+        "max_notional_usdt",
+        "leverage_cap",
+        "action",
+        "position_effect"
+      ],
+      "title": "CloseIntent",
+      "type": "object"
+    },
+    "IncreaseIntent": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "INCREASE",
+          "title": "Action",
+          "type": "string"
+        },
+        "leverage_cap": {
+          "exclusiveMinimum": 0,
+          "maximum": 100,
+          "title": "Leverage Cap",
+          "type": "number"
+        },
+        "max_notional_usdt": {
+          "exclusiveMinimum": 0,
+          "title": "Max Notional Usdt",
+          "type": "number"
+        },
+        "position_effect": {
+          "const": "OPEN_OR_INCREASE",
+          "title": "Position Effect",
+          "type": "string"
+        },
+        "reduce_fraction": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "maximum": 1,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reduce Fraction"
+        },
+        "risk_budget_pct": {
+          "maximum": 0.1,
+          "minimum": 0,
+          "title": "Risk Budget Pct",
+          "type": "number"
+        },
+        "side": {
+          "enum": [
+            "BUY",
+            "SELL"
+          ],
+          "title": "Side",
+          "type": "string"
+        },
+        "target_exposure_pct": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Target Exposure Pct",
+          "type": "number"
+        },
+        "target_order_link_id": {
+          "anyOf": [
+            {
+              "maxLength": 36,
+              "minLength": 8,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Target Order Link Id"
+        }
+      },
+      "required": [
+        "side",
+        "target_exposure_pct",
+        "risk_budget_pct",
+        "max_notional_usdt",
+        "leverage_cap",
+        "action",
+        "position_effect"
+      ],
+      "title": "IncreaseIntent",
+      "type": "object"
+    },
+    "OpenIntent": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "OPEN",
+          "title": "Action",
+          "type": "string"
+        },
+        "leverage_cap": {
+          "exclusiveMinimum": 0,
+          "maximum": 100,
+          "title": "Leverage Cap",
+          "type": "number"
+        },
+        "max_notional_usdt": {
+          "exclusiveMinimum": 0,
+          "title": "Max Notional Usdt",
+          "type": "number"
+        },
+        "position_effect": {
+          "const": "OPEN_OR_INCREASE",
+          "title": "Position Effect",
+          "type": "string"
+        },
+        "reduce_fraction": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "maximum": 1,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reduce Fraction"
+        },
+        "risk_budget_pct": {
+          "maximum": 0.1,
+          "minimum": 0,
+          "title": "Risk Budget Pct",
+          "type": "number"
+        },
+        "side": {
+          "enum": [
+            "BUY",
+            "SELL"
+          ],
+          "title": "Side",
+          "type": "string"
+        },
+        "target_exposure_pct": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Target Exposure Pct",
+          "type": "number"
+        },
+        "target_order_link_id": {
+          "anyOf": [
+            {
+              "maxLength": 36,
+              "minLength": 8,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Target Order Link Id"
+        }
+      },
+      "required": [
+        "side",
+        "target_exposure_pct",
+        "risk_budget_pct",
+        "max_notional_usdt",
+        "leverage_cap",
+        "action",
+        "position_effect"
+      ],
+      "title": "OpenIntent",
+      "type": "object"
+    },
+    "ReduceIntent": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "REDUCE",
+          "title": "Action",
+          "type": "string"
+        },
+        "leverage_cap": {
+          "exclusiveMinimum": 0,
+          "maximum": 100,
+          "title": "Leverage Cap",
+          "type": "number"
+        },
+        "max_notional_usdt": {
+          "exclusiveMinimum": 0,
+          "title": "Max Notional Usdt",
+          "type": "number"
+        },
+        "position_effect": {
+          "const": "REDUCE_ONLY",
+          "title": "Position Effect",
+          "type": "string"
+        },
+        "reduce_fraction": {
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "title": "Reduce Fraction",
+          "type": "number"
+        },
+        "risk_budget_pct": {
+          "maximum": 0.1,
+          "minimum": 0,
+          "title": "Risk Budget Pct",
+          "type": "number"
+        },
+        "side": {
+          "enum": [
+            "BUY",
+            "SELL"
+          ],
+          "title": "Side",
+          "type": "string"
+        },
+        "target_exposure_pct": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Target Exposure Pct",
+          "type": "number"
+        },
+        "target_order_link_id": {
+          "anyOf": [
+            {
+              "maxLength": 36,
+              "minLength": 8,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Target Order Link Id"
+        }
+      },
+      "required": [
+        "side",
+        "target_exposure_pct",
+        "risk_budget_pct",
+        "max_notional_usdt",
+        "leverage_cap",
+        "reduce_fraction",
+        "action",
+        "position_effect"
+      ],
+      "title": "ReduceIntent",
+      "type": "object"
+    },
+    "ReplaceIntent": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "REPLACE",
+          "title": "Action",
+          "type": "string"
+        },
+        "leverage_cap": {
+          "exclusiveMinimum": 0,
+          "maximum": 100,
+          "title": "Leverage Cap",
+          "type": "number"
+        },
+        "max_notional_usdt": {
+          "exclusiveMinimum": 0,
+          "title": "Max Notional Usdt",
+          "type": "number"
+        },
+        "position_effect": {
+          "const": "REPLACE_ONLY",
+          "title": "Position Effect",
+          "type": "string"
+        },
+        "reduce_fraction": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "maximum": 1,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reduce Fraction"
+        },
+        "risk_budget_pct": {
+          "maximum": 0.1,
+          "minimum": 0,
+          "title": "Risk Budget Pct",
+          "type": "number"
+        },
+        "side": {
+          "enum": [
+            "BUY",
+            "SELL"
+          ],
+          "title": "Side",
+          "type": "string"
+        },
+        "target_exposure_pct": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Target Exposure Pct",
+          "type": "number"
+        },
+        "target_order_link_id": {
+          "anyOf": [
+            {
+              "maxLength": 36,
+              "minLength": 8,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Target Order Link Id"
+        }
+      },
+      "required": [
+        "side",
+        "target_exposure_pct",
+        "risk_budget_pct",
+        "max_notional_usdt",
+        "leverage_cap",
+        "action",
+        "position_effect"
+      ],
+      "title": "ReplaceIntent",
+      "type": "object"
+    },
     "StopLoss": {
       "additionalProperties": false,
       "properties": {
@@ -179,6 +675,23 @@
           "title": "Event Blackout",
           "type": "boolean"
         },
+        "execution_market": {
+          "const": "bybit",
+          "default": "bybit",
+          "title": "Execution Market",
+          "type": "string"
+        },
+        "forecast_market": {
+          "default": "binance",
+          "title": "Forecast Market",
+          "type": "string"
+        },
+        "max_cross_exchange_basis_bps": {
+          "default": 25.0,
+          "minimum": 0,
+          "title": "Max Cross Exchange Basis Bps",
+          "type": "number"
+        },
         "max_feature_age_sec": {
           "exclusiveMinimum": 0,
           "title": "Max Feature Age Sec",
@@ -200,6 +713,19 @@
           "title": "Min Data Quality",
           "type": "number"
         },
+        "observed_cross_exchange_basis_bps": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Observed Cross Exchange Basis Bps"
+        },
         "observed_data_quality": {
           "maximum": 1,
           "minimum": 0,
@@ -214,6 +740,16 @@
         "observed_market_regime": {
           "title": "Observed Market Regime",
           "type": "string"
+        },
+        "provisional_reduce_only": {
+          "default": false,
+          "title": "Provisional Reduce Only",
+          "type": "boolean"
+        },
+        "require_cross_exchange_basis_check": {
+          "default": false,
+          "title": "Require Cross Exchange Basis Check",
+          "type": "boolean"
         },
         "require_flat_position": {
           "default": false,
@@ -277,104 +813,6 @@
         "symbol"
       ],
       "title": "TicketInstrument",
-      "type": "object"
-    },
-    "TicketIntent": {
-      "additionalProperties": false,
-      "properties": {
-        "action": {
-          "enum": [
-            "OPEN",
-            "INCREASE",
-            "REDUCE",
-            "CLOSE",
-            "CANCEL",
-            "REPLACE"
-          ],
-          "title": "Action",
-          "type": "string"
-        },
-        "leverage_cap": {
-          "exclusiveMinimum": 0,
-          "maximum": 100,
-          "title": "Leverage Cap",
-          "type": "number"
-        },
-        "max_notional_usdt": {
-          "exclusiveMinimum": 0,
-          "title": "Max Notional Usdt",
-          "type": "number"
-        },
-        "position_effect": {
-          "enum": [
-            "OPEN_OR_INCREASE",
-            "REDUCE_ONLY",
-            "CLOSE_ONLY",
-            "CANCEL_ONLY",
-            "REPLACE_ONLY"
-          ],
-          "title": "Position Effect",
-          "type": "string"
-        },
-        "reduce_fraction": {
-          "anyOf": [
-            {
-              "exclusiveMinimum": 0,
-              "maximum": 1,
-              "type": "number"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Reduce Fraction"
-        },
-        "risk_budget_pct": {
-          "maximum": 0.1,
-          "minimum": 0,
-          "title": "Risk Budget Pct",
-          "type": "number"
-        },
-        "side": {
-          "enum": [
-            "BUY",
-            "SELL"
-          ],
-          "title": "Side",
-          "type": "string"
-        },
-        "target_exposure_pct": {
-          "maximum": 1,
-          "minimum": 0,
-          "title": "Target Exposure Pct",
-          "type": "number"
-        },
-        "target_order_link_id": {
-          "anyOf": [
-            {
-              "maxLength": 36,
-              "minLength": 8,
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Target Order Link Id"
-        }
-      },
-      "required": [
-        "action",
-        "side",
-        "position_effect",
-        "target_exposure_pct",
-        "risk_budget_pct",
-        "max_notional_usdt",
-        "leverage_cap"
-      ],
-      "title": "TicketIntent",
       "type": "object"
     },
     "TicketProtection": {
@@ -535,7 +973,44 @@
       "$ref": "#/$defs/TicketInstrument"
     },
     "intent": {
-      "$ref": "#/$defs/TicketIntent"
+      "discriminator": {
+        "mapping": {
+          "CANCEL": "#/$defs/CancelIntent",
+          "CLOSE": "#/$defs/CloseIntent",
+          "INCREASE": "#/$defs/IncreaseIntent",
+          "OPEN": "#/$defs/OpenIntent",
+          "REDUCE": "#/$defs/ReduceIntent",
+          "REPLACE": "#/$defs/ReplaceIntent"
+        },
+        "propertyName": "action"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/OpenIntent"
+        },
+        {
+          "$ref": "#/$defs/IncreaseIntent"
+        },
+        {
+          "$ref": "#/$defs/ReduceIntent"
+        },
+        {
+          "$ref": "#/$defs/CloseIntent"
+        },
+        {
+          "$ref": "#/$defs/CancelIntent"
+        },
+        {
+          "$ref": "#/$defs/ReplaceIntent"
+        }
+      ],
+      "title": "Intent"
+    },
+    "portfolio_decision_id": {
+      "maxLength": 80,
+      "minLength": 8,
+      "title": "Portfolio Decision Id",
+      "type": "string"
     },
     "protection": {
       "anyOf": [
@@ -554,6 +1029,12 @@
       "const": "operation-ticket.v1",
       "default": "operation-ticket.v1",
       "title": "Schema Version",
+      "type": "string"
+    },
+    "strategy_release_id": {
+      "maxLength": 120,
+      "minLength": 8,
+      "title": "Strategy Release Id",
       "type": "string"
     },
     "supersedes_ticket_id": {
@@ -586,6 +1067,8 @@
     "ticket_id",
     "forecast_id",
     "forecast_revision",
+    "portfolio_decision_id",
+    "strategy_release_id",
     "created_at",
     "valid_from",
     "expires_at",

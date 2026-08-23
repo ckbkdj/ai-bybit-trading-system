@@ -48,7 +48,7 @@ class TicketPolicy:
             return None
         if quality.max_feature_age_sec > self.config.max_feature_age_sec:
             return None
-        if quality.out_of_distribution_score > self.config.max_ood_score:
+        if quality.range_guard_score > self.config.max_ood_score:
             return None
 
         distribution = forecast.distribution

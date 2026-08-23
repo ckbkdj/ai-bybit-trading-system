@@ -70,6 +70,8 @@ _OPTIONAL_PREDICTION_FIELDS = (
     "data_source_reliable",
     "out_of_distribution_score",
     "out_of_distribution_details",
+    "range_guard_score",
+    "range_guard_details",
     "factor_scores",
 )
 
@@ -134,6 +136,8 @@ class ResultManager:
         control_plane_db: Path | None = None,
         tickets_enabled: bool | None = None,
         required_brain_release_stage: str | None = None,
+        strategy_release_bundle=None,
+        strategy_release_bundle_path: Path | None = None,
     ):
         self.results_dir = results_dir
         self.results_dir.mkdir(parents=True, exist_ok=True)
@@ -152,6 +156,21 @@ class ResultManager:
         self.control_plane = ControlPlaneRepository(control_plane_db or default_db)
         self.forecast_adapter = LegacyForecastAdapter()
         self.ticket_builder = TicketBuilder()
+        from core.decision.portfolio_intent import PortfolioIntentBuilder
+        from core.release.strategy_bundle import StrategyReleaseLoader
+
+        self.portfolio_intent_builder = PortfolioIntentBuilder()
+        self.strategy_release_error = None
+        self.strategy_release_bundle = strategy_release_bundle
+        bundle_path = strategy_release_bundle_path or os.environ.get(
+            "AI_BOT_STRATEGY_RELEASE_BUNDLE"
+        )
+        if self.strategy_release_bundle is None and bundle_path:
+            try:
+                self.strategy_release_bundle = StrategyReleaseLoader.load(Path(bundle_path))
+            except Exception as exc:
+                self.strategy_release_error = f"{type(exc).__name__}: {exc}"
+                logging.exception("策略发布包校验失败，执行通道保持 shadow: %s", exc)
 
     def _brain_authorized_for_ticket(self, prediction: Dict[str, Any]) -> bool:
         brain = prediction.get("brain_prediction")
@@ -159,8 +178,23 @@ class ResultManager:
             return False
         stage = str(brain.get("release_stage") or "unreviewed").lower()
         if self.required_brain_release_stage == "live":
-            return stage == "live"
-        return stage in {"candidate", "live"}
+            stage_allowed = stage == "live"
+        else:
+            stage_allowed = stage in {"candidate", "live"}
+        bundle = self.strategy_release_bundle
+        if not stage_allowed or bundle is None:
+            return False
+        if self.required_brain_release_stage == "live" and bundle.release_stage != "live":
+            return False
+        if self.required_brain_release_stage == "candidate" and bundle.release_stage not in {
+            "candidate",
+            "live",
+        }:
+            return False
+        declared_release = str(
+            brain.get("strategy_release_id") or prediction.get("strategy_release_id") or ""
+        )
+        return declared_release == bundle.strategy_release_id
 
     def _get_file_path(self, symbol: str, mode: str) -> Path:
         return self.results_dir / f"{symbol}_{mode}.json"
@@ -179,7 +213,9 @@ class ResultManager:
         await asyncio.to_thread(_atomic_json_write, file_path, normalized)
         try:
             forecast = self.forecast_adapter.adapt(symbol, mode, normalized)
+            await asyncio.to_thread(self.control_plane.publish, forecast, None)
             ticket = None
+            portfolio_intent = None
             if self.tickets_enabled and self._brain_authorized_for_ticket(normalized):
                 reference_price = (
                     normalized.get("current_price")
@@ -191,15 +227,48 @@ class ResultManager:
                 except (TypeError, ValueError):
                     reference_price = 0.0
                 if reference_price > 0:
+                    release_id = self.strategy_release_bundle.strategy_release_id
+                    forecasts = await asyncio.to_thread(
+                        self.control_plane.active_forecasts,
+                        symbol,
+                        strategy_release_id=release_id,
+                    )
+                    decision_version = await asyncio.to_thread(
+                        self.control_plane.next_portfolio_decision_version, symbol
+                    )
+                    portfolio_intent = self.portfolio_intent_builder.build(
+                        forecasts,
+                        strategy_release_id=release_id,
+                        decision_version=decision_version,
+                    )
+                    latest_intent = await asyncio.to_thread(
+                        self.control_plane.latest_portfolio_intent, symbol
+                    )
+                    if portfolio_intent and latest_intent:
+                        previous_sources = {
+                            (item.forecast_id, item.forecast_revision)
+                            for item in latest_intent.contributions
+                        }
+                        new_sources = {
+                            (item.forecast_id, item.forecast_revision)
+                            for item in portfolio_intent.contributions
+                        }
+                        if previous_sources == new_sources:
+                            portfolio_intent = None
                     position_version = await asyncio.to_thread(
                         self.control_plane.latest_position_version, symbol
                     )
-                    ticket = self.ticket_builder.build_open_ticket(
-                        forecast,
-                        reference_price=reference_price,
-                        required_position_version=position_version,
-                    )
-            await asyncio.to_thread(self.control_plane.publish, forecast, ticket)
+                    if portfolio_intent:
+                        ticket = self.ticket_builder.build_portfolio_ticket(
+                            portfolio_intent,
+                            forecasts,
+                            reference_price=reference_price,
+                            required_position_version=position_version,
+                        )
+            if ticket and portfolio_intent:
+                await asyncio.to_thread(
+                    self.control_plane.publish, forecast, ticket, portfolio_intent
+                )
         except Exception as exc:
             # The legacy prediction remains available, but ticket generation is fail-closed.
             logging.exception("预测契约/操作票落盘失败，已禁止该结果进入执行通道: %s", exc)

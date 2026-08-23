@@ -32,7 +32,7 @@
 
 ## 强制评估输出
 
-预测层：long/short precision 与 recall、balanced accuracy、log loss/Brier、可靠性曲线、ECE、收益/波动/MAE/MFE 误差、分 regime/币种/周期/月份稳定性、OOD 与缺失率。
+预测层：long/short precision 与 recall、balanced accuracy、log loss/Brier、可靠性曲线、ECE、收益/波动/MAE/MFE 误差、分 regime/币种/周期/月份稳定性、range guard 与缺失率。真正分布偏移另报 PSI/Wasserstein。
 
 交易层：费用前后收益、成交率、滑点、资金费率、profit factor、turnover、容量、日/周/月收益、Sharpe/Sortino、收盘到收盘与 intratrade 最大回撤、最长回撤期、尾部损失、连续亏损、压力场景。
 
@@ -59,4 +59,4 @@ live     -> 只有人工证据包晋升后，才可能通过默认出票门禁
 
 所以当前结论是 `profitability_not_demonstrated`，不是“过去能盈利”。完整机器报告位于 `ai_bot3/ai_bot3/model_results/evaluation/strategy_audit.json`（运行时生成）。
 
-同日用本地 OHLCV 缓存按新规则强制重训 25 个 Brain 组合：20 组因只有约 540–600 行而达不到最低训练样本，进入 shadow；其余 5 组非 flat 方向准确率低于 50% 基线，全部 rejected。结果为 **0 candidate、0 live、20 shadow、5 rejected**。机器报告位于 `ai_bot3/ai_bot3/model_results/evaluation/brain_retrain_report.json`。
+同日旧缓存路径强制重训 25 个 Brain 组合：20 组因只有约 540–600 行而达不到最低训练样本，其余 5 组未达候选基线，结果为 **0 candidate、0 live、20 shadow、5 rejected**。后续审计证明该脚本绕过了 258 万行版本化特征库，因此它只是旧管线失败证据，不是新管线的模型结论。新管线尚未生成 candidate/live bundle。

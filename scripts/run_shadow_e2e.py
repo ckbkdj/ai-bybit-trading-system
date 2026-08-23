@@ -61,7 +61,7 @@ def main() -> int:
                 "confidence": 0.8,
                 "predicted_return": 0.008,
                 "calibrated_predicted_return": 0.008,
-                "out_of_distribution_score": 0.1,
+                "range_guard_score": 0.1,
                 "calibration_status": "valid",
                 "market_regime": "risk_on",
                 "data_source_status": "ok",
@@ -69,6 +69,7 @@ def main() -> int:
                 "current_price_age_seconds": 0,
                 "context_completeness": {"score": 0.96},
                 "model_version": "shadow-e2e-v1",
+                "strategy_release_id": "sr_shadow_e2e_fixture_001",
             },
         )
         ticket = TicketBuilder().build_open_ticket(

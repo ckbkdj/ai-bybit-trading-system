@@ -87,10 +87,12 @@ class ForecastQuality(ContractModel):
     data_coverage: float = Field(ge=0, le=1)
     data_quality: float = Field(ge=0, le=1)
     calibration_status: Literal["valid", "degraded", "invalid", "unknown"]
-    out_of_distribution_score: float = Field(ge=0, le=1)
+    range_guard_score: float = Field(ge=0, le=1)
     max_feature_age_sec: int = Field(ge=0)
     prediction_interval_coverage_target: Optional[float] = Field(default=None, gt=0, le=1)
     source_status: Literal["ok", "degraded", "missing", "error"] = "ok"
+    data_health_status: Literal["valid", "degraded", "invalid", "unknown"] = "unknown"
+    predictive_health_status: Literal["valid", "degraded", "invalid", "unknown"] = "unknown"
 
 
 class ForecastEvidence(ContractModel):
@@ -101,6 +103,7 @@ class ForecastEvidence(ContractModel):
 
 
 class ForecastLineage(ContractModel):
+    strategy_release_id: str = Field(min_length=8, max_length=120)
     model_bundle_id: str = Field(min_length=1)
     feature_set_id: str = Field(min_length=1)
     calibration_model_id: str = Field(min_length=1)

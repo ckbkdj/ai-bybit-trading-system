@@ -67,9 +67,58 @@ class RuntimeConfigTests(unittest.TestCase):
                 "BYBIT_LIVE_APPROVAL_ID": "change-20260822-001",
                 "BYBIT_API_KEY": "placeholder-key",
                 "BYBIT_SECRET_KEY": "placeholder-secret",
+                "BYBIT_DEDICATED_SUBACCOUNT": "true",
+                "POSITION_OWNER_ID": "owner-live-primary",
+                "APPROVED_STRATEGY_RELEASE_ID": "sr_live_approved_001",
+                "APP_CODE_COMMIT": "abcdef1234567890",
             }
         )
         self.assertIs(settings.mode, TradingMode.LIVE)
+        self.assertTrue(settings.dedicated_subaccount)
+
+    def test_testnet_refuses_shared_or_manual_account(self):
+        base = {
+            "BYBIT_TRADING_MODE": "testnet",
+            "BYBIT_API_KEY": "placeholder-key",
+            "BYBIT_SECRET_KEY": "placeholder-secret",
+        }
+        with self.assertRaisesRegex(SettingsError, "DEDICATED_SUBACCOUNT"):
+            self.load(base)
+        with self.assertRaisesRegex(SettingsError, "forbids manual orders"):
+            self.load(
+                {
+                    **base,
+                    "BYBIT_DEDICATED_SUBACCOUNT": "true",
+                    "POSITION_OWNER_ID": "owner-testnet-primary",
+                    "BYBIT_ALLOW_MANUAL_ORDERS": "true",
+                }
+            )
+
+    def test_testnet_requires_an_approved_strategy_release(self):
+        with self.assertRaisesRegex(SettingsError, "APPROVED_STRATEGY_RELEASE_ID"):
+            self.load(
+                {
+                    "BYBIT_TRADING_MODE": "testnet",
+                    "BYBIT_API_KEY": "placeholder-key",
+                    "BYBIT_SECRET_KEY": "placeholder-secret",
+                    "BYBIT_DEDICATED_SUBACCOUNT": "true",
+                    "POSITION_OWNER_ID": "owner-testnet-primary",
+                    "APP_CODE_COMMIT": "abcdef1234567890",
+                }
+            )
+
+    def test_testnet_requires_a_deployed_code_commit(self):
+        with self.assertRaisesRegex(SettingsError, "APP_CODE_COMMIT"):
+            self.load(
+                {
+                    "BYBIT_TRADING_MODE": "testnet",
+                    "BYBIT_API_KEY": "placeholder-key",
+                    "BYBIT_SECRET_KEY": "placeholder-secret",
+                    "BYBIT_DEDICATED_SUBACCOUNT": "true",
+                    "POSITION_OWNER_ID": "owner-testnet-primary",
+                    "APPROVED_STRATEGY_RELEASE_ID": "sr_testnet_approved_001",
+                }
+            )
 
 
 class ShadowExchangeTests(unittest.TestCase):

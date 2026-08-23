@@ -49,6 +49,7 @@ def vector(*, blackout=True, primary=True):
                 {"name": "reversal", "probability": 0.3},
             ],
             "event_blackout": blackout,
+            "risk_directive": "BLACKOUT" if blackout else "NONE",
             "blackout_until": NOW + timedelta(hours=8) if blackout else None,
             "evidence_source_ids": ["fed-statement"],
         }
@@ -152,6 +153,35 @@ class ResearchJobTests(unittest.TestCase):
                 event_blackout=True,
                 blackout_until=NOW + timedelta(hours=2),
             )
+
+        tier_b = [
+            EvidenceSource("wire-1", SourceTier.B, NOW, True, 0.8),
+            EvidenceSource("wire-2", SourceTier.B, NOW, True, 0.85),
+        ]
+        provisional = build_impact_vector(
+            event_id=fingerprint,
+            revision=2,
+            event_type="central_bank_policy",
+            data_cutoff=NOW,
+            created_at=NOW + timedelta(minutes=6),
+            novelty=0.8,
+            sources=tier_b,
+            affected_assets={
+                "BTC": {
+                    "direction_distribution": {
+                        "positive": 0.2,
+                        "neutral": 0.2,
+                        "negative": 0.6,
+                    },
+                    "impact_strength": 0.7,
+                    "half_life_sec": 3600,
+                }
+            },
+            scenarios=[{"name": "base", "probability": 1}],
+            provisional_risk_reduction=True,
+        )
+        self.assertEqual(provisional.risk_directive, "REDUCE_ONLY")
+        self.assertFalse(provisional.event_blackout)
 
 
 if __name__ == "__main__":

@@ -23,10 +23,10 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 try:
-    from .evaluation.time_series_split import purged_holdout_boundary
+    from .evaluation.time_series_split import purged_three_way_boundary
     from .evaluation.statistical_governance import TrialLedger, TrialRecord
 except ImportError:  # Direct file loading in governance tests and maintenance tools.
-    from core.evaluation.time_series_split import purged_holdout_boundary
+    from core.evaluation.time_series_split import purged_three_way_boundary
     from core.evaluation.statistical_governance import TrialLedger, TrialRecord
 
 log = logging.getLogger("BrainModel")
@@ -69,7 +69,8 @@ def _brain_cfg(cfg: Dict[str, Any] | None) -> Dict[str, Any]:
     out.setdefault("history_db", "./data/brain_training_history.sqlite3")
     out.setdefault("trial_ledger_db", "./data/research_trials.sqlite3")
     out.setdefault("min_samples", 600)
-    out.setdefault("validation_fraction", 0.2)
+    out.setdefault("validation_fraction", 0.15)
+    out.setdefault("test_fraction", 0.15)
     out.setdefault("min_confidence", 0.58)
     out.setdefault("volatility_multiplier", 1.2)
     out.setdefault("min_train_threshold", 0.0012)
@@ -506,24 +507,44 @@ def train_brain_from_df(df: pd.DataFrame, symbol: str, tf_code: str, mode: str, 
         _record_history(bc, symbol, mode, tf_code, df, signature, model_path, meta_path, meta["status"], meta)
         return meta
     horizon = horizon_for_mode(mode, cfg)
-    validation_fraction = float(bc.get("validation_fraction", 0.2))
+    validation_fraction = float(bc.get("validation_fraction", 0.15))
+    test_fraction = float(bc.get("test_fraction", 0.15))
     purge_rows = max(horizon, int(bc.get("validation_purge_bars", horizon)))
-    boundary = purged_holdout_boundary(
+    boundary = purged_three_way_boundary(
         len(X),
         validation_fraction=validation_fraction,
-        minimum_train_size=max(200, int(min_samples * (1.0 - validation_fraction)) - purge_rows),
+        test_fraction=test_fraction,
+        minimum_train_size=max(
+            200,
+            int(min_samples * (1.0 - validation_fraction - test_fraction))
+            - 2 * purge_rows,
+        ),
         minimum_validation_size=PROMOTE_MIN_VALIDATION_SAMPLES,
+        minimum_test_size=PROMOTE_MIN_VALIDATION_SAMPLES,
         purge_size=purge_rows,
     )
     X_train = X.iloc[boundary.train_start : boundary.train_end]
     X_val = X.iloc[boundary.validation_start : boundary.validation_end]
+    X_test = X.iloc[boundary.test_start : boundary.test_end]
     y_train = y[boundary.train_start : boundary.train_end]
     y_val = y[boundary.validation_start : boundary.validation_end]
+    y_test = y[boundary.test_start : boundary.test_end]
     clf = _model()
     sample_weight = np.where(y_train == LABEL_FLAT, 1.0, 1.6)
     clf.fit(X_train, y_train, clf__sample_weight=sample_weight)
     metrics = _evaluate(clf, X_val, y_val, float(ds_meta["strict_target_return"]), int(ds_meta["leverage"]))
+    test_metrics = _evaluate(
+        clf,
+        X_test,
+        y_test,
+        float(ds_meta["strict_target_return"]),
+        int(ds_meta["leverage"]),
+    )
+    metrics.update({f"test_{key}": value for key, value in test_metrics.items()})
     decision, reason, baseline = _decide_promotion(metrics, samples=int(len(X)), min_samples=int(min_samples))
+    if decision == "candidate" and float(metrics.get("test_direction_acc_nonflat") or 0) < PROMOTE_MIN_DIRECTION_ACC:
+        decision = "shadow"
+        reason = "independent_test_direction_acc_below_baseline"
     meta = {
         **base_metrics,
         **metrics,

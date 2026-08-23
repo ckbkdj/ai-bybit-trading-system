@@ -14,6 +14,9 @@ class ValidationResult:
 
 
 class TicketValidator:
+    def __init__(self, approved_strategy_release_id: str = ""):
+        self.approved_strategy_release_id = approved_strategy_release_id.strip()
+
     def validate(self, ticket: OperationTicket, *, now: datetime | None = None) -> ValidationResult:
         current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
         if ticket.schema_version != "operation-ticket.v1":
@@ -24,6 +27,15 @@ class TicketValidator:
             return ValidationResult(False, "TICKET_EXPIRED", "expires_at has passed")
         if ticket.instrument.exchange != "bybit" or ticket.instrument.category != "linear":
             return ValidationResult(False, "UNSUPPORTED_INSTRUMENT", "only Bybit linear instruments are supported")
+        if (
+            self.approved_strategy_release_id
+            and ticket.strategy_release_id != self.approved_strategy_release_id
+        ):
+            return ValidationResult(
+                False,
+                "UNAPPROVED_STRATEGY_RELEASE",
+                "ticket strategy_release_id is not the configured approved release",
+            )
         if ticket.intent.action in {"OPEN", "INCREASE", "REPLACE"}:
             if ticket.entry is None or ticket.protection is None or ticket.protection.stop_loss is None:
                 return ValidationResult(False, "MISSING_RISK_FIELDS", "entry and stop loss are required")

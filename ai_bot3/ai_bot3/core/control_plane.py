@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import threading
 from contextlib import closing, contextmanager
@@ -12,9 +13,14 @@ from typing import Any, Iterable, Iterator, Optional
 from contracts.execution_receipt_v1 import ExecutionReceipt
 from contracts.forecast_v1 import ForecastEnvelope
 from contracts.operation_ticket_v1 import OperationTicket
+from contracts.portfolio_intent_v1 import PortfolioIntent
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+SCHEMA_CHECKSUM = hashlib.sha256(
+    b"control-plane:v2:portfolio-intents:claim-epoch:immutable-outbox"
+).hexdigest()
+CODE_COMMIT = os.environ.get("APP_CODE_COMMIT", "workspace-uncommitted")
 
 
 def _utc_now() -> datetime:
@@ -67,6 +73,31 @@ class ControlPlaneRepository:
 
     def migrate(self) -> None:
         with self._migration_lock, self.transaction(immediate=True) as connection:
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                )"""
+            )
+            current = connection.execute(
+                "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations"
+            ).fetchone()["version"]
+            if int(current) > SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"control-plane DB schema {current} is newer than supported {SCHEMA_VERSION}"
+                )
+            migration_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(schema_migrations)")
+            }
+            for name, declaration in (
+                ("migration_id", "TEXT"),
+                ("code_commit", "TEXT"),
+                ("schema_checksum", "TEXT"),
+            ):
+                if name not in migration_columns:
+                    connection.execute(
+                        f"ALTER TABLE schema_migrations ADD COLUMN {name} {declaration}"
+                    )
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -98,6 +129,19 @@ class ControlPlaneRepository:
                 );
                 CREATE INDEX IF NOT EXISTS idx_tickets_cursor ON operation_tickets(sequence);
                 CREATE INDEX IF NOT EXISTS idx_tickets_symbol ON operation_tickets(symbol, sequence);
+                CREATE TABLE IF NOT EXISTS portfolio_intents (
+                    portfolio_decision_id TEXT PRIMARY KEY,
+                    strategy_release_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    decision_version INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    valid_until TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    payload_sha256 TEXT NOT NULL,
+                    UNIQUE(symbol, decision_version)
+                );
+                CREATE INDEX IF NOT EXISTS idx_portfolio_intents_symbol
+                    ON portfolio_intents(symbol, decision_version);
                 CREATE TABLE IF NOT EXISTS ticket_delivery_outbox (
                     sequence INTEGER PRIMARY KEY,
                     ticket_id TEXT NOT NULL UNIQUE,
@@ -111,6 +155,7 @@ class ControlPlaneRepository:
                     lease_token TEXT NOT NULL,
                     claimed_at TEXT NOT NULL,
                     lease_expires_at TEXT NOT NULL,
+                    claim_epoch INTEGER NOT NULL DEFAULT 0,
                     FOREIGN KEY (ticket_id) REFERENCES operation_tickets(ticket_id)
                 );
                 CREATE TABLE IF NOT EXISTS execution_receipts (
@@ -138,12 +183,38 @@ class ControlPlaneRepository:
                     ON ticket_events(ticket_id, sequence);
                 """
             )
+            claim_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(ticket_claims)")
+            }
+            if "claim_epoch" not in claim_columns:
+                connection.execute(
+                    "ALTER TABLE ticket_claims ADD COLUMN claim_epoch INTEGER NOT NULL DEFAULT 0"
+                )
             connection.execute(
-                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                (SCHEMA_VERSION, _iso(_utc_now())),
+                """INSERT OR IGNORE INTO schema_migrations(
+                    version, applied_at, migration_id, code_commit, schema_checksum
+                ) VALUES (?, ?, ?, ?, ?)""",
+                (
+                    SCHEMA_VERSION,
+                    _iso(_utc_now()),
+                    "control-plane-v2",
+                    CODE_COMMIT,
+                    SCHEMA_CHECKSUM,
+                ),
             )
+            recorded = connection.execute(
+                "SELECT schema_checksum FROM schema_migrations WHERE version=?",
+                (SCHEMA_VERSION,),
+            ).fetchone()
+            if not recorded or recorded["schema_checksum"] != SCHEMA_CHECKSUM:
+                raise RuntimeError("control-plane DB schema checksum does not match this build")
 
-    def publish(self, forecast: ForecastEnvelope, ticket: OperationTicket | None) -> bool:
+    def publish(
+        self,
+        forecast: ForecastEnvelope,
+        ticket: OperationTicket | None,
+        portfolio_intent: PortfolioIntent | None = None,
+    ) -> bool:
         forecast_data = forecast.model_dump(mode="json")
         forecast_json, forecast_hash = _canonical(forecast_data)
         with self.transaction(immediate=True) as connection:
@@ -167,6 +238,35 @@ class ControlPlaneRepository:
                 )
             if ticket is None:
                 return False
+            if portfolio_intent is not None:
+                if ticket.portfolio_decision_id != portfolio_intent.portfolio_decision_id:
+                    raise ImmutableConflict("ticket does not reference the supplied portfolio intent")
+                intent_json, intent_hash = _canonical(portfolio_intent.model_dump(mode="json"))
+                existing_intent = connection.execute(
+                    "SELECT payload_sha256 FROM portfolio_intents WHERE portfolio_decision_id=?",
+                    (portfolio_intent.portfolio_decision_id,),
+                ).fetchone()
+                if existing_intent and existing_intent["payload_sha256"] != intent_hash:
+                    raise ImmutableConflict(
+                        "portfolio_decision_id already exists with different content"
+                    )
+                if not existing_intent:
+                    connection.execute(
+                        """INSERT INTO portfolio_intents(
+                            portfolio_decision_id, strategy_release_id, symbol,
+                            decision_version, created_at, valid_until, payload_json, payload_sha256
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            portfolio_intent.portfolio_decision_id,
+                            portfolio_intent.strategy_release_id,
+                            portfolio_intent.symbol,
+                            portfolio_intent.decision_version,
+                            _iso(portfolio_intent.created_at),
+                            _iso(portfolio_intent.valid_until),
+                            intent_json,
+                            intent_hash,
+                        ),
+                    )
 
             ticket_data = ticket.model_dump(mode="json")
             ticket_json, ticket_hash = _canonical(ticket_data)
@@ -199,6 +299,45 @@ class ControlPlaneRepository:
                 (cursor, ticket.ticket_id, _iso(_utc_now())),
             )
             return True
+
+    def active_forecasts(
+        self, symbol: str, *, strategy_release_id: str, limit: int = 100
+    ) -> list[ForecastEnvelope]:
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                """SELECT payload_json FROM forecasts WHERE symbol=?
+                   ORDER BY created_at DESC, revision DESC LIMIT ?""",
+                (symbol.strip().upper(), max(2, min(int(limit), 500))),
+            ).fetchall()
+        forecasts = [ForecastEnvelope.model_validate_json(row["payload_json"]) for row in rows]
+        return [
+            item for item in forecasts if item.lineage.strategy_release_id == strategy_release_id
+        ]
+
+    def next_portfolio_decision_version(self, symbol: str) -> int:
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                "SELECT MAX(decision_version) AS version FROM portfolio_intents WHERE symbol=?",
+                (symbol.strip().upper(),),
+            ).fetchone()
+        return int(row["version"] or 0) + 1
+
+    def get_portfolio_intent(self, portfolio_decision_id: str) -> Optional[PortfolioIntent]:
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM portfolio_intents WHERE portfolio_decision_id=?",
+                (portfolio_decision_id,),
+            ).fetchone()
+        return PortfolioIntent.model_validate_json(row["payload_json"]) if row else None
+
+    def latest_portfolio_intent(self, symbol: str) -> Optional[PortfolioIntent]:
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                """SELECT payload_json FROM portfolio_intents WHERE symbol=?
+                   ORDER BY decision_version DESC LIMIT 1""",
+                (symbol.strip().upper(),),
+            ).fetchone()
+        return PortfolioIntent.model_validate_json(row["payload_json"]) if row else None
 
     def list_tickets(self, after_cursor: int = 0, limit: int = 100) -> tuple[list[OperationTicket], int]:
         page, cursor = self.ticket_page(after_cursor, limit)
@@ -257,32 +396,52 @@ class ControlPlaneRepository:
                 ).fetchone()
         return ForecastEnvelope.model_validate_json(row["payload_json"]) if row else None
 
-    def claim(self, ticket_id: str, consumer_id: str, lease_token: str, lease_sec: int = 30) -> bool:
+    def claim(
+        self, ticket_id: str, consumer_id: str, lease_token: str, lease_sec: int = 30
+    ) -> Optional[int]:
         now = _utc_now()
         expires = now + timedelta(seconds=max(5, min(int(lease_sec), 3600)))
         with self.transaction(immediate=True) as connection:
             if not connection.execute(
                 "SELECT 1 FROM operation_tickets WHERE ticket_id=?", (ticket_id,)
             ).fetchone():
-                return False
+                return None
             row = connection.execute(
-                "SELECT consumer_id, lease_expires_at FROM ticket_claims WHERE ticket_id=?", (ticket_id,)
+                """SELECT consumer_id, lease_token, lease_expires_at, claim_epoch
+                   FROM ticket_claims WHERE ticket_id=?""",
+                (ticket_id,),
             ).fetchone()
             if row:
                 current_expiry = datetime.fromisoformat(row["lease_expires_at"].replace("Z", "+00:00"))
-                if current_expiry > now and row["consumer_id"] != consumer_id:
-                    return False
+                same_lease = (
+                    row["consumer_id"] == consumer_id and row["lease_token"] == lease_token
+                )
+                if current_expiry > now and not same_lease:
+                    return None
+                claim_epoch = int(row["claim_epoch"] or 0) + (0 if same_lease else 1)
                 connection.execute(
-                    """UPDATE ticket_claims SET consumer_id=?, lease_token=?, claimed_at=?, lease_expires_at=?
+                    """UPDATE ticket_claims SET consumer_id=?, lease_token=?, claimed_at=?,
+                       lease_expires_at=?, claim_epoch=?
                        WHERE ticket_id=?""",
-                    (consumer_id, lease_token, _iso(now), _iso(expires), ticket_id),
+                    (
+                        consumer_id,
+                        lease_token,
+                        _iso(now),
+                        _iso(expires),
+                        claim_epoch,
+                        ticket_id,
+                    ),
                 )
             else:
+                claim_epoch = 1
                 connection.execute(
-                    "INSERT INTO ticket_claims VALUES (?, ?, ?, ?, ?)",
-                    (ticket_id, consumer_id, lease_token, _iso(now), _iso(expires)),
+                    """INSERT INTO ticket_claims(
+                        ticket_id, consumer_id, lease_token, claimed_at,
+                        lease_expires_at, claim_epoch
+                    ) VALUES (?, ?, ?, ?, ?, ?)""",
+                    (ticket_id, consumer_id, lease_token, _iso(now), _iso(expires), claim_epoch),
                 )
-            return True
+            return claim_epoch
 
     def save_receipt(self, receipt: ExecutionReceipt) -> bool:
         data = receipt.model_dump(mode="json")

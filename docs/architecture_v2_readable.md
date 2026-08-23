@@ -1,5 +1,7 @@
 # 可读版产品架构 v2
 
+> 已由 `docs/architecture_v3_release_candidate.md` 取代。v2 保留作为历史设计记录。
+
 更新时间：2026-08-23  
 当前发布结论：**工程影子候选，不是主网候选**。
 
@@ -97,4 +99,3 @@ live      -> 模型人工晋升 + 交易主网双开关 + approval id
 ```
 
 当前真实状态：Brain 重训结果为 20 shadow、5 rejected、0 candidate、0 live；所以无论代码是否能连接交易所，都不满足真钱条件。
-

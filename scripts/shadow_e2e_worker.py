@@ -25,6 +25,7 @@ class ShadowContext:
         return MarketSnapshot(
             ticket.instrument.symbol, 100000, 99995, 100005,
             ticket.guards.observed_market_regime, datetime.now(timezone.utc),
+            cross_exchange_basis_bps=0,
         )
 
     def account(self, ticket):
@@ -50,7 +51,8 @@ def main(base_url: str, db_path: str) -> int:
         raise RuntimeError(f"expected one ticket, received {len(items)}")
     item = items[0]
     lease = deterministic_lease_token("shadow-e2e", item.ticket.ticket_id)
-    if not client.claim(item.ticket.ticket_id, "shadow-e2e", lease):
+    claim_epoch = client.claim(item.ticket.ticket_id, "shadow-e2e", lease)
+    if claim_epoch is None:
         raise RuntimeError("remote claim failed")
     store = ExecutionStore(Path(db_path))
     exchange = BybitClient(mode="shadow")
@@ -60,7 +62,9 @@ def main(base_url: str, db_path: str) -> int:
         context=ShadowContext(),
         executor=BybitExecutor(exchange, store),
     )
-    state = consumer.process(item.ticket)
+    state = consumer.process(
+        item.ticket, claim_epoch=claim_epoch, lease_token=lease
+    )
     receipt = ExecutionReporter(store, "shadow-e2e", "shadow").build(item.ticket.ticket_id)
     if not client.post_receipt(receipt):
         raise RuntimeError("receipt delivery failed")
@@ -70,6 +74,8 @@ def main(base_url: str, db_path: str) -> int:
         "shadow_order_count": len(exchange.exchange.orders),
         "cursor": item.cursor,
         "receipt_id": receipt.receipt_id,
+        "reason_code": store.ticket_record(item.ticket.ticket_id).get("reason_code"),
+        "reason_detail": store.ticket_record(item.ticket.ticket_id).get("reason_detail"),
     }
     print(json.dumps(output, sort_keys=True))
     return 0 if output["state"] == "SUBMITTED" and output["shadow_order_count"] == 1 else 2

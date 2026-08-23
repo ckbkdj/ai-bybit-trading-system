@@ -12,6 +12,8 @@ from typing import Any, Dict, Iterable, Iterator, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
+from .evaluation.time_series_split import purged_three_way_boundary
+
 SCHEMA_VERSION = "kfs_v1"
 DEFAULT_FEATURE_VERSION = "kline_ta_v1"
 LABEL_VERSION = "future_return_v1"
@@ -66,7 +68,7 @@ def _stable_hash(obj: Any, n: int = 24) -> str:
     return hashlib.sha256(json.dumps(obj, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()[:n]
 
 
-def _config_hash(cfg: Dict[str, Any]) -> str:
+def _training_config_hash(cfg: Dict[str, Any]) -> str:
     relevant = {
         "modes": cfg.get("modes"),
         "general": {"cache_days": (cfg.get("general") or {}).get("cache_days")},
@@ -74,6 +76,16 @@ def _config_hash(cfg: Dict[str, Any]) -> str:
         "brain_model": cfg.get("brain_model"),
     }
     return _stable_hash(relevant)
+
+
+def _feature_config_hash() -> str:
+    return _stable_hash(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "feature_version": DEFAULT_FEATURE_VERSION,
+            "feature_columns": list(KLINE_DERIVED_FEATURES),
+        }
+    )
 
 
 KLINE_DERIVED_FEATURES = (
@@ -142,6 +154,7 @@ class ModeSpec:
     multi_timeframe: bool = False
     timeframe_set: Tuple[str, ...] = ()
     config_hash: str = ""
+    training_config_hash: str = ""
 
 
 @dataclass(frozen=True)
@@ -180,24 +193,68 @@ class BuiltDataset:
     signature: ModelDataSignature
 
 
+@dataclass(frozen=True)
+class DatasetAttritionReport:
+    symbol: str
+    mode_name: str
+    base_timeframe: str
+    as_of_close_time: int
+    requested_limit: int
+    raw_rows: int
+    closed_rows: int
+    point_in_time_rows: int
+    feature_version_rows: int
+    model_input_window_rows: int
+    complete_feature_rows: int
+    label_available_rows: int
+    eligible_rows: int
+    purge_rows: int
+    train_rows: int
+    validation_rows: int
+    test_rows: int
+    non_flat_rows: int
+    feature_set_hash: str
+    split_status: str
+    explanation: str
+
+
 class KlineFeatureStore:
-    def __init__(self, db_path: str | Path, cfg: Dict[str, Any], fetcher: Any = None, source: str = "binance"):
+    def __init__(
+        self,
+        db_path: str | Path,
+        cfg: Dict[str, Any],
+        fetcher: Any = None,
+        source: str = "binance",
+        *,
+        read_only: bool = False,
+    ):
         self.db_path = Path(db_path)
         if not self.db_path.is_absolute():
             self.db_path = Path.cwd() / self.db_path
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.cfg = cfg or {}
         self.fetcher = fetcher
         self.source = source
+        self.read_only = bool(read_only)
+        if not self.read_only:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.read_only and not self.db_path.is_file():
+            raise FileNotFoundError(self.db_path)
         if self.db_path.exists() and self.db_path.stat().st_size > 0:
             self.assert_database_integrity()
-        self.ensure_schema()
+        if not self.read_only:
+            self.ensure_schema()
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         """Yield one bounded connection and always release its Windows handle."""
 
-        connection = sqlite3.connect(str(self.db_path))
+        if self.read_only:
+            connection = sqlite3.connect(
+                f"file:{self.db_path.resolve().as_posix()}?mode=ro", uri=True
+            )
+            connection.execute("PRAGMA query_only=ON")
+        else:
+            connection = sqlite3.connect(str(self.db_path))
         connection.row_factory = sqlite3.Row
         try:
             yield connection
@@ -274,7 +331,8 @@ class KlineFeatureStore:
         horizons = (self.cfg.get("brain_model") or {}).get("horizons") or {}
         mtf_cfg = (self.cfg.get("training") or {}).get("multi_timeframe") or {}
         mtf_enabled = bool(mtf_cfg.get("enabled", False))
-        cfg_hash = _config_hash(self.cfg)
+        feature_cfg_hash = _feature_config_hash()
+        training_cfg_hash = _training_config_hash(self.cfg)
         all_tfs = [str(v[0]) for v in modes.values()]
         out: list[ModeSpec] = []
         for sym in syms:
@@ -288,7 +346,9 @@ class KlineFeatureStore:
                     mode_name=str(mode), symbol=str(sym), base_timeframe=base_tf,
                     requested_limit=int(vals[1]), lookback_window=int(vals[2]), cache_days=cache_days,
                     label_horizon=int(horizons.get(mode, 1)), multi_timeframe=mtf_enabled,
-                    timeframe_set=tfset, config_hash=cfg_hash,
+                    timeframe_set=tfset,
+                    config_hash=feature_cfg_hash,
+                    training_config_hash=training_cfg_hash,
                 ))
         return out
 
@@ -440,23 +500,57 @@ class KlineFeatureStore:
             con.commit()
         return len(rows)
 
-    def load_enhanced_frame(self, symbol: str, timeframe: str, spec: ModeSpec, limit: int | None = None) -> pd.DataFrame:
-        sql = """SELECT open_time,close_time,open,high,low,close,volume,features_json,feature_set_hash
-                 FROM enhanced_kline WHERE symbol=? AND timeframe=? AND source=? AND feature_version=? AND config_hash=? AND schema_version=?
-                 ORDER BY open_time ASC"""
+    def load_enhanced_frame(
+        self,
+        symbol: str,
+        timeframe: str,
+        spec: ModeSpec,
+        limit: int | None = None,
+        *,
+        as_of_close_time: int | None = None,
+    ) -> pd.DataFrame:
+        expected_feature_hash = _stable_hash(list(KLINE_DERIVED_FEATURES), 16)
+        inner = """SELECT open_time,close_time,open,high,low,close,volume,
+                          features_json,feature_set_hash,
+                          ROW_NUMBER() OVER(
+                              PARTITION BY open_time
+                              ORDER BY computed_at DESC, config_hash DESC
+                          ) AS selected_rank
+                   FROM enhanced_kline
+                   WHERE symbol=? AND timeframe=? AND source=? AND feature_version=?
+                     AND schema_version=? AND feature_set_hash=?"""
+        params: list[Any] = [
+            symbol,
+            timeframe,
+            self.source,
+            spec.feature_version,
+            SCHEMA_VERSION,
+            expected_feature_hash,
+        ]
+        if as_of_close_time is not None:
+            inner += " AND close_time<=?"
+            params.append(int(as_of_close_time))
+        sql = f"""SELECT open_time,close_time,open,high,low,close,volume,
+                         features_json,feature_set_hash
+                  FROM ({inner}) WHERE selected_rank=1"""
+        if limit:
+            sql += " ORDER BY open_time DESC LIMIT ?"
+            params.append(max(1, int(limit)))
+        else:
+            sql += " ORDER BY open_time ASC"
         try:
             with self._connect() as con:
-                rows = con.execute(sql, (symbol, timeframe, self.source, spec.feature_version, spec.config_hash, SCHEMA_VERSION)).fetchall()
+                rows = con.execute(sql, tuple(params)).fetchall()
         except sqlite3.DatabaseError as exc:
             raise FeatureStoreIntegrityError(
                 f"enhanced feature evidence is unreadable for {symbol}-{timeframe}: {exc}"
             ) from exc
+        if limit:
+            rows = list(reversed(rows))
         records = []
         for r in rows:
             d = dict(r); fj = json.loads(d.pop("features_json") or "{}"); d.update(fj); records.append(d)
         df = pd.DataFrame(records)
-        if limit and len(df) > limit:
-            df = df.tail(int(limit)).reset_index(drop=True)
         return df
 
     def build_feature_frame(self, spec: ModeSpec, include_mtf: bool = True) -> pd.DataFrame:
@@ -483,7 +577,7 @@ class KlineFeatureStore:
     def build_mode_dataset(self, spec: ModeSpec, shift_features: bool = True) -> BuiltDataset:
         frame = self.build_feature_frame(spec, include_mtf=True)
         if frame.empty:
-            sig = ModelDataSignature(spec.mode_name, spec.symbol, tuple(spec.timeframe_set), spec.base_timeframe, 0, 0, 0, spec.feature_version, _stable_hash([]), spec.config_hash)
+            sig = ModelDataSignature(spec.mode_name, spec.symbol, tuple(spec.timeframe_set), spec.base_timeframe, 0, 0, 0, spec.feature_version, _stable_hash([]), spec.training_config_hash)
             return BuiltDataset(frame, [], "future_return", sig)
         excluded = {"open_time","close_time","open","high","low","close","volume","feature_set_hash","future_return"}
         # Only model derived feature columns, never raw OHLCV/timestamps/labels/source diagnostic columns.
@@ -504,9 +598,178 @@ class KlineFeatureStore:
             mode_name=spec.mode_name, symbol=spec.symbol, timeframe_set=tuple(spec.timeframe_set), base_timeframe=spec.base_timeframe,
             train_start_ts=int(ds["close_time"].iloc[0]) if len(ds) else 0,
             train_end_ts=int(ds["close_time"].iloc[-1]) if len(ds) else 0,
-            row_count=int(len(ds)), feature_version=spec.feature_version, feature_set_hash=fhash, config_hash=spec.config_hash,
+            row_count=int(len(ds)), feature_version=spec.feature_version, feature_set_hash=fhash, config_hash=spec.training_config_hash,
         )
         return BuiltDataset(ds, feature_cols, "future_return", sig)
+
+    def dataset_attrition(
+        self,
+        spec: ModeSpec,
+        *,
+        as_of_close_time: int | None = None,
+    ) -> DatasetAttritionReport:
+        """Explain every material row reduction before Brain/LSTM training."""
+
+        with self._connect() as connection:
+            latest = connection.execute(
+                """SELECT MAX(close_time) AS value FROM raw_kline
+                   WHERE symbol=? AND timeframe=? AND source=?""",
+                (spec.symbol, spec.base_timeframe, self.source),
+            ).fetchone()["value"]
+            as_of = int(as_of_close_time if as_of_close_time is not None else (latest or 0))
+            raw_rows = int(
+                connection.execute(
+                    """SELECT COUNT(*) AS value FROM raw_kline
+                       WHERE symbol=? AND timeframe=? AND source=?""",
+                    (spec.symbol, spec.base_timeframe, self.source),
+                ).fetchone()["value"]
+            )
+            closed_rows = int(
+                connection.execute(
+                    """SELECT COUNT(*) AS value FROM raw_kline
+                       WHERE symbol=? AND timeframe=? AND source=? AND close_time<=?""",
+                    (spec.symbol, spec.base_timeframe, self.source, as_of),
+                ).fetchone()["value"]
+            )
+            expected_feature_hash = _stable_hash(list(KLINE_DERIVED_FEATURES), 16)
+            versioned_rows = int(
+                connection.execute(
+                    """SELECT COUNT(DISTINCT open_time) AS value FROM enhanced_kline
+                       WHERE symbol=? AND timeframe=? AND source=? AND feature_version=?
+                         AND schema_version=? AND feature_set_hash=? AND close_time<=?""",
+                    (
+                        spec.symbol,
+                        spec.base_timeframe,
+                        self.source,
+                        spec.feature_version,
+                        SCHEMA_VERSION,
+                        expected_feature_hash,
+                        as_of,
+                    ),
+                ).fetchone()["value"]
+            )
+        frame = self.load_enhanced_frame(
+            spec.symbol,
+            spec.base_timeframe,
+            spec,
+            spec.requested_limit,
+            as_of_close_time=as_of,
+        )
+        excluded = {
+            "open_time",
+            "close_time",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "feature_set_hash",
+            "future_return",
+        }
+        feature_cols = [column for column in frame.columns if column not in excluded]
+        if frame.empty:
+            feature_cols = []
+        else:
+            frame = frame.sort_values("close_time").reset_index(drop=True)
+            feature_cols = [column for column in frame.columns if column not in excluded]
+        if frame.empty or not feature_cols:
+            return DatasetAttritionReport(
+                spec.symbol,
+                spec.mode_name,
+                spec.base_timeframe,
+                as_of,
+                spec.requested_limit,
+                raw_rows,
+                closed_rows,
+                0,
+                versioned_rows,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                _stable_hash([], 16),
+                "empty",
+                "No version-matching feature rows are available for this symbol/mode.",
+            )
+        shifted = frame[feature_cols].shift(1)
+        feature_complete = shifted.notna().all(axis=1)
+        horizon = max(1, int(spec.label_horizon))
+        future_return = frame["close"].shift(-horizon) / frame["close"] - 1.0
+        label_available = future_return.notna() & np.isfinite(future_return)
+        eligible = feature_complete & label_available
+        eligible_count = int(eligible.sum())
+
+        brain = self.cfg.get("brain_model") or {}
+        leverage_map = {str(k).upper(): int(v) for k, v in (brain.get("leverage") or {}).items()}
+        leverage = max(
+            1,
+            int(leverage_map.get(spec.symbol.upper(), brain.get("default_leverage", 75))),
+        )
+        strict = float(brain.get("target_leveraged_profit", 0.31)) / leverage
+        volatility = frame["close"].pct_change().rolling(24, min_periods=8).std().fillna(0.0)
+        threshold = np.minimum(
+            strict,
+            np.maximum(
+                volatility * float(brain.get("volatility_multiplier", 1.2)),
+                float(brain.get("min_train_threshold", 0.0012)),
+            ),
+        )
+        non_flat = int(((future_return.abs() >= threshold) & eligible).sum())
+        purge_rows = max(
+            horizon, int(brain.get("validation_purge_bars", horizon))
+        )
+        train_rows = validation_rows = test_rows = 0
+        split_status = "insufficient_history"
+        if eligible_count:
+            try:
+                boundary = purged_three_way_boundary(
+                    eligible_count,
+                    validation_fraction=float(brain.get("validation_fraction", 0.15)),
+                    test_fraction=float(brain.get("test_fraction", 0.15)),
+                    minimum_train_size=max(1, min(200, eligible_count // 2)),
+                    minimum_validation_size=max(1, min(100, eligible_count // 10)),
+                    minimum_test_size=max(1, min(100, eligible_count // 10)),
+                    purge_size=purge_rows,
+                )
+                train_rows = boundary.train_size
+                validation_rows = boundary.validation_size
+                test_rows = boundary.test_size
+                split_status = "ready"
+            except ValueError as exc:
+                split_status = f"blocked:{exc}"
+        feature_hash = str(frame["feature_set_hash"].dropna().iloc[-1])
+        return DatasetAttritionReport(
+            symbol=spec.symbol,
+            mode_name=spec.mode_name,
+            base_timeframe=spec.base_timeframe,
+            as_of_close_time=as_of,
+            requested_limit=spec.requested_limit,
+            raw_rows=raw_rows,
+            closed_rows=closed_rows,
+            point_in_time_rows=versioned_rows,
+            feature_version_rows=versioned_rows,
+            model_input_window_rows=len(frame),
+            complete_feature_rows=int(feature_complete.sum()),
+            label_available_rows=int(label_available.sum()),
+            eligible_rows=eligible_count,
+            purge_rows=purge_rows * 2,
+            train_rows=train_rows,
+            validation_rows=validation_rows,
+            test_rows=test_rows,
+            non_flat_rows=non_flat,
+            feature_set_hash=feature_hash,
+            split_status=split_status,
+            explanation=(
+                "The store-wide count spans every symbol/timeframe. This report selects one "
+                "symbol/mode, applies its requested_limit, one-bar PIT lag, future label horizon, "
+                "two purge gaps, then independent chronological validation and test slices."
+            ),
+        )
 
     def should_train(self, model_kind: str, spec: ModeSpec, signature: ModelDataSignature, model_path: str | None, new_rows: int) -> tuple[bool, str]:
         digest = signature.digest()

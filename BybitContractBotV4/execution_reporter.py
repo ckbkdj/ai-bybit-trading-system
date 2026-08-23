@@ -28,6 +28,7 @@ class ExecutionReporter:
         order_payloads = [
             {
                 "order_link_id": order["order_link_id"],
+                "role": order["role"],
                 "bybit_order_id": order["bybit_order_id"],
                 "order_status": order["order_status"],
                 "side": order["side"].upper(),
