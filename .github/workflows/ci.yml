@@ -109,9 +109,14 @@ jobs:
 
           report = json.loads(Path("supply-chain-audit.json").read_text(encoding="utf-8"))
           secrets = report["tracked_secret_scan"]
+          history = report["git_history_secret_scan"]
           node = report["node_lock_integrity"]
           if secrets["finding_count"] or secrets["tracked_sensitive_paths"]:
               raise SystemExit("tracked credential finding blocks CI")
+          if history["finding_count"] or history["historical_sensitive_paths"]:
+              raise SystemExit("reachable Git history contains credential findings")
+          if history["scan_limit_reached"]:
+              raise SystemExit("Git history credential scan limit was reached")
           if node["missing_integrity_entries"]:
               raise SystemExit("Node lockfile integrity is incomplete")
           print("Repository scan passed; dependency locking/vulnerability attestation remain release gates.")
