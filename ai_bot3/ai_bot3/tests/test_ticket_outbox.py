@@ -27,6 +27,11 @@ def actionable_forecast(symbol="BTCUSDT", generated_at="2026-08-21T08:00:00Z", t
             "calibrated_trend": trend,
             "confidence": 0.9,
             "predicted_return": signed_return,
+            "return_quantiles_bps": (
+                {"p10": 70.0, "p25": 85.0, "p50": 100.0, "p75": 115.0, "p90": 130.0}
+                if trend == "up"
+                else {"p10": -130.0, "p25": -115.0, "p50": -100.0, "p75": -85.0, "p90": -70.0}
+            ),
             "data_source_status": "ok",
             "data_source_reliable": True,
             "context_completeness": {"score": 0.96},

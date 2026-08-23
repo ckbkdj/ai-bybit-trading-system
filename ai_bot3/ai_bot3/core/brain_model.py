@@ -32,6 +32,7 @@ except ImportError:  # Direct file loading in governance tests and maintenance t
 log = logging.getLogger("BrainModel")
 
 BRAIN_VERSION = "brain_sklearn_v1"
+BRAIN_BASELINE_ONLY = True
 DEFAULT_TARGET_LEVERAGED_PROFIT = 0.31
 DEFAULT_LEVERAGE = {"BTCUSDT": 100, "ETHUSDT": 100, "XRPUSDT": 75, "SOLUSDT": 75, "1000PEPEUSDT": 75}
 DEFAULT_HORIZONS = {"scalping": 3, "mid_short": 2, "trend": 2, "trend_swing": 2, "swing": 1}
@@ -75,7 +76,7 @@ def _brain_cfg(cfg: Dict[str, Any] | None) -> Dict[str, Any]:
     out.setdefault("volatility_multiplier", 1.2)
     out.setdefault("min_train_threshold", 0.0012)
     out.setdefault("horizons", DEFAULT_HORIZONS)
-    out.setdefault("inference_stage", os.environ.get("AI_BOT_BRAIN_INFERENCE_STAGE", "shadow"))
+    out.setdefault("inference_stage", os.environ.get("AI_BOT_BRAIN_INFERENCE_STAGE", "baseline"))
     return out
 
 
@@ -405,13 +406,11 @@ def _evaluate(model: Pipeline, X_val: pd.DataFrame, y_val: np.ndarray, strict_ta
 
 
 def _decide_promotion(metrics: Dict[str, Any], samples: int, min_samples: int) -> Tuple[str, str, Dict[str, Any]]:
-    """Decide promote_decision / promote_reason / baseline_comparison.
+    """Record Brain diagnostics while rejecting it as a release candidate.
 
-    Conservative defaults: anything below the minimum validation sample
-    floor stays in ``shadow``; below baseline direction accuracy gets
-    ``rejected``; strong metrics get ``candidate`` (NOT auto-live; promotion
-    to ``live`` is reserved for the release pipeline which must also factor
-    in shadow / settled outcomes per docs §9.3).
+    Direction accuracy on close-to-close labels is retained only for baseline
+    comparison.  It is not evidence of fee-adjusted lockbox profitability and
+    therefore cannot produce a candidate or live artifact.
     """
     val_samples = int(metrics.get("validation_samples") or 0)
     direction_acc = float(metrics.get("direction_acc_nonflat") or 0.0)
@@ -430,35 +429,31 @@ def _decide_promotion(metrics: Dict[str, Any], samples: int, min_samples: int) -
         "min_validation_samples": PROMOTE_MIN_VALIDATION_SAMPLES,
         "min_training_samples": int(min_samples),
         "training_samples": int(samples),
+        "baseline_only": True,
+        "profitability_evidence": False,
     }
-    # Insufficient samples / metrics → shadow (don't auto-promote).
-    if samples < int(min_samples):
-        return "shadow", "training_samples_below_floor", baseline
-    if val_samples < PROMOTE_MIN_VALIDATION_SAMPLES:
-        return "shadow", "validation_samples_below_floor", baseline
-    if direction_acc < PROMOTE_MIN_DIRECTION_ACC:
-        return "rejected", "direction_acc_below_baseline", baseline
-    strong = (
-        direction_acc >= PROMOTE_STRONG_HIT_RATE
-        and (precision_long >= PROMOTE_STRONG_PRECISION or precision_short >= PROMOTE_STRONG_PRECISION)
-    )
-    if strong:
-        return "candidate", "metrics_meet_strong_baseline", baseline
-    return "shadow", "metrics_above_floor_below_strong_baseline", baseline
+    return "rejected", "brain_baseline_rejected_profitability_rebuild", baseline
 
 
 def train_brain_from_df(df: pd.DataFrame, symbol: str, tf_code: str, mode: str, cfg: Dict[str, Any] | None = None, force: bool = False) -> Dict[str, Any]:
     bc = _brain_cfg(cfg)
     model_path, meta_path = brain_paths(symbol, mode, cfg)
     signature = compute_signature(df, symbol, mode, cfg)
-    base_metrics = {"feature_count": 0, "data_signature": signature, "version": BRAIN_VERSION}
+    base_metrics = {
+        "feature_count": 0,
+        "data_signature": signature,
+        "version": BRAIN_VERSION,
+        "baseline_only": True,
+        "profitability_evidence": False,
+    }
     if not bool(bc.get("enabled", True)):
         meta = {
             **base_metrics,
             "status": "disabled",
             "generated_at": _now_iso(),
-            "promote_decision": "hold",
-            "promote_reason": "brain_disabled",
+            "promote_decision": "rejected",
+            "release_stage": "rejected",
+            "promote_reason": "brain_baseline_rejected_profitability_rebuild",
             "baseline_comparison": {
                 "min_validation_samples": PROMOTE_MIN_VALIDATION_SAMPLES,
                 "baseline_direction_acc": PROMOTE_MIN_DIRECTION_ACC,
@@ -480,9 +475,13 @@ def train_brain_from_df(df: pd.DataFrame, symbol: str, tf_code: str, mode: str, 
             "model_path": str(model_path),
             "meta_path": str(meta_path),
         }
-        # Preserve any previously recorded governance fields without overwriting them.
-        meta.setdefault("promote_decision", old.get("promote_decision", "hold"))
-        meta.setdefault("promote_reason", old.get("promote_reason", "unchanged_signature"))
+        # Old candidate/live decisions are deliberately not preserved.  Their
+        # direction-only metrics are not profitability evidence.
+        meta["promote_decision"] = "rejected"
+        meta["release_stage"] = "rejected"
+        meta["promote_reason"] = "brain_baseline_rejected_profitability_rebuild"
+        meta["baseline_only"] = True
+        meta["profitability_evidence"] = False
         meta.setdefault("baseline_comparison", old.get("baseline_comparison", {}))
         _record_history(bc, symbol, mode, tf_code, df, signature, model_path, meta_path, "skipped_same_signature", meta)
         return meta
@@ -495,8 +494,9 @@ def train_brain_from_df(df: pd.DataFrame, symbol: str, tf_code: str, mode: str, 
             "status": "skipped_insufficient_samples_or_classes",
             "samples": int(len(X)),
             "generated_at": _now_iso(),
-            "promote_decision": "shadow",
-            "promote_reason": "insufficient_samples_or_classes",
+            "promote_decision": "rejected",
+            "release_stage": "rejected",
+            "promote_reason": "brain_baseline_rejected_profitability_rebuild",
             "baseline_comparison": {
                 "training_samples": int(len(X)),
                 "min_training_samples": int(min_samples),
@@ -542,9 +542,6 @@ def train_brain_from_df(df: pd.DataFrame, symbol: str, tf_code: str, mode: str, 
     )
     metrics.update({f"test_{key}": value for key, value in test_metrics.items()})
     decision, reason, baseline = _decide_promotion(metrics, samples=int(len(X)), min_samples=int(min_samples))
-    if decision == "candidate" and float(metrics.get("test_direction_acc_nonflat") or 0) < PROMOTE_MIN_DIRECTION_ACC:
-        decision = "shadow"
-        reason = "independent_test_direction_acc_below_baseline"
     meta = {
         **base_metrics,
         **metrics,
@@ -586,10 +583,11 @@ def train_brain_from_df(df: pd.DataFrame, symbol: str, tf_code: str, mode: str, 
 
 def load_brain_bundle(symbol: str, mode: str, cfg: Dict[str, Any] | None = None) -> Optional[Dict[str, Any]]:
     model_path, _ = brain_paths(symbol, mode, cfg)
-    inference_stage = str(_brain_cfg(cfg).get("inference_stage") or "shadow").lower()
+    inference_stage = str(_brain_cfg(cfg).get("inference_stage") or "baseline").lower()
     if inference_stage in {"candidate", "live"}:
-        model_path, _ = brain_stage_artifact_paths(symbol, mode, inference_stage, cfg)
-    elif inference_stage != "shadow":
+        log.error("Brain is baseline-only and cannot load %s artifacts", inference_stage)
+        return None
+    if inference_stage not in {"baseline", "shadow", "rejected"}:
         log.error("unsupported brain inference stage %s; refusing model load", inference_stage)
         return None
     if not model_path.exists():
@@ -636,18 +634,14 @@ def predict_brain_from_df(df: pd.DataFrame, symbol: str, mode: str, cfg: Dict[st
     if direction == "short" and liq < -0.2: confidence = min(1.0, confidence + 0.04); reasons.append("爆仓/多头压力偏空，增强short信心")
     min_conf = float(bc.get("min_confidence", 0.58))
     model_meta = dict(bundle.get("meta") or {})
-    release_stage = str(
-        model_meta.get("release_stage")
-        or model_meta.get("promote_decision")
-        or "unreviewed"
-    ).lower()
+    release_stage = "rejected"
     signal_qualified = bool(direction != "flat" and confidence >= min_conf and expected_return >= strict)
-    actionable = bool(signal_qualified and release_stage in {"candidate", "live"})
+    actionable = False
     if not actionable:
         if direction == "flat": reasons.append("模型倾向观望")
         if confidence < min_conf: reasons.append(f"置信度{confidence:.3f}低于阈值{min_conf:.3f}")
         if expected_return < strict: reasons.append(f"预期收益{expected_return:.5f}未达到31%杠杆目标所需{strict:.5f}")
-        if release_stage not in {"candidate", "live"}: reasons.append(f"模型发布阶段{release_stage}不允许形成可交易信号")
+        reasons.append("Brain direction classifier仅作为baseline，缺少费用后lockbox盈利证据")
     return {
         "version": BRAIN_VERSION,
         "status": "ok",
@@ -666,4 +660,5 @@ def predict_brain_from_df(df: pd.DataFrame, symbol: str, mode: str, cfg: Dict[st
         "proba_short": p_short,
         "reason": reasons,
         "model_meta": model_meta,
+        "baseline_only": True,
     }

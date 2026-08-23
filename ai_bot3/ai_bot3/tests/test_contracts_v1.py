@@ -75,7 +75,7 @@ def operation_payload():
             "observed_market_regime": "risk_on",
             "required_position_version": 3,
         },
-        "reason": {"regime": "risk_on"},
+        "reason": {"regime": "risk_on", "lower_bound_net_edge_bps": 1.0},
     }
 
 

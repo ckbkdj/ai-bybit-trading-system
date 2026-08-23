@@ -34,6 +34,11 @@ def _forecast(mode: str, trend: str, expected_return: float):
             "trend": trend,
             "confidence": 0.9,
             "predicted_return": expected_return,
+            "return_quantiles_bps": (
+                {"p10": 60.0, "p25": 75.0, "p50": 100.0, "p75": 115.0, "p90": 130.0}
+                if expected_return > 0
+                else {"p10": -100.0, "p25": -90.0, "p50": -80.0, "p75": -70.0, "p90": -60.0}
+            ),
             "current_price_age_seconds": 5,
             "data_source_status": "ok",
             "data_source_reliable": True,

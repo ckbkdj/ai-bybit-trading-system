@@ -25,6 +25,7 @@ def compare_factor_groups(
     higher_is_better: bool,
     minimum_mean_improvement: float = 0.0,
     minimum_improved_fold_ratio: float = 0.6,
+    minimum_worst_fold_improvement: float = -0.002,
 ) -> tuple[AblationResult, ...]:
     """Compare each group on identical walk-forward folds; never pool in-sample rows."""
     if not baseline_folds:
@@ -59,6 +60,7 @@ def compare_factor_groups(
                 retained=(
                     mean_improvement >= minimum_mean_improvement
                     and improved_ratio >= minimum_improved_fold_ratio
+                    and min(improvements) >= minimum_worst_fold_improvement
                 ),
             )
         )

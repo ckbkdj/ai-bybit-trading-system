@@ -15,12 +15,12 @@ class TicketPolicyConfig:
     min_data_quality: float = 0.90
     max_feature_age_sec: int = 120
     max_ood_score: float = 0.35
-    min_after_cost_bps: float = 8.0
+    min_after_cost_bps: float = 0.0
     ticket_ttl_sec: int = 300
-    risk_budget_pct: float = 0.003
-    target_exposure_pct: float = 0.08
+    risk_budget_pct: float = 0.0025
+    target_exposure_pct: float = 0.05
     max_notional_usdt: float = 5000.0
-    leverage_cap: float = 3.0
+    leverage_cap: float = 2.0
     max_live_spread_bps: float = 10.0
     max_live_price_deviation_bps: float = 18.0
     default_stop_bps: float = 100.0
@@ -33,6 +33,7 @@ class TicketDecision:
     side: str
     gross_edge_bps: float
     cost: CostEstimate
+    lower_bound_net_edge_bps: float
 
 
 class TicketPolicy:
@@ -71,4 +72,22 @@ class TicketPolicy:
         )
         if cost.after_cost_bps < self.config.min_after_cost_bps:
             return None
-        return TicketDecision(side=side, gross_edge_bps=gross_edge, cost=cost)
+        quantiles = distribution.return_quantiles_bps
+        if quantiles is None:
+            return None
+        lower_gross_edge = float(quantiles.p10 if side == "BUY" else -quantiles.p90)
+        lower_bound_net_edge = (
+            lower_gross_edge
+            - cost.fee_bps
+            - cost.slippage_bps
+            - cost.funding_bps
+            - cost.model_error_buffer_bps
+        )
+        if lower_bound_net_edge <= 0:
+            return None
+        return TicketDecision(
+            side=side,
+            gross_edge_bps=gross_edge,
+            cost=cost,
+            lower_bound_net_edge_bps=lower_bound_net_edge,
+        )

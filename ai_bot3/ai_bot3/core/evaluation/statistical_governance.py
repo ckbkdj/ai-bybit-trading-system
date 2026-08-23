@@ -121,6 +121,21 @@ class TrialLedger:
                 );
                 CREATE INDEX IF NOT EXISTS idx_trials_family
                     ON research_trials(model_family, sequence);
+                CREATE TABLE IF NOT EXISTS trial_events(
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trial_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    metrics_json TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_trial_events_id
+                    ON trial_events(trial_id, sequence);
+                CREATE TABLE IF NOT EXISTS lockbox_evaluations(
+                    lockbox_fingerprint TEXT PRIMARY KEY,
+                    trial_id TEXT NOT NULL,
+                    purpose TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -182,3 +197,57 @@ class TrialLedger:
                     "SELECT COUNT(*) FROM research_trials WHERE model_family=?", (model_family,)
                 ).fetchone()[0]
             )
+
+    def append_event(
+        self,
+        trial_id: str,
+        status: str,
+        metrics: Mapping[str, Any] | None = None,
+    ) -> int:
+        """Append every lifecycle event, including failures and rejections."""
+
+        if status not in {"planned", "running", "completed", "failed", "rejected"}:
+            raise ValueError("unsupported trial event status")
+        payload = json.dumps(dict(metrics or {}), sort_keys=True, separators=(",", ":"), default=str)
+        with closing(self._connect()) as connection:
+            with connection:
+                cursor = connection.execute(
+                    "INSERT INTO trial_events(trial_id,status,metrics_json,recorded_at) VALUES(?,?,?,?)",
+                    (trial_id, status, payload, _utc_now()),
+                )
+                return int(cursor.lastrowid)
+
+    def claim_lockbox(
+        self,
+        lockbox_fingerprint: str,
+        trial_id: str,
+        *,
+        purpose: str = "final_evaluation",
+    ) -> bool:
+        """Claim an immutable lockbox once; never recycle it for parameter selection."""
+
+        if purpose != "final_evaluation":
+            raise ValueError("lockbox data may only be used for final_evaluation")
+        if len(lockbox_fingerprint) != 64:
+            raise ValueError("lockbox fingerprint must be a SHA-256 hex digest")
+        with closing(self._connect()) as connection:
+            with connection:
+                existing = connection.execute(
+                    "SELECT trial_id,purpose FROM lockbox_evaluations WHERE lockbox_fingerprint=?",
+                    (lockbox_fingerprint,),
+                ).fetchone()
+                if existing:
+                    if existing["trial_id"] == trial_id and existing["purpose"] == purpose:
+                        return False
+                    raise ValueError(
+                        "lockbox was already consumed; repeated OOS tuning/evaluation is forbidden"
+                    )
+                connection.execute(
+                    "INSERT INTO lockbox_evaluations(lockbox_fingerprint,trial_id,purpose,recorded_at) VALUES(?,?,?,?)",
+                    (lockbox_fingerprint, trial_id, purpose, _utc_now()),
+                )
+        return True
+
+    def lockbox_claim_count(self) -> int:
+        with closing(self._connect()) as connection:
+            return int(connection.execute("SELECT COUNT(*) FROM lockbox_evaluations").fetchone()[0])

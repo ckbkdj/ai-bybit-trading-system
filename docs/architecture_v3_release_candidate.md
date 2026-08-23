@@ -1,7 +1,9 @@
 # 量化平台产品架构 v3
 
+> 盈利与模型发布部分已由 `docs/profitability_first_alpha_rebuild.md` 取代。本文保留预测—交易合同、恢复和执行架构历史；当前所有 Brain 均为 baseline-only/rejected，不能再按旧方向准确率门槛晋升。
+
 更新时间：2026-08-23
-当前结论：**可部署的 shadow 工程候选，持续运行能力仍需长时间 soak 验证。**
+当前结论：**Profitability Gate 未通过；仅保留 shadow/研究能力，0 candidate、0 live。**
 
 这不是主网上线批准，也不是盈利证明。系统当前的目标是把两年线上经验保留下来，同时用可版本化、可恢复、可审计的边界替代旧脚本间的隐式耦合。
 

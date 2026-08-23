@@ -2,13 +2,14 @@
 
 本目录现在包含一套默认 `shadow`、失败关闭、可回放的预测—执行系统。现用边界不再是旧预测 JSON 或共享数据库，而是版本化的 Forecast、PortfolioIntent、OperationTicket、ExecutionReceipt、ExecutionAwareLabel 和 StrategyReleaseBundle 契约。
 
-当前结论：**可部署的 shadow 工程候选，持续运行能力仍需长时间 soak 验证。**
+当前结论：**Profitability Gate 未通过；仅保留 shadow/研究能力，0 candidate、0 live。** 工程测试通过不代表盈利，也不代表真钱许可。
 
 ## 入口
 
 - 预测控制面：`ai_bot3/ai_bot3/api/control_plane_main.py`
 - 交易执行服务：`BybitContractBotV4/bot_threshold_super_v4_1.py`
 - 跨项目影子验收：`scripts/run_shadow_e2e.py`
+- 盈利优先 Alpha 架构、因子来源与使用：`docs/profitability_first_alpha_rebuild.md`
 - 可读版系统架构：`docs/architecture_v3_release_candidate.md`
 - 部署就绪度：`docs/deployment_readiness_20260823.md`
 - 完整 Bug 与证据审计：`docs/bug_and_evidence_audit.md`
@@ -22,7 +23,7 @@
 
 ## 安全状态
 
-默认模式为 `shadow`。`testnet` 和 `live` 均要求凭证；`live` 还同时要求显式 `BYBIT_ENABLE_LIVE=true` 和非空 `BYBIT_LIVE_APPROVAL_ID`。本次实现和验证没有启用主网，也没有删除旧数据库、模型和历史 bot。损坏特征库已非破坏重建为候选文件，但生产配置尚未切换。
+默认模式为 `shadow`。所有旧 Brain 模型均为 baseline-only/rejected，不能独立出票。只有未参与调参的 lockbox 在全部成本后通过盈利、回撤、bootstrap、2x 成本、fold 稳定性、集中度、因子消融和执行证据门禁，才会生成 candidate manifest；当前没有生成。`live` 双开关未修改也未启用，旧数据库、模型、策略和历史 bot 均未删除。
 
 ## 快速验证
 

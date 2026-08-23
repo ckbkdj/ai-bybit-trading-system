@@ -185,6 +185,7 @@ class TicketGuards(ContractModel):
 
 class TicketReason(ContractModel):
     regime: str
+    lower_bound_net_edge_bps: Optional[float] = Field(default=None, gt=0)
     top_factor_scores: Dict[str, float] = Field(default_factory=dict)
     event_ids: List[str] = Field(default_factory=list)
     warnings: List[str] = Field(default_factory=list)
@@ -229,6 +230,8 @@ class OperationTicket(ContractModel):
                 raise ValueError("risk-increasing tickets require positive risk fields")
             if self.economics.expected_return_after_cost_bps <= 0:
                 raise ValueError("risk-increasing tickets require positive after-cost return")
+            if self.reason.lower_bound_net_edge_bps is None:
+                raise ValueError("risk-increasing tickets require positive lower-bound net edge")
             if self.guards.observed_data_quality < self.guards.min_data_quality:
                 raise ValueError("observed data quality is below the ticket minimum")
             if self.guards.observed_feature_age_sec > self.guards.max_feature_age_sec:

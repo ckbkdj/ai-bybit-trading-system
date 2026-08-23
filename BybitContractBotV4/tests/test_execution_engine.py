@@ -97,7 +97,7 @@ def ticket_payload(ticket_id="tk_execution_test_001", *, position_version=3, ref
             "required_position_version": position_version,
             "require_flat_position": True,
         },
-        "reason": {"regime": "risk_on"},
+        "reason": {"regime": "risk_on", "lower_bound_net_edge_bps": 1.0},
     }
 
 

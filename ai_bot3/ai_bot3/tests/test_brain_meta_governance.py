@@ -41,9 +41,8 @@ def test_brain_stage_dirs_are_created(tmp_path):
     assert model_path.parent == tmp_path / "brain"
 
 
-def test_decide_promotion_insufficient_samples_holds_in_shadow():
+def test_decide_promotion_insufficient_samples_is_rejected_baseline():
     bm = _load_brain_module()
-    # Below validation floor → shadow.
     metrics = {
         "validation_samples": 20,
         "direction_acc_nonflat": 0.99,
@@ -52,10 +51,10 @@ def test_decide_promotion_insufficient_samples_holds_in_shadow():
         "actionable_rate": 0.5,
     }
     decision, reason, baseline = bm._decide_promotion(metrics, samples=1000, min_samples=600)
-    assert decision == "shadow"
-    assert "validation_samples" in reason
-    assert baseline["validation_samples"] == 20
-    assert baseline["min_validation_samples"] == bm.PROMOTE_MIN_VALIDATION_SAMPLES
+    assert decision == "rejected"
+    assert reason == "brain_baseline_rejected_profitability_rebuild"
+    assert baseline["baseline_only"] is True
+    assert baseline["profitability_evidence"] is False
 
 
 def test_decide_promotion_low_direction_acc_rejected():
@@ -69,10 +68,10 @@ def test_decide_promotion_low_direction_acc_rejected():
     }
     decision, reason, _ = bm._decide_promotion(metrics, samples=1000, min_samples=600)
     assert decision == "rejected"
-    assert reason == "direction_acc_below_baseline"
+    assert reason == "brain_baseline_rejected_profitability_rebuild"
 
 
-def test_decide_promotion_strong_metrics_candidate_not_live():
+def test_decide_promotion_strong_metrics_still_rejected():
     bm = _load_brain_module()
     metrics = {
         "validation_samples": 500,
@@ -82,13 +81,12 @@ def test_decide_promotion_strong_metrics_candidate_not_live():
         "actionable_rate": 0.30,
     }
     decision, reason, baseline = bm._decide_promotion(metrics, samples=2000, min_samples=600)
-    # Strong metrics should propose candidate (NOT auto-live) per docs §9.3.
-    assert decision == "candidate"
-    assert reason == "metrics_meet_strong_baseline"
-    assert baseline["direction_acc_nonflat"] == 0.60
+    assert decision == "rejected"
+    assert reason == "brain_baseline_rejected_profitability_rebuild"
+    assert baseline["baseline_only"] is True
 
 
-def test_decide_promotion_floor_above_minimum_stays_shadow():
+def test_decide_promotion_floor_above_minimum_still_rejected():
     bm = _load_brain_module()
     metrics = {
         "validation_samples": 300,
@@ -98,5 +96,5 @@ def test_decide_promotion_floor_above_minimum_stays_shadow():
         "actionable_rate": 0.10,
     }
     decision, reason, _ = bm._decide_promotion(metrics, samples=1500, min_samples=600)
-    assert decision == "shadow"
-    assert reason == "metrics_above_floor_below_strong_baseline"
+    assert decision == "rejected"
+    assert reason == "brain_baseline_rejected_profitability_rebuild"

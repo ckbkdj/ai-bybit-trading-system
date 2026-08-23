@@ -130,6 +130,7 @@ class TicketBuilder:
                     "top_factor_scores": top_factors,
                     "event_ids": forecast.evidence.event_ids,
                     "warnings": forecast.evidence.warnings,
+                    "lower_bound_net_edge_bps": decision.lower_bound_net_edge_bps,
                 },
             }
         )

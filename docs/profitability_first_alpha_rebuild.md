@@ -1,0 +1,161 @@
+# Profitability-First Alpha Rebuild 架构与使用手册
+
+更新时间：2026-08-23
+当前发布状态：`profitability_gate=FAILED`、`candidate_count=0`、`live_count=0`。
+
+这次重构保留了旧系统两年运行经验、模型文件、数据库和交易服务，没有启用 Bybit live，也没有改动主网双开关。改变的是“谁有权出票”：旧 Brain 方向分类器现在只做 baseline；只有两级 Alpha 在未参与调参的 lockbox 上通过全部费用、回撤、稳定性、压力和因子证据门禁，才允许生成 candidate manifest。candidate 也只对应显式测试策略，不能批准 live。
+
+## 一张图看懂新链路
+
+```mermaid
+flowchart TB
+  subgraph SOURCE[点时数据源]
+    K[本地只读 SQLite\nBinance OHLCV]
+    MS[待补齐 PIT 历史\nBybit orderbook / public trades]
+    DER[待补齐 PIT 历史\nbasis / funding / OI / liquidation]
+    MACRO[待补齐 PIT 历史\n跨资产 / flows / FRED-ALFRED / Tier A]
+  end
+
+  subgraph LABEL[真实交易标签]
+    PIT[available_at 校验]
+    TB[Triple Barrier\nentry fill / TP / SL / max holding]
+    LC[fee / spread / slippage / funding\nfill probability / partial fill / MAE / MFE]
+  end
+
+  subgraph DATA[训练与验证]
+    PANEL[五个 horizon 的跨币种 pooled panel\n180 / 900 / 7200 / 14400 / 86400 秒]
+    DEV[Development\nwalk-forward + purge + embargo]
+    LOCK[最终不可见 Lockbox\nSHA-256 一次性 claim]
+    LEDGER[Append-only Trial Ledger\n成功、失败和拒绝都保存]
+  end
+
+  subgraph MODEL[两级 Alpha]
+    L1[Level 1\n方向概率 / 净收益分布 / MAE / MFE / 不确定性]
+    L2[Level 2 Meta-label\nTRADE / NO_TRADE]
+    BRAIN[旧 Brain\nbaseline_only + rejected]
+  end
+
+  subgraph EVAL[交易级证据]
+    BT[Event-driven Backtest\nfill / latency / timeout / cancel-fill race\nTP-SL path / exposure]
+    ABL[逐因子组 OOS 消融]
+    COST[正常成本 + 2x 成本压力]
+    RISK[保本风控\n0.25% / 0.50% / 1.50% / 3% / 2x]
+    GATE[Profitability Gate]
+  end
+
+  subgraph RELEASE[发布与出票]
+    FAIL[FAILED\nrejected / 0 candidate / 0 live]
+    MAN[Candidate Release Manifest\n报告与模型 SHA-256]
+    FORECAST[ForecastEnvelope\n必须含收益分位数]
+    TICKET[PortfolioIntent -> OperationTicket\n仅 candidate 策略]
+  end
+
+  K --> PIT
+  MS --> PIT
+  DER --> PIT
+  MACRO --> PIT
+  PIT --> TB --> LC --> PANEL
+  PANEL --> DEV --> L1 --> L2 --> BT
+  PANEL --> LOCK --> BT
+  DEV --> LEDGER
+  LOCK --> LEDGER
+  BRAIN -.只比较，不授权.-> EVAL
+  BT --> GATE
+  ABL --> GATE
+  COST --> GATE
+  RISK --> GATE
+  GATE -->|任一项不通过| FAIL
+  GATE -->|全部通过| MAN --> FORECAST --> TICKET
+```
+
+## 目录职责
+
+| 目录/文件 | 责任 | 不允许做的事 |
+|---|---|---|
+| `core/labels/triple_barrier.py` | 从未来市场事件构建真实成交标签，保存 entry/exit、费用、滑点、资金费、MAE/MFE、成交概率和部分成交 | 使用决策时刻尚不可见的数据；用 close-to-close 冒充成交 |
+| `core/training/pooled_panel.py` | 为五个固定 horizon 构建跨币种 panel；冻结 lockbox；生成 purge/embargo walk-forward | 单币种各自过拟合；把 lockbox 行放回训练 |
+| `core/models/two_stage.py` | 一级预测分布和尾部风险，二级决定 TRADE/NO_TRADE | 自己把模型晋升为 candidate/live |
+| `core/backtest/event_driven.py` | 模拟 maker/taker、spread、动态滑点、funding、部分成交、延迟、超时、竞态、止盈止损路径和组合敞口 | 只看收盘价差；忽略未成交和交易成本 |
+| `core/evaluation/profitability_gate.py` | 同时检查 lockbox、PF、回撤、bootstrap 下界、2x 成本、fold 稳定性和收益集中度 | 单项好看就放行 |
+| `core/evaluation/statistical_governance.py` | 追加式保存每次试验；lockbox 指纹只能由一个最终试验消费 | 删除失败试验；重复使用同一 OOS 调参 |
+| `core/risk/capital_preservation.py` | 固化单笔/日/周/总回撤/杠杆和禁止摊平、马丁、无止损交易 | 通过配置提高到硬上限以上 |
+| `core/release/profitability_release.py` | 只有 Gate 全通过时绑定报告、模型、lockbox、commit 的 SHA-256 manifest | Gate 失败时生成 candidate；批准 live |
+| `core/result_manager.py` | 验证盈利报告、manifest、策略发布包和 Alpha 预测后才进入组合出票 | 使用 Brain 或普通 legacy 预测授权出票 |
+
+旧的 `portfolio3_3_fixed.py`、Brain 模型、v4.1 交易逻辑、数据库和策略文件继续保留。旧经验中的止损、最长持仓、失败关闭、组合净额化、确定性订单和交易端最终否决权仍然复用；方向命中率直接晋升和只有均值收益即可出票的路径被关闭。
+
+## 因子及来源
+
+“已注册”不等于“已进入正式特征集”。每个组必须在相同 walk-forward fold、相同成本和相同回测器下做 OOS 消融；没有稳定费用后增益就保持 `retained=false`。
+
+| 因子组 | 计划来源 | PIT/用途 | 当前状态 |
+|---|---|---|---|
+| Bybit orderbook delta、spread、depth、microprice | Bybit V5 public orderbook 增量快照 | 交易时可见；短周期方向和执行成本 | 缺完整历史，未进入正式集 |
+| public trades、OFI、CVD | Bybit V5 public trades + orderbook event | 交易时可见；主动买卖流 | 缺完整历史，未进入正式集 |
+| basis、funding、OI、liquidations | Binance/Bybit 合约公开接口；本地 Coinglass wrapper 只作补充 | 使用交易所事件时间和本地 available_at | 历史不完整，未进入正式集 |
+| fill probability、slippage | Bybit 私有 ExecutionReceipt + 同时刻盘口；shadow/testnet 成交样本 | 只使用当时可得盘口与后续成交标签 | 当前只有 OHLCV 保守代理，不构成发布证据 |
+| SPY、QQQ、VIX | 正规证券行情源 | 美股交易时段和发布延迟对齐 | 缺统一 PIT 历史，未进入正式集 |
+| TLT、real yield、UUP | 证券行情 + FRED/ALFRED vintage | 利率和美元环境；宏观值按 vintage | 缺完整 vintage，未进入正式集 |
+| GLD、USO、XLV、IBB、FXI、KWEB、COIN、MSTR | 正规证券行情源 | 跨资产收益按市场收盘/可用时间对齐 | 缺统一 PIT 历史，未进入正式集 |
+| ETF/stablecoin flows | 可审计 ETF 流量和链上/交易所净流数据 | 以官方发布日期或区块确认后的 available_at 为准 | 缺完整 PIT 历史，未进入正式集 |
+| FRED/ALFRED vintage | FRED/ALFRED | 禁止用最终修订值回填历史 | 未接入完整 vintage |
+| Tier A 重大事件 | 分级事件库；官方日历/公告优先 | 记录 published_at、available_at、事件级别 | 当前历史不足，未进入正式集 |
+
+当前正式基线只使用本地 SQLite 中的五币种 Binance OHLCV 技术特征。OHLCV 推导的 spread/depth 仅用于保守地验证软件链路，报告会明确写 `execution_evidence_complete=false`，因此不能授权 candidate。
+
+## 盈利门禁
+
+以下条件必须同时成立：
+
+- lockbox 费用后净收益大于 0；
+- profit factor 不低于 1.20；
+- 最大回撤不高于 3%；
+- 95% block-bootstrap 单笔期望下界大于 0；
+- 2x 成本压力下不出现明显亏损；
+- 至少 60% walk-forward folds 费用后正收益；
+- 正收益不超过 50% 集中于单币种、单月份或单 regime；
+- 至少 30 笔真实回测交易；
+- 完整执行证据和所有必需因子组消融均完成。
+
+任何一项不满足时，输出固定为：
+
+```text
+profitability_gate=FAILED
+candidate_count=0
+live_count=0
+```
+
+失败运行不会生成 `candidate_release_manifest.json`。如果输出目录里残留旧 manifest，程序会保留到 `archive/`，同时从当前授权位置移走，避免旧候选误授权。
+
+## 如何运行
+
+在安全机器内进入 `ai_bot3/ai_bot3`，先确认本地历史库存在。命令只读市场库，新模型、试验账本和报告写入独立目录：
+
+```powershell
+python scripts/run_profitability_rebuild.py `
+  --feature-store data/kline_feature_store.rebuilt.20260822.sqlite3 `
+  --output-dir model_results/evaluation `
+  --trial-ledger data/research_trials.sqlite3 `
+  --model-output-dir models/profitability `
+  --code-commit <当前Git提交> `
+  --max-bars-per-symbol 3000 `
+  --walk-forward-folds 3
+```
+
+退出码：`0` 表示盈利门禁通过并生成 candidate manifest；`2` 表示评估完整但门禁失败；`1` 表示流水线异常。后两种都必须视为无候选。
+
+必读报告：
+
+1. `profitability_report.json`：最终结论和逐门禁实际值；
+2. `walk_forward_report.json`：各 horizon/fold 的训练测试范围和费用后结果；
+3. `lockbox_report.json`：一次性 lockbox 指纹、来源范围和逐交易记录；
+4. `factor_ablation_report.json`：每组是否完成、是否保留；
+5. `execution_cost_report.json`：正常和 2x 成本结果及证据限制；
+6. `capital_preservation_report.json`：不可放宽的保本参数；
+7. `candidate_release_manifest.json`：只在全部通过时存在。
+
+## 验证与后续工作
+
+本次代码回归为预测侧 132 项通过；真实库小规模端到端冒烟也已完成，结果是零交易并失败关闭。正式报告应以仓库中最新的六份 JSON 为准，不以测试数量或训练准确率替代盈利证据。
+
+下一阶段不是继续在同一 lockbox 调参，而是先补建独立 PIT 数据：Bybit orderbook/public trades、衍生品历史、跨资产行情、FRED/ALFRED vintage、flows、Tier A 事件和 shadow/testnet ExecutionReceipt。数据版本冻结后，从新的 development 区间做逐组消融，并预先登记一个全新的最终 lockbox；旧 lockbox 不得再用于选择参数。

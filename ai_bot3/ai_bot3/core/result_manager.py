@@ -12,6 +12,7 @@ import asyncio
 from adapters.legacy_forecast_adapter import LegacyForecastAdapter
 from core.control_plane import ControlPlaneRepository
 from core.decision.ticket_builder import TicketBuilder
+from core.release.profitability_release import verify_candidate_authorization
 
 
 def _now_iso() -> str:
@@ -60,6 +61,7 @@ _OPTIONAL_PREDICTION_FIELDS = (
     "current_price_age_seconds",
     "current_price_warning",
     "brain_prediction",
+    "alpha_prediction",
     "trade_direction",
     "trade_actionable",
     "target_leverage",
@@ -138,6 +140,8 @@ class ResultManager:
         required_brain_release_stage: str | None = None,
         strategy_release_bundle=None,
         strategy_release_bundle_path: Path | None = None,
+        profitability_report_path: Path | None = None,
+        candidate_release_manifest_path: Path | None = None,
     ):
         self.results_dir = results_dir
         self.results_dir.mkdir(parents=True, exist_ok=True)
@@ -171,28 +175,63 @@ class ResultManager:
             except Exception as exc:
                 self.strategy_release_error = f"{type(exc).__name__}: {exc}"
                 logging.exception("策略发布包校验失败，执行通道保持 shadow: %s", exc)
+        report_path_value = profitability_report_path or os.environ.get(
+            "AI_BOT_PROFITABILITY_REPORT"
+        )
+        manifest_path_value = candidate_release_manifest_path or os.environ.get(
+            "AI_BOT_CANDIDATE_RELEASE_MANIFEST"
+        )
+        self.profitability_report_path = Path(report_path_value) if report_path_value else None
+        self.candidate_release_manifest_path = (
+            Path(manifest_path_value) if manifest_path_value else None
+        )
+        self.profitability_authorized, self.profitability_authorization_reason = (
+            verify_candidate_authorization(
+                self.profitability_report_path,
+                self.candidate_release_manifest_path,
+            )
+        )
+        self.profitability_manifest = None
+        if self.profitability_authorized and self.candidate_release_manifest_path:
+            self.profitability_manifest = json.loads(
+                self.candidate_release_manifest_path.read_text(encoding="utf-8")
+            )
 
     def _brain_authorized_for_ticket(self, prediction: Dict[str, Any]) -> bool:
-        brain = prediction.get("brain_prediction")
-        if not isinstance(brain, dict) or not bool(brain.get("actionable")):
-            return False
-        stage = str(brain.get("release_stage") or "unreviewed").lower()
+        # Name retained for compatibility; authorization now belongs to the
+        # two-stage profitability model. Brain is always a rejected baseline.
         if self.required_brain_release_stage == "live":
-            stage_allowed = stage == "live"
-        else:
-            stage_allowed = stage in {"candidate", "live"}
+            return False
+        alpha = prediction.get("alpha_prediction")
+        if not isinstance(alpha, dict):
+            return False
+        if str(alpha.get("model_family")) != "profitability_two_stage":
+            return False
+        if not bool(alpha.get("actionable")) or str(alpha.get("decision")) != "TRADE":
+            return False
+        if str(alpha.get("release_stage")) != "candidate":
+            return False
+        if str(alpha.get("profitability_gate")) != "PASSED":
+            return False
+        if float(alpha.get("lower_bound_net_edge_bps") or 0.0) <= 0:
+            return False
+        if not self.profitability_authorized or not self.profitability_manifest:
+            return False
+        if str(alpha.get("release_id")) != str(self.profitability_manifest.get("release_id")):
+            return False
+        if str(alpha.get("model_artifact_sha256") or "") != str(
+            self.profitability_manifest.get("model_artifact_sha256") or ""
+        ):
+            return False
+        if str(alpha.get("lockbox_fingerprint") or "") != str(
+            self.profitability_manifest.get("lockbox_fingerprint") or ""
+        ):
+            return False
         bundle = self.strategy_release_bundle
-        if not stage_allowed or bundle is None:
-            return False
-        if self.required_brain_release_stage == "live" and bundle.release_stage != "live":
-            return False
-        if self.required_brain_release_stage == "candidate" and bundle.release_stage not in {
-            "candidate",
-            "live",
-        }:
+        if bundle is None or bundle.release_stage != "candidate":
             return False
         declared_release = str(
-            brain.get("strategy_release_id") or prediction.get("strategy_release_id") or ""
+            alpha.get("strategy_release_id") or prediction.get("strategy_release_id") or ""
         )
         return declared_release == bundle.strategy_release_id
 

@@ -14,6 +14,8 @@ sys.path.insert(0, str(ROOT))
 
 from core.result_manager import ResultManager
 from contracts.strategy_release_v1 import StrategyReleaseBundle
+from core.evaluation.profitability_gate import ProfitabilityGateResult, write_profitability_report
+from core.release.profitability_release import create_candidate_manifest
 from core.release.strategy_bundle import canonical_bundle_hash
 
 
@@ -46,6 +48,62 @@ def _prediction(stage: str, release_id: str = "sr_result_gate_test_001") -> dict
             "expected_return": 0.01,
         },
     }
+
+
+def _authorized_alpha(manifest: dict, release_id: str = "sr_result_gate_test_001") -> dict:
+    return {
+        "model_family": "profitability_two_stage",
+        "model_bundle_id": "profitability-two-stage-test",
+        "strategy_release_id": release_id,
+        "release_id": manifest["release_id"],
+        "model_artifact_sha256": manifest["model_artifact_sha256"],
+        "lockbox_fingerprint": manifest["lockbox_fingerprint"],
+        "profitability_gate": "PASSED",
+        "release_stage": "candidate",
+        "decision": "TRADE",
+        "actionable": True,
+        "direction": "long",
+        "p_up": 0.8,
+        "p_flat": 0.1,
+        "p_down": 0.1,
+        "expected_net_return_bps": 70.0,
+        "expected_mae_bps": 50.0,
+        "expected_mfe_bps": 120.0,
+        "lower_bound_net_edge_bps": 40.0,
+        "return_quantiles_bps": {
+            "p10": 80.0,
+            "p25": 90.0,
+            "p50": 100.0,
+            "p75": 115.0,
+            "p90": 130.0,
+        },
+    }
+
+
+def _profitability_release(root: Path) -> tuple[Path, Path, dict]:
+    gate = ProfitabilityGateResult(
+        profitability_gate="PASSED",
+        stage="candidate",
+        candidate_count=1,
+        live_count=0,
+        checks={"fixture": {"passed": True}},
+        metrics={"net_return": 0.01},
+        blockers=(),
+    )
+    report = root / "profitability_report.json"
+    artifact = root / "two-stage-model.json"
+    artifact.write_text('{"release_stage":"rejected"}', encoding="utf-8")
+    write_profitability_report(report, gate)
+    manifest_path = root / "candidate_release_manifest.json"
+    manifest = create_candidate_manifest(
+        manifest_path,
+        gate=gate,
+        profitability_report_path=report,
+        model_artifact_path=artifact,
+        lockbox_fingerprint="c" * 64,
+        code_commit="1234567",
+    ).to_dict()
+    return report, manifest_path, manifest
 
 
 def _bundle(stage: str, release_id: str = "sr_result_gate_test_001") -> StrategyReleaseBundle:
@@ -85,7 +143,7 @@ def _counts(db_path: Path) -> tuple[int, int]:
     return int(forecasts), int(tickets)
 
 
-def test_default_gate_requires_verified_release_and_two_horizons_before_ticket():
+def test_brain_never_authorizes_ticket_even_with_stale_live_release():
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         db = root / "control.sqlite3"
@@ -100,10 +158,10 @@ def test_default_gate_requires_verified_release_and_two_horizons_before_ticket()
             strategy_release_bundle=_bundle("live"),
         )
         asyncio.run(manager.save_result("BTCUSDT", "mid_short", _prediction("live")))
-        assert _counts(db) == (2, 1)
+        assert _counts(db) == (2, 0)
 
 
-def test_candidate_stage_requires_explicit_testnet_policy():
+def test_candidate_stage_without_profitability_evidence_fails_closed():
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         db = root / "control.sqlite3"
@@ -117,6 +175,30 @@ def test_candidate_stage_requires_explicit_testnet_policy():
         asyncio.run(manager.save_result("BTCUSDT", "scalping", _prediction("candidate")))
         assert _counts(db) == (1, 0)
         asyncio.run(manager.save_result("BTCUSDT", "mid_short", _prediction("candidate")))
+        assert _counts(db) == (2, 0)
+
+
+def test_verified_profitability_release_can_create_candidate_ticket_only():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        db = root / "control.sqlite3"
+        report, manifest_path, manifest = _profitability_release(root)
+        manager = ResultManager(
+            root / "results",
+            control_plane_db=db,
+            tickets_enabled=True,
+            required_brain_release_stage="candidate",
+            strategy_release_bundle=_bundle("candidate"),
+            profitability_report_path=report,
+            candidate_release_manifest_path=manifest_path,
+        )
+        near = _prediction("rejected")
+        near["alpha_prediction"] = _authorized_alpha(manifest)
+        far = _prediction("rejected")
+        far["alpha_prediction"] = _authorized_alpha(manifest)
+        asyncio.run(manager.save_result("BTCUSDT", "scalping", near))
+        assert _counts(db) == (1, 0)
+        asyncio.run(manager.save_result("BTCUSDT", "mid_short", far))
         assert _counts(db) == (2, 1)
 
 

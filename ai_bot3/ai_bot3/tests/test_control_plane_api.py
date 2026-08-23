@@ -45,6 +45,13 @@ class ControlPlaneApiTests(unittest.TestCase):
                 "calibrated_trend": "up",
                 "confidence": 0.9,
                 "predicted_return": 0.01,
+                "return_quantiles_bps": {
+                    "p10": 70.0,
+                    "p25": 85.0,
+                    "p50": 100.0,
+                    "p75": 115.0,
+                    "p90": 130.0,
+                },
                 "data_source_status": "ok",
                 "data_source_reliable": True,
                 "context_completeness": {"score": 0.96},

@@ -17,6 +17,7 @@ ai_bot3/ai_bot3/config.yml.bak_*
 **/.ruff_cache/
 **/.venv/
 .test-deps/
+.test-deps312/
 **/node_modules/
 
 # Large model, market-data and runtime outputs
@@ -28,6 +29,13 @@ ai_bot3/ai_bot3/model_results/*
 ai_bot3/ai_bot3/model_results/evaluation/*
 !ai_bot3/ai_bot3/model_results/evaluation/strategy_audit.json
 !ai_bot3/ai_bot3/model_results/evaluation/brain_retrain_report.json
+!ai_bot3/ai_bot3/model_results/evaluation/profitability_report.json
+!ai_bot3/ai_bot3/model_results/evaluation/walk_forward_report.json
+!ai_bot3/ai_bot3/model_results/evaluation/lockbox_report.json
+!ai_bot3/ai_bot3/model_results/evaluation/factor_ablation_report.json
+!ai_bot3/ai_bot3/model_results/evaluation/execution_cost_report.json
+!ai_bot3/ai_bot3/model_results/evaluation/capital_preservation_report.json
+!ai_bot3/ai_bot3/model_results/evaluation/candidate_release_manifest.json
 ai_bot3/ai_bot3/models/
 ai_bot3/ai_bot3/logs/
 ai_bot3/ai_bot3/err

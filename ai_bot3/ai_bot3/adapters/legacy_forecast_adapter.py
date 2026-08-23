@@ -57,16 +57,31 @@ class LegacyForecastAdapter:
             data_cutoff = generated_at
         horizon = int(legacy.get("horizon_sec") or MODE_HORIZONS.get(mode, 3600))
 
+        alpha = legacy.get("alpha_prediction") if isinstance(legacy.get("alpha_prediction"), Mapping) else {}
+        alpha_stage = str(alpha.get("release_stage") or "rejected").lower()
+        alpha_qualified = (
+            str(alpha.get("model_family") or "") == "profitability_two_stage"
+            and bool(alpha.get("actionable"))
+            and str(alpha.get("decision") or "").upper() == "TRADE"
+            and alpha_stage == "candidate"
+            and str(alpha.get("profitability_gate") or "").upper() == "PASSED"
+        )
         brain = legacy.get("brain_prediction") if isinstance(legacy.get("brain_prediction"), Mapping) else {}
         brain_direction = str(brain.get("direction") or "flat").lower()
         brain_stage = str(brain.get("release_stage") or "unreviewed").lower()
-        brain_qualified = bool(brain.get("actionable")) and brain_stage in {"candidate", "live"}
+        # Brain is retained as a comparison baseline only.  Even stale files
+        # claiming candidate/live cannot influence the execution forecast.
+        brain_qualified = False
         brain_trend = "up" if brain_direction == "long" else "down" if brain_direction == "short" else "flat"
         trend = str(
-            brain_trend
-            if brain_qualified
+            str(alpha.get("direction") or "flat").lower()
+            if alpha_qualified
             else legacy.get("calibrated_direction") or legacy.get("calibrated_trend") or legacy.get("trend") or "flat"
         ).lower()
+        if trend in {"long", "buy"}:
+            trend = "up"
+        elif trend in {"short", "sell"}:
+            trend = "down"
         if trend not in {"up", "down", "flat"}:
             trend = "flat"
         confidence = max(
@@ -81,24 +96,46 @@ class LegacyForecastAdapter:
                 ),
             ),
         )
-        directional = 0.34 + 0.46 * confidence
-        flat_probability = max(0.05, 0.25 * (1 - confidence))
-        opposite = 1.0 - directional - flat_probability
-        if trend == "up":
-            p_up, p_flat, p_down = directional, flat_probability, opposite
-        elif trend == "down":
-            p_up, p_flat, p_down = opposite, flat_probability, directional
+        if alpha_qualified:
+            raw_probabilities = [
+                max(0.0, _float(alpha.get("p_up"), 0.0)),
+                max(0.0, _float(alpha.get("p_flat"), 0.0)),
+                max(0.0, _float(alpha.get("p_down"), 0.0)),
+            ]
+            probability_total = sum(raw_probabilities)
+            if probability_total <= 0:
+                p_up = p_flat = p_down = 1.0 / 3.0
+            else:
+                p_up, p_flat, p_down = [value / probability_total for value in raw_probabilities]
         else:
-            p_flat = max(0.5, directional)
-            p_up = p_down = (1 - p_flat) / 2
+            directional = 0.34 + 0.46 * confidence
+            flat_probability = max(0.05, 0.25 * (1 - confidence))
+            opposite = 1.0 - directional - flat_probability
+            if trend == "up":
+                p_up, p_flat, p_down = directional, flat_probability, opposite
+            elif trend == "down":
+                p_up, p_flat, p_down = opposite, flat_probability, directional
+            else:
+                p_flat = max(0.5, directional)
+                p_up = p_down = (1 - p_flat) / 2
 
         predicted_return = legacy.get("calibrated_predicted_return")
         if predicted_return is None:
             predicted_return = legacy.get("predicted_return")
-        if brain_qualified:
-            brain_return = abs(_float(brain.get("expected_return"), 0.0))
-            predicted_return = brain_return if brain_direction == "long" else -brain_return
-        expected_return_bps = _float(predicted_return) * 10_000 if predicted_return is not None else None
+        if alpha_qualified:
+            if alpha.get("expected_net_return_bps") is not None:
+                expected_return_bps = _float(alpha.get("expected_net_return_bps"))
+            else:
+                expected_return_bps = _float(alpha.get("expected_net_return")) * 10_000
+        else:
+            expected_return_bps = _float(predicted_return) * 10_000 if predicted_return is not None else None
+        quantiles = (
+            alpha.get("return_quantiles_bps")
+            if alpha_qualified
+            else legacy.get("return_quantiles_bps")
+        )
+        if not isinstance(quantiles, Mapping):
+            quantiles = None
         source_status = str(legacy.get("data_source_status") or "degraded").lower()
         if source_status not in {"ok", "degraded", "missing", "error"}:
             source_status = "degraded"
@@ -106,8 +143,10 @@ class LegacyForecastAdapter:
         quality = _float((legacy.get("context_completeness") or {}).get("score") if isinstance(legacy.get("context_completeness"), dict) else legacy.get("context_completeness"), 0.75 if reliable else 0.5)
         quality = max(0.0, min(1.0, quality))
         warnings = ["legacy_inferred_direction_distribution"]
-        if brain_qualified:
-            warnings.append(f"brain_model_signal:{brain_stage}")
+        if alpha_qualified:
+            warnings.append(f"profitability_two_stage_signal:{alpha_stage}")
+        if brain_stage in {"candidate", "live"}:
+            warnings.append("stale_brain_release_ignored")
         if not reliable:
             warnings.append(str(legacy.get("data_source_warning") or "legacy_source_not_verified"))
 
@@ -119,7 +158,12 @@ class LegacyForecastAdapter:
             legacy.get("model_version"),
         )
         model_bundle = str(
-            brain.get("version") if brain_qualified else legacy.get("model_version") or f"legacy-{mode}"
+            (
+                alpha.get("model_bundle_id")
+                if alpha_qualified
+                else legacy.get("model_version")
+            )
+            or f"legacy-{mode}"
         )
         calibration_status = str(legacy.get("calibration_status") or "unknown").lower()
         if calibration_status not in {"valid", "degraded", "invalid", "unknown"}:
@@ -144,10 +188,15 @@ class LegacyForecastAdapter:
                     "p_up": p_up,
                     "p_flat": p_flat,
                     "p_down": p_down,
+                    "return_quantiles_bps": dict(quantiles) if quantiles else None,
                     "expected_return_bps": expected_return_bps,
                     "expected_volatility_bps": None,
-                    "expected_mae_bps": None,
-                    "expected_mfe_bps": None,
+                    "expected_mae_bps": (
+                        _float(alpha.get("expected_mae_bps")) if alpha_qualified else None
+                    ),
+                    "expected_mfe_bps": (
+                        _float(alpha.get("expected_mfe_bps")) if alpha_qualified else None
+                    ),
                 },
                 "regime": {
                     "market_regime": str(legacy.get("market_regime") or "unknown"),
@@ -187,8 +236,11 @@ class LegacyForecastAdapter:
                 "evidence": {"warnings": warnings},
                 "lineage": {
                     "strategy_release_id": str(
-                        legacy.get("strategy_release_id")
-                        or brain.get("strategy_release_id")
+                        (
+                            alpha.get("strategy_release_id")
+                            if alpha_qualified
+                            else legacy.get("strategy_release_id")
+                        )
                         or f"legacy-{model_bundle}"
                     ),
                     "model_bundle_id": model_bundle,

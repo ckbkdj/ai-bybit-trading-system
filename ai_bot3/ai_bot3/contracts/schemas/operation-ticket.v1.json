@@ -863,6 +863,19 @@
           "title": "Event Ids",
           "type": "array"
         },
+        "lower_bound_net_edge_bps": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Lower Bound Net Edge Bps"
+        },
         "regime": {
           "title": "Regime",
           "type": "string"

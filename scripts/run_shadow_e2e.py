@@ -61,6 +61,13 @@ def main() -> int:
                 "confidence": 0.8,
                 "predicted_return": 0.008,
                 "calibrated_predicted_return": 0.008,
+                "return_quantiles_bps": {
+                    "p10": 55.0,
+                    "p25": 65.0,
+                    "p50": 80.0,
+                    "p75": 95.0,
+                    "p90": 110.0,
+                },
                 "range_guard_score": 0.1,
                 "calibration_status": "valid",
                 "market_regime": "risk_on",
@@ -86,7 +93,11 @@ def main() -> int:
             {
                 "CONTROL_PLANE_DB": str(control_db),
                 "RESEARCH_JOB_DB": str(temp / "research.sqlite3"),
-                "PYTHONPATH": str(AI_ROOT),
+                "PYTHONPATH": os.pathsep.join(
+                    value
+                    for value in (str(AI_ROOT), environment.get("PYTHONPATH", ""))
+                    if value
+                ),
             }
         )
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
