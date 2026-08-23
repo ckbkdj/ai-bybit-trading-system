@@ -5,7 +5,6 @@ import tempfile
 from datetime import timedelta
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE = ROOT.parent
 sys.path.insert(0, str(ROOT))
@@ -20,26 +19,25 @@ from execution_reconciler import ExecutionReconciler
 from execution_state import ExecutionState
 from tests.test_execution_engine import NOW, StaticContext, ticket_payload
 from ticket_consumer import TicketConsumer
+from ticket_store import parse_time
 
 
 class AcceptedCancelButStillOpenGateway:
-    def __init__(self, bybit_order_id: str):
-        self.bybit_order_id = bybit_order_id
+    def __init__(self, exchange_order_id: str):
+        self.exchange_order_id = exchange_order_id
         self.cancel_calls = 0
 
-    def cancel_order(self, symbol: str, bybit_order_id: str):
+    def cancel_order(self, symbol: str, exchange_order_id: str):
         self.cancel_calls += 1
-        assert bybit_order_id == self.bybit_order_id
-        # This is only a REST acknowledgement, even though a wrapper labels it
-        # canceled.  The subsequent exchange query remains authoritative.
-        return {"id": bybit_order_id, "status": "canceled", "info": {}}
+        assert exchange_order_id == self.exchange_order_id
+        return {"id": exchange_order_id, "status": "canceled", "info": {}}
 
     def find_order(self, symbol: str, order_link_id_value: str):
         return {
-            "id": self.bybit_order_id,
+            "id": self.exchange_order_id,
             "status": "open",
             "info": {
-                "orderId": self.bybit_order_id,
+                "orderId": self.exchange_order_id,
                 "orderLinkId": order_link_id_value,
                 "orderStatus": "New",
             },
@@ -65,12 +63,15 @@ def test_entry_timeout_cancel_waits_for_exchange_terminal_state():
         )
         assert consumer.process(ticket, now=NOW) == ExecutionState.SUBMITTED
         entry_link = order_link_id(ticket.ticket_id)
-        bybit_order_id = store.order(entry_link)["bybit_order_id"]
-        gateway = AcceptedCancelButStillOpenGateway(bybit_order_id)
+        entry = store.order(entry_link)
+        gateway = AcceptedCancelButStillOpenGateway(entry["bybit_order_id"])
+        reconcile_at = parse_time(entry["created_at"]) + timedelta(
+            seconds=ticket.entry.max_wait_sec + 1
+        )
 
         state = ExecutionReconciler(store, gateway).reconcile_ticket(
             ticket.ticket_id,
-            now=NOW + timedelta(seconds=ticket.entry.max_wait_sec + 1),
+            now=reconcile_at,
         )
 
         assert gateway.cancel_calls == 1
