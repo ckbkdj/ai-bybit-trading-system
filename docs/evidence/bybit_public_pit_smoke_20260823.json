@@ -1,0 +1,43 @@
+{
+  "schema_version": "bybit-public-pit-smoke.v1",
+  "captured_at": "2026-08-23T15:38:54.757380Z",
+  "ended_at": "2026-08-23T15:39:10.085103Z",
+  "endpoint": "wss://stream.bybit.com/v5/public/linear",
+  "mode": "public_market_data_capture_only",
+  "authentication_used": false,
+  "trading_used": false,
+  "symbols": [
+    "BTCUSDT",
+    "ETHUSDT"
+  ],
+  "session_status": "completed",
+  "raw_event_counts": {
+    "orderbook.50.BTCUSDT": 208,
+    "orderbook.50.ETHUSDT": 302,
+    "publicTrade.BTCUSDT": 134,
+    "publicTrade.ETHUSDT": 262,
+    "tickers.BTCUSDT": 56,
+    "tickers.ETHUSDT": 70
+  },
+  "feature_observation_counts": {
+    "orderbook_spread_bps": 510,
+    "bybit_orderbook_delta_l5": 510,
+    "orderbook_imbalance_l5": 510,
+    "orderbook_depth_usdt_l5": 510,
+    "microprice_deviation_bps": 510,
+    "fill_probability": 510,
+    "expected_slippage_bps": 510,
+    "public_trade_imbalance_1m": 112,
+    "ofi_1m": 112,
+    "aggressive_cvd_1m": 112,
+    "perpetual_basis_bps": 10,
+    "funding_rate": 2
+  },
+  "missing_in_short_smoke": {
+    "liquidation_imbalance_5m": "no liquidation event arrived during the 15-second capture",
+    "open_interest_change_1h": "one hour of observation history is required"
+  },
+  "pit_policy": "exchange event time is preserved; available_at and ingested_at equal the local UTC receive time",
+  "raw_database_committed": false,
+  "raw_database_policy": "local append-only SQLite evidence is excluded from Git because it grows continuously"
+}

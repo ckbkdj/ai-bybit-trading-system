@@ -91,7 +91,7 @@ def default_registry() -> FactorRegistry:
             FactorDefinition("perpetual_basis_bps", "crypto.derivatives.v1", "bps", "direct_observation", 300, 0.8),
             FactorDefinition("open_interest_change_1h", "crypto.derivatives.v1", "ratio", "direct_observation", 900, 0.8),
             FactorDefinition("funding_rate", "crypto.derivatives.v1", "ratio", "direct_observation", 3600, 0.8),
-            FactorDefinition("liquidation_imbalance_5m", "crypto.derivatives.v1", "usd", "directly_observed_flow", 600, 0.8),
+            FactorDefinition("liquidation_imbalance_5m", "crypto.derivatives.v1", "ratio", "directly_observed_flow", 600, 0.8),
             FactorDefinition("stablecoin_exchange_netflow_1h", "crypto.onchain.v1", "usd", "directly_observed_flow", 7200, 0.7),
             FactorDefinition("crypto_etf_netflow_daily", "crypto.onchain.v1", "usd", "directly_observed_flow", 172800, 0.8),
             FactorDefinition("usd_liquidity_proxy", "macro.us_liquidity.v1", "zscore", "inferred_rotation_proxy", 172800, 0.8),
