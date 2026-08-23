@@ -1,0 +1,100 @@
+{
+  "provenance_correction": {
+    "declared_code_commit": "7579fb6c0a9d9b863a078832bed336c3aaed7e03",
+    "lockbox_reused": false,
+    "resolved_code_commit": "7579fb63f93f0e77cf311ec73777de0291b361f8",
+    "result_unchanged": true
+  },
+  "blockers": [
+    "execution_evidence",
+    "factor_ablation",
+    "minimum_trades",
+    "lockbox_net_return",
+    "profit_factor",
+    "bootstrap_lower_expectancy",
+    "positive_walk_forward_folds",
+    "return_concentration"
+  ],
+  "candidate_count": 0,
+  "checks": {
+    "bootstrap_lower_expectancy": {
+      "actual": null,
+      "confidence": 0.95,
+      "passed": false,
+      "threshold": 0.0
+    },
+    "execution_evidence": {
+      "actual": false,
+      "passed": false,
+      "required": true
+    },
+    "factor_ablation": {
+      "actual": false,
+      "passed": false,
+      "required": true
+    },
+    "lockbox_net_return": {
+      "actual": 0.0,
+      "passed": false,
+      "threshold": 0.0
+    },
+    "max_drawdown": {
+      "actual": 0.0,
+      "passed": true,
+      "threshold": 0.03
+    },
+    "minimum_trades": {
+      "actual": 0,
+      "passed": false,
+      "threshold": 30
+    },
+    "positive_walk_forward_folds": {
+      "actual": 0.0,
+      "fold_count": 15,
+      "passed": false,
+      "threshold": 0.6
+    },
+    "profit_factor": {
+      "actual": 0.0,
+      "passed": false,
+      "threshold": 1.2
+    },
+    "return_concentration": {
+      "actual": 1.0,
+      "month": {
+        "largest": null,
+        "share": 1.0
+      },
+      "passed": false,
+      "regime": {
+        "largest": null,
+        "share": 1.0
+      },
+      "symbol": {
+        "largest": null,
+        "share": 1.0
+      },
+      "threshold": 0.5
+    },
+    "two_x_cost_stress": {
+      "actual": 0.0,
+      "minimum": -0.005,
+      "passed": true
+    }
+  },
+  "live_count": 0,
+  "metrics": {
+    "bootstrap_lower_expectancy": null,
+    "final_equity_usdt": 100000.0,
+    "initial_equity_usdt": 100000.0,
+    "max_drawdown": 0.0,
+    "maximum_return_concentration_share": 1.0,
+    "net_return": 0.0,
+    "positive_walk_forward_fold_ratio": 0.0,
+    "profit_factor": 0.0,
+    "trade_count": 0,
+    "two_x_cost_net_return": 0.0
+  },
+  "profitability_gate": "FAILED",
+  "stage": "rejected"
+}

@@ -1,0 +1,18 @@
+{
+  "fail_closed": true,
+  "no_averaging_down": true,
+  "no_martingale": true,
+  "no_trade_when_lower_bound_net_edge_lte_zero": true,
+  "no_trade_without_stop": true,
+  "policy": {
+    "daily_loss_limit": 0.005,
+    "equity_drawdown_limit": 0.03,
+    "leverage_cap": 2.0,
+    "no_averaging_down": true,
+    "no_martingale": true,
+    "require_positive_lower_bound_edge": true,
+    "require_stop": true,
+    "risk_per_trade": 0.0025,
+    "weekly_loss_limit": 0.015
+  }
+}

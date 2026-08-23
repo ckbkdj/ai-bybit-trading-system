@@ -7,6 +7,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+WORKSPACE = ROOT.parents[1]
 sys.path.insert(0, str(ROOT))
 
 from core.evaluation.profitability_rebuild import (
@@ -14,6 +15,22 @@ from core.evaluation.profitability_rebuild import (
     ProfitabilityRebuildConfig,
     write_failed_outputs,
 )
+
+
+def _local_head_commit() -> str:
+    git_dir = WORKSPACE / ".version-history"
+    head_file = git_dir / "HEAD"
+    if not head_file.exists():
+        raise RuntimeError("local version-history HEAD is missing")
+    value = head_file.read_text(encoding="utf-8").strip()
+    if value.startswith("ref: "):
+        reference = git_dir / value.removeprefix("ref: ")
+        if not reference.exists():
+            raise RuntimeError(f"local version-history reference is missing: {reference}")
+        value = reference.read_text(encoding="utf-8").strip()
+    if len(value) != 40 or any(character not in "0123456789abcdef" for character in value.lower()):
+        raise RuntimeError("local version-history HEAD is not a SHA-1 commit")
+    return value.lower()
 
 
 def main() -> int:
@@ -32,16 +49,21 @@ def main() -> int:
     parser.add_argument(
         "--model-output-dir", type=Path, default=ROOT / "models" / "profitability"
     )
-    parser.add_argument("--code-commit", default="unknown")
+    parser.add_argument("--code-commit")
     parser.add_argument("--max-bars-per-symbol", type=int, default=3000)
     parser.add_argument("--walk-forward-folds", type=int, default=3)
     args = parser.parse_args()
+    head_commit = _local_head_commit()
+    if args.code_commit and args.code_commit.lower() != head_commit:
+        raise SystemExit(
+            f"--code-commit does not match the running repository HEAD: {head_commit}"
+        )
     config = ProfitabilityRebuildConfig(
         feature_store_path=args.feature_store,
         output_dir=args.output_dir,
         trial_ledger_path=args.trial_ledger,
         model_output_dir=args.model_output_dir,
-        code_commit=args.code_commit,
+        code_commit=head_commit,
         max_bars_per_symbol=args.max_bars_per_symbol,
         walk_forward_folds=args.walk_forward_folds,
     )

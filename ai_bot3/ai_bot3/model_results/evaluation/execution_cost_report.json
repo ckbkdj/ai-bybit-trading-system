@@ -1,0 +1,88 @@
+{
+  "execution_evidence_complete": false,
+  "limitations": [
+    "historical spread/depth/fill inputs are conservative OHLCV-derived proxies",
+    "PIT Bybit orderbook and public-trade histories are not present in the current store",
+    "therefore execution evidence cannot authorize a candidate"
+  ],
+  "normal_cost": {
+    "cancel_fill_race_count": 0,
+    "configuration": {
+      "cost_multiplier": 1.0,
+      "daily_loss_limit": 0.005,
+      "equity_drawdown_limit": 0.03,
+      "execution": {
+        "base_slippage_bps": 1.0,
+        "default_depth_usdt": 25000.0,
+        "default_spread_bps": 4.0,
+        "impact_bps_at_full_depth": 4.0,
+        "latency_ms": 250,
+        "maker_fee_bps": 2.0,
+        "missing_depth_fill_fraction": 0.5,
+        "stop_first_when_same_bar": true,
+        "taker_fee_bps": 5.5,
+        "volatility_slippage_multiplier": 0.05
+      },
+      "initial_equity_usdt": 100000.0,
+      "leverage_cap": 2.0,
+      "max_gross_exposure": 1.0,
+      "no_averaging_down": true,
+      "no_martingale": true,
+      "require_positive_lower_bound_edge": true,
+      "require_stop": true,
+      "risk_per_trade": 0.0025,
+      "weekly_loss_limit": 0.015
+    },
+    "final_equity_usdt": 100000.0,
+    "initial_equity_usdt": 100000.0,
+    "intrabar_path_used": true,
+    "max_drawdown": 0.0,
+    "net_return": 0.0,
+    "profit_factor": null,
+    "rejected_signals": {},
+    "total_fee_cost": 0,
+    "total_funding_cost": 0,
+    "total_slippage_cost": 0,
+    "trades": []
+  },
+  "two_x_cost": {
+    "cancel_fill_race_count": 0,
+    "configuration": {
+      "cost_multiplier": 2.0,
+      "daily_loss_limit": 0.005,
+      "equity_drawdown_limit": 0.03,
+      "execution": {
+        "base_slippage_bps": 2.0,
+        "default_depth_usdt": 25000.0,
+        "default_spread_bps": 8.0,
+        "impact_bps_at_full_depth": 8.0,
+        "latency_ms": 250,
+        "maker_fee_bps": 4.0,
+        "missing_depth_fill_fraction": 0.5,
+        "stop_first_when_same_bar": true,
+        "taker_fee_bps": 11.0,
+        "volatility_slippage_multiplier": 0.1
+      },
+      "initial_equity_usdt": 100000.0,
+      "leverage_cap": 2.0,
+      "max_gross_exposure": 1.0,
+      "no_averaging_down": true,
+      "no_martingale": true,
+      "require_positive_lower_bound_edge": true,
+      "require_stop": true,
+      "risk_per_trade": 0.0025,
+      "weekly_loss_limit": 0.015
+    },
+    "final_equity_usdt": 100000.0,
+    "initial_equity_usdt": 100000.0,
+    "intrabar_path_used": true,
+    "max_drawdown": 0.0,
+    "net_return": 0.0,
+    "profit_factor": null,
+    "rejected_signals": {},
+    "total_fee_cost": 0,
+    "total_funding_cost": 0,
+    "total_slippage_cost": 0,
+    "trades": []
+  }
+}

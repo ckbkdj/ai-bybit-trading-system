@@ -137,10 +137,11 @@ python scripts/run_profitability_rebuild.py `
   --output-dir model_results/evaluation `
   --trial-ledger data/research_trials.sqlite3 `
   --model-output-dir models/profitability `
-  --code-commit <当前Git提交> `
   --max-bars-per-symbol 3000 `
   --walk-forward-folds 3
 ```
+
+程序会直接读取本地版本历史的 `HEAD`；如果显式传入 `--code-commit`，它必须与实际 `HEAD` 完全一致，否则在读取 lockbox 前终止。
 
 退出码：`0` 表示盈利门禁通过并生成 candidate manifest；`2` 表示评估完整但门禁失败；`1` 表示流水线异常。后两种都必须视为无候选。
 
@@ -156,6 +157,8 @@ python scripts/run_profitability_rebuild.py `
 
 ## 验证与后续工作
 
-本次代码回归为预测侧 132 项通过；真实库小规模端到端冒烟也已完成，结果是零交易并失败关闭。正式报告应以仓库中最新的六份 JSON 为准，不以测试数量或训练准确率替代盈利证据。
+本次代码回归为预测侧 133 项、交易侧 59 项全部通过；真实本机 HTTP→shadow→receipt 闭环通过。正式真实库评估使用 5 个 horizon、15 个 walk-forward fold；development/lockbox 行数分别为 25,058/4,422、25,060/4,420、25,060/4,420、25,060/4,420、17,330/3,740。模型在保守的费用后下界门禁下没有产生信号或交易，因此净收益、回撤和成本压力显示为 0；这不是“低回撤盈利”，而是“没有可交易 Alpha”。此外 13 个必需因子组缺完整 PIT 历史，执行成本只有 OHLCV 代理，所以结果为 FAILED。
+
+本次 lockbox 指纹是 `893488f8cee82c568316cd54c6ec0017bf39d685ea17dc1aab95ed4a9a299741`，已在 trial ledger 中一次性登记，不会再次用于调参或评估。运行后核对发现命令行声明的完整 commit 字符串存在人工抄写错误；实际运行代码是提交 `7579fb63f93f0e77cf311ec73777de0291b361f8`。本次没有重跑 lockbox，而是以 append-only correction 记录声明值和实际值，计算结果不变；运行器也已增加 HEAD 强校验，防止再次发生。
 
 下一阶段不是继续在同一 lockbox 调参，而是先补建独立 PIT 数据：Bybit orderbook/public trades、衍生品历史、跨资产行情、FRED/ALFRED vintage、flows、Tier A 事件和 shadow/testnet ExecutionReceipt。数据版本冻结后，从新的 development 区间做逐组消融，并预先登记一个全新的最终 lockbox；旧 lockbox 不得再用于选择参数。

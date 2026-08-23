@@ -1,0 +1,158 @@
+{
+  "all_required_groups_evaluated": false,
+  "baseline": "price_technical_only",
+  "blocker": "current local store has OHLCV and snapshots, but not complete PIT histories for required orderbook/trades/macro-vintage groups",
+  "groups": [
+    {
+      "cadence": "short",
+      "factor_group": "bybit_orderbook",
+      "factors": [
+        "bybit_orderbook_delta_l5",
+        "orderbook_spread_bps",
+        "orderbook_depth_usdt_l5",
+        "microprice_deviation_bps"
+      ],
+      "formal_feature_set": false,
+      "oos_ablation_status": "NOT_EVALUATED_MISSING_PIT_HISTORY",
+      "retained": false
+    },
+    {
+      "cadence": "short",
+      "factor_group": "public_trades",
+      "factors": [
+        "public_trade_imbalance_1m",
+        "ofi_1m",
+        "aggressive_cvd_1m"
+      ],
+      "formal_feature_set": false,
+      "oos_ablation_status": "NOT_EVALUATED_MISSING_PIT_HISTORY",
+      "retained": false
+    },
+    {
+      "cadence": "short",
+      "factor_group": "crypto_derivatives",
+      "factors": [
+        "perpetual_basis_bps",
+        "funding_rate",
+        "open_interest_change_1h",
+        "liquidation_imbalance_5m"
+      ],
+      "formal_feature_set": false,
+      "oos_ablation_status": "NOT_EVALUATED_MISSING_PIT_HISTORY",
+      "retained": false
+    },
+    {
+      "cadence": "short",
+      "factor_group": "execution_quality",
+      "factors": [
+        "fill_probability",
+        "expected_slippage_bps"
+      ],
+      "formal_feature_set": false,
+      "oos_ablation_status": "NOT_EVALUATED_MISSING_PIT_HISTORY",
+      "retained": false
+    },
+    {
+      "cadence": "medium_long",
+      "factor_group": "us_risk",
+      "factors": [
+        "spy_return",
+        "qqq_return",
+        "vix_level"
+      ],
+      "formal_feature_set": false,
+      "oos_ablation_status": "NOT_EVALUATED_MISSING_PIT_HISTORY",
+      "retained": false
+    },
+    {
+      "cadence": "medium_long",
+      "factor_group": "rates_usd",
+      "factors": [
+        "tlt_return",
+        "real_yield_10y",
+        "uup_return"
+      ],
+      "formal_feature_set": false,
+      "oos_ablation_status": "NOT_EVALUATED_MISSING_PIT_HISTORY",
+      "retained": false
+    },
+    {
+      "cadence": "medium_long",
+      "factor_group": "commodities",
+      "factors": [
+        "gld_return",
+        "uso_return"
+      ],
+      "formal_feature_set": false,
+      "oos_ablation_status": "NOT_EVALUATED_MISSING_PIT_HISTORY",
+      "retained": false
+    },
+    {
+      "cadence": "medium_long",
+      "factor_group": "healthcare",
+      "factors": [
+        "xlv_return",
+        "ibb_return"
+      ],
+      "formal_feature_set": false,
+      "oos_ablation_status": "NOT_EVALUATED_MISSING_PIT_HISTORY",
+      "retained": false
+    },
+    {
+      "cadence": "medium_long",
+      "factor_group": "china",
+      "factors": [
+        "fxi_return",
+        "kweb_return"
+      ],
+      "formal_feature_set": false,
+      "oos_ablation_status": "NOT_EVALUATED_MISSING_PIT_HISTORY",
+      "retained": false
+    },
+    {
+      "cadence": "medium_long",
+      "factor_group": "crypto_equities",
+      "factors": [
+        "coin_return",
+        "mstr_return"
+      ],
+      "formal_feature_set": false,
+      "oos_ablation_status": "NOT_EVALUATED_MISSING_PIT_HISTORY",
+      "retained": false
+    },
+    {
+      "cadence": "medium_long",
+      "factor_group": "flows",
+      "factors": [
+        "crypto_etf_netflow_daily",
+        "stablecoin_exchange_netflow_1h"
+      ],
+      "formal_feature_set": false,
+      "oos_ablation_status": "NOT_EVALUATED_MISSING_PIT_HISTORY",
+      "retained": false
+    },
+    {
+      "cadence": "medium_long",
+      "factor_group": "macro_vintage",
+      "factors": [
+        "fred_vintage_surprise",
+        "alfred_revision_surprise"
+      ],
+      "formal_feature_set": false,
+      "oos_ablation_status": "NOT_EVALUATED_MISSING_PIT_HISTORY",
+      "retained": false
+    },
+    {
+      "cadence": "medium_long",
+      "factor_group": "tier_a_events",
+      "factors": [
+        "tier_a_event_state"
+      ],
+      "formal_feature_set": false,
+      "oos_ablation_status": "NOT_EVALUATED_MISSING_PIT_HISTORY",
+      "retained": false
+    }
+  ],
+  "method": "identical purged walk-forward folds; fee-adjusted event-driven net return",
+  "retained_factor_groups": []
+}
