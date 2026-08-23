@@ -97,6 +97,8 @@ def evaluate_profitability_gate(
     *,
     initial_equity_usdt: float,
     two_x_cost_net_return: float,
+    mark_to_market_max_drawdown: float | None = None,
+    mark_to_market_evidence_complete: bool = False,
     execution_evidence_complete: bool = True,
     factor_ablation_complete: bool = True,
     thresholds: ProfitabilityThresholds | None = None,
@@ -118,7 +120,17 @@ def evaluate_profitability_gate(
     profit_factor_actual: float | str = (
         "Infinity" if profit > 0 and loss == 0 else float(profit_factor or 0.0)
     )
-    drawdown = _maximum_drawdown(pnls, initial_equity_usdt)
+    realized_only_drawdown = _maximum_drawdown(pnls, initial_equity_usdt)
+    mark_to_market_drawdown = (
+        float(mark_to_market_max_drawdown)
+        if mark_to_market_max_drawdown is not None
+        else None
+    )
+    drawdown_passed = (
+        bool(mark_to_market_evidence_complete)
+        and mark_to_market_drawdown is not None
+        and 0.0 <= mark_to_market_drawdown <= cfg.maximum_drawdown
+    )
     bootstrap_lower = _bootstrap_lower_expectancy(
         returns,
         samples=cfg.bootstrap_samples,
@@ -146,7 +158,13 @@ def evaluate_profitability_gate(
         "minimum_trades": {"passed": len(trades) >= cfg.minimum_trades, "actual": len(trades), "threshold": cfg.minimum_trades},
         "lockbox_net_return": {"passed": net_return > cfg.minimum_net_return, "actual": net_return, "threshold": cfg.minimum_net_return},
         "profit_factor": {"passed": profit_factor_passed, "actual": profit_factor_actual, "threshold": cfg.minimum_profit_factor},
-        "max_drawdown": {"passed": drawdown <= cfg.maximum_drawdown, "actual": drawdown, "threshold": cfg.maximum_drawdown},
+        "mark_to_market_drawdown": {
+            "passed": drawdown_passed,
+            "actual": mark_to_market_drawdown,
+            "threshold": cfg.maximum_drawdown,
+            "evidence_complete": bool(mark_to_market_evidence_complete),
+            "required_method": "portfolio_mark_to_market_at_every_market_observation",
+        },
         "bootstrap_lower_expectancy": {
             "passed": bootstrap_lower is not None and bootstrap_lower > cfg.minimum_bootstrap_expectancy,
             "actual": bootstrap_lower,
@@ -187,7 +205,8 @@ def evaluate_profitability_gate(
             "trade_count": len(trades),
             "net_return": net_return,
             "profit_factor": profit_factor_actual,
-            "max_drawdown": drawdown,
+            "max_drawdown": mark_to_market_drawdown,
+            "realized_close_only_drawdown": realized_only_drawdown,
             "bootstrap_lower_expectancy": bootstrap_lower,
             "two_x_cost_net_return": two_x_cost_net_return,
             "positive_walk_forward_fold_ratio": positive_fold_ratio,

@@ -8,15 +8,7 @@ from typing import Mapping, Sequence
 import numpy as np
 import pandas as pd
 
-
-HORIZONS_SEC: tuple[int, ...] = (180, 900, 7200, 14400, 86400)
-HORIZON_TIMEFRAME: Mapping[int, str] = {
-    180: "3m",
-    900: "15m",
-    7200: "2h",
-    14400: "4h",
-    86400: "1d",
-}
+from contracts.horizons import HORIZONS_SEC, HORIZON_TIMEFRAME
 
 REQUIRED_CONTEXT_COLUMNS = (
     "symbol",
@@ -32,6 +24,38 @@ REQUIRED_CONTEXT_COLUMNS = (
     "mae",
     "mfe",
 )
+
+
+def causal_regime_labels(
+    frame: pd.DataFrame,
+    *,
+    minimum_history: int = 8,
+    high_volatility_quantile: float = 0.70,
+) -> pd.Series:
+    """Classify each row using only volatility observations strictly before it."""
+
+    if minimum_history <= 0 or not 0 < high_volatility_quantile < 1:
+        raise ValueError("invalid causal regime configuration")
+    required = {"symbol", "decision_at", "volatility"}
+    if not required.issubset(frame.columns):
+        raise ValueError(f"causal regime requires columns: {sorted(required)}")
+    ordered = frame[["symbol", "decision_at", "volatility"]].copy()
+    ordered["_original_index"] = np.arange(len(ordered))
+    ordered["decision_at"] = _as_utc(ordered["decision_at"], "decision_at")
+    ordered["volatility"] = pd.to_numeric(ordered["volatility"], errors="coerce")
+    ordered = ordered.sort_values(["symbol", "decision_at", "_original_index"])
+    threshold = ordered.groupby("symbol", sort=False)["volatility"].transform(
+        lambda values: values.shift(1).expanding(min_periods=minimum_history).quantile(
+            high_volatility_quantile
+        )
+    )
+    labels = np.where(
+        threshold.isna(),
+        "insufficient_history",
+        np.where(ordered["volatility"] > threshold, "high_volatility", "normal"),
+    )
+    result = pd.Series(labels, index=ordered["_original_index"].to_numpy(), dtype="object")
+    return result.sort_index().reset_index(drop=True)
 
 
 @dataclass(frozen=True)
@@ -119,8 +143,14 @@ class PooledPanelBuilder:
             raise ValueError("symbol is required")
         data["symbol"] = data["symbol"].astype(str).str.upper()
         if "liquidity" not in data:
-            close = pd.to_numeric(data.get("close"), errors="coerce")
-            volume = pd.to_numeric(data.get("volume"), errors="coerce").fillna(0.0)
+            close = pd.to_numeric(
+                data["close"] if "close" in data else pd.Series(0.0, index=data.index),
+                errors="coerce",
+            ).fillna(0.0)
+            volume = pd.to_numeric(
+                data["volume"] if "volume" in data else pd.Series(0.0, index=data.index),
+                errors="coerce",
+            ).fillna(0.0)
             data["liquidity"] = (close * volume).clip(lower=0.0)
         if "volatility" not in data:
             close = pd.to_numeric(data.get("close"), errors="coerce")
@@ -140,9 +170,7 @@ class PooledPanelBuilder:
                 [hour < 8, hour < 16], ["asia", "europe"], default="americas"
             )
         if "regime" not in data:
-            vol = pd.to_numeric(data["volatility"], errors="coerce").fillna(0.0)
-            threshold = float(vol.quantile(0.70)) if len(vol) else 0.0
-            data["regime"] = np.where(vol > threshold, "high_volatility", "normal")
+            data["regime"] = causal_regime_labels(data).to_numpy()
         return data
 
     @staticmethod
@@ -288,5 +316,6 @@ __all__: Sequence[str] = (
     "HorizonDataset",
     "PooledPanelBuilder",
     "WalkForwardFold",
+    "causal_regime_labels",
     "dataset_manifest",
 )

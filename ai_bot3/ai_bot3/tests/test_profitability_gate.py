@@ -41,6 +41,8 @@ def test_profitability_gate_passes_only_complete_stable_evidence():
         [{"net_return": value} for value in (0.01, 0.02, -0.001, 0.015, 0.005)],
         initial_equity_usdt=100_000,
         two_x_cost_net_return=0.01,
+        mark_to_market_max_drawdown=0.02,
+        mark_to_market_evidence_complete=True,
     )
     assert gate.profitability_gate == "PASSED"
     assert gate.stage == "candidate"
@@ -72,6 +74,28 @@ def test_failed_gate_has_zero_candidates_and_cannot_create_manifest(tmp_path):
             lockbox_fingerprint="a" * 64,
             code_commit="1234567",
         )
+
+
+def test_profitability_gate_rejects_realized_only_or_excess_mtm_drawdown():
+    missing = evaluate_profitability_gate(
+        _profitable_trades(),
+        [{"net_return": 0.01}] * 5,
+        initial_equity_usdt=100_000,
+        two_x_cost_net_return=0.01,
+    )
+    assert missing.profitability_gate == "FAILED"
+    assert "mark_to_market_drawdown" in missing.blockers
+
+    excessive = evaluate_profitability_gate(
+        _profitable_trades(),
+        [{"net_return": 0.01}] * 5,
+        initial_equity_usdt=100_000,
+        two_x_cost_net_return=0.01,
+        mark_to_market_max_drawdown=0.031,
+        mark_to_market_evidence_complete=True,
+    )
+    assert excessive.profitability_gate == "FAILED"
+    assert excessive.checks["mark_to_market_drawdown"]["actual"] == 0.031
 
 
 def test_pipeline_failure_archives_stale_candidate_manifest(tmp_path):

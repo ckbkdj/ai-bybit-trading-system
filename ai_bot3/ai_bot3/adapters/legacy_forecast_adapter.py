@@ -5,18 +5,7 @@ from typing import Any, Mapping
 
 from contracts.common import deterministic_id
 from contracts.forecast_v1 import ForecastEnvelope
-
-
-# These horizons are the actual settlement/decision horizons used by the live
-# prediction loop, not the amount of historical context loaded by each mode.
-# Confusing the two made tickets and event gates outlive their source forecast.
-MODE_HORIZONS = {
-    "scalping": 3 * 60,
-    "mid_short": 15 * 60,
-    "trend": 2 * 60 * 60,
-    "trend_swing": 4 * 60 * 60,
-    "swing": 24 * 60 * 60,
-}
+from contracts.horizons import MODE_HORIZONS
 
 
 def _timestamp(value: Any, fallback: datetime) -> datetime:

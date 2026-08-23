@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -57,3 +58,27 @@ def test_pooled_panel_lockbox_and_walk_forward_are_disjoint_and_index_safe():
         test = dataset.development.iloc[list(fold.test_indices)]
         assert train["label_available_at"].max() < test["decision_at"].min()
         assert set(fold.train_indices).isdisjoint(fold.test_indices)
+
+
+def test_regime_is_causal_and_future_rows_cannot_rewrite_past_labels():
+    start = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    prefix = pd.DataFrame(
+        {
+            "symbol": ["BTCUSDT"] * 80,
+            "decision_at": [start + timedelta(minutes=index) for index in range(80)],
+            "volatility": np.linspace(0.001, 0.010, 80),
+        }
+    )
+    future = pd.DataFrame(
+        {
+            "symbol": ["BTCUSDT"] * 40,
+            "decision_at": [start + timedelta(minutes=80 + index) for index in range(40)],
+            "volatility": np.linspace(0.10, 0.50, 40),
+        }
+    )
+    before = PooledPanelBuilder.enrich_context(prefix)["regime"].tolist()
+    after = PooledPanelBuilder.enrich_context(pd.concat([prefix, future], ignore_index=True))[
+        "regime"
+    ].iloc[: len(prefix)].tolist()
+    assert before == after
+    assert before[:8] == ["insufficient_history"] * 8

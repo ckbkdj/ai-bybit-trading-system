@@ -20,6 +20,9 @@ class TwoStageConfig:
     tail_penalty: float = 0.50
     meta_trade_probability: float = 0.55
     uncertainty_quantile: float = 0.95
+    oof_folds: int = 4
+    minimum_oof_train_rows: int = 30
+    minimum_oof_validation_rows: int = 10
 
     def __post_init__(self) -> None:
         if min(self.direction_iterations, self.meta_iterations) <= 0:
@@ -30,6 +33,10 @@ class TwoStageConfig:
             raise ValueError("meta trade threshold must be at least 0.5")
         if not 0.5 < self.uncertainty_quantile < 1:
             raise ValueError("uncertainty quantile must be in (0.5, 1)")
+        if self.oof_folds < 2 or min(
+            self.minimum_oof_train_rows, self.minimum_oof_validation_rows
+        ) <= 0:
+            raise ValueError("OOF folds and minimum row counts are invalid")
 
 
 @dataclass(frozen=True)
@@ -162,17 +169,16 @@ class TwoStageAlphaModel:
         self.mfe_weights: np.ndarray | None = None
         self.meta_weights: np.ndarray | None = None
         self.residual_quantiles = np.zeros(3, dtype=float)
+        self.conformal_lower_residual = 0.0
+        self.training_audit: dict[str, object] = {}
         self.fitted = False
         self.release_stage = "rejected"
 
-    def fit(self, frame: pd.DataFrame, feature_columns: Sequence[str]) -> "TwoStageAlphaModel":
-        missing = [column for column in self.REQUIRED_LABELS if column not in frame]
+    @staticmethod
+    def _labels(frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        missing = [column for column in TwoStageAlphaModel.REQUIRED_LABELS if column not in frame]
         if missing:
             raise ValueError(f"missing training labels: {missing}")
-        if len(frame) < 50:
-            raise ValueError("at least 50 pooled observations are required")
-        self.feature_columns = list(feature_columns)
-        x = self.encoder.fit(frame, self.feature_columns)
         net = pd.to_numeric(frame["net_return"], errors="raise").to_numpy(float)
         mae = np.maximum(0.0, pd.to_numeric(frame["mae"], errors="raise").to_numpy(float))
         mfe = np.maximum(0.0, pd.to_numeric(frame["mfe"], errors="raise").to_numpy(float))
@@ -184,6 +190,16 @@ class TwoStageAlphaModel:
             direction = normalized.map(mapping).to_numpy(int)
         else:
             direction = np.where(net > 1e-12, 2, np.where(net < -1e-12, 0, 1)).astype(int)
+        return net, mae, mfe, direction
+
+    def _fit_level_one_only(
+        self,
+        frame: pd.DataFrame,
+        feature_columns: Sequence[str],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        self.feature_columns = list(feature_columns)
+        x = self.encoder.fit(frame, self.feature_columns)
+        net, mae, mfe, direction = self._labels(frame)
         self.direction_weights = np.zeros((x.shape[1] + 1, 3), dtype=float)
         design = np.column_stack([np.ones(len(x)), x])
         targets = np.eye(3)[direction]
@@ -198,12 +214,105 @@ class TwoStageAlphaModel:
         self.net_weights = _fit_ridge(x, net - self.config.tail_penalty * mae, self.config.ridge)
         self.mae_weights = _fit_ridge(x, mae, self.config.ridge)
         self.mfe_weights = _fit_ridge(x, mfe, self.config.ridge)
-        expected_net = _ridge_predict(x, self.net_weights)
-        residuals = net - expected_net
-        self.residual_quantiles = np.quantile(residuals, [0.10, 0.50, 0.90])
-        meta_x = self._meta_features(x)
+        return x, net, mae, mfe
+
+    def _oof_level_one(
+        self,
+        frame: pd.DataFrame,
+        feature_columns: Sequence[str],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[dict[str, object]]]:
+        if "decision_at" not in frame or "label_available_at" not in frame:
+            raise ValueError(
+                "decision_at and label_available_at are required for leakage-safe OOF training"
+            )
+        decision = pd.to_datetime(frame["decision_at"], utc=True, errors="coerce")
+        label_available = pd.to_datetime(frame["label_available_at"], utc=True, errors="coerce")
+        if decision.isna().any() or label_available.isna().any():
+            raise ValueError("OOF timestamps contain invalid values")
+        if (label_available <= decision).any():
+            raise ValueError("label_available_at must be strictly after decision_at")
+        unique_times = decision.drop_duplicates().sort_values().reset_index(drop=True)
+        if len(unique_times) < self.config.oof_folds + 2:
+            raise ValueError("too few unique timestamps for OOF training")
+        first_validation = max(1, int(math.floor(len(unique_times) * 0.40)))
+        validation_times = np.array_split(
+            unique_times.iloc[first_validation:].to_numpy(), self.config.oof_folds
+        )
+        probabilities = np.full((len(frame), 3), np.nan, dtype=float)
+        expected_net = np.full(len(frame), np.nan, dtype=float)
+        expected_mae = np.full(len(frame), np.nan, dtype=float)
+        expected_mfe = np.full(len(frame), np.nan, dtype=float)
+        audit: list[dict[str, object]] = []
+        for fold_number, times in enumerate(validation_times, start=1):
+            if len(times) == 0:
+                continue
+            validation_start = pd.Timestamp(times[0])
+            validation_end = pd.Timestamp(times[-1])
+            train_mask = (decision < validation_start) & (label_available < validation_start)
+            validation_mask = (decision >= validation_start) & (decision <= validation_end)
+            train_positions = np.flatnonzero(train_mask.to_numpy())
+            validation_positions = np.flatnonzero(validation_mask.to_numpy())
+            if len(train_positions) < self.config.minimum_oof_train_rows:
+                continue
+            if len(validation_positions) < self.config.minimum_oof_validation_rows:
+                continue
+            local = TwoStageAlphaModel(self.config)
+            local._fit_level_one_only(frame.iloc[train_positions], feature_columns)
+            validation_x = local.encoder.transform(frame.iloc[validation_positions])
+            fold_probabilities, fold_net, fold_mae, fold_mfe = local._level_one(validation_x)
+            probabilities[validation_positions] = fold_probabilities
+            expected_net[validation_positions] = fold_net
+            expected_mae[validation_positions] = fold_mae
+            expected_mfe[validation_positions] = fold_mfe
+            audit.append(
+                {
+                    "fold": fold_number,
+                    "train_rows": len(train_positions),
+                    "validation_rows": len(validation_positions),
+                    "train_label_available_max": label_available.iloc[train_positions].max().isoformat(),
+                    "validation_start": validation_start.isoformat(),
+                    "validation_end": validation_end.isoformat(),
+                }
+            )
+        valid = np.isfinite(expected_net)
+        minimum_oof_rows = max(20, self.config.minimum_oof_validation_rows)
+        if int(valid.sum()) < minimum_oof_rows or len(audit) < 2:
+            raise ValueError("insufficient leakage-safe OOF rows for level-two training")
+        return probabilities, expected_net, expected_mae, expected_mfe, valid, audit
+
+    @staticmethod
+    def _compose_meta_features(
+        probabilities: np.ndarray,
+        expected_net: np.ndarray,
+        mae: np.ndarray,
+        mfe: np.ndarray,
+    ) -> np.ndarray:
+        entropy = -np.sum(
+            probabilities * np.log(np.clip(probabilities, 1e-12, 1.0)), axis=1
+        ) / math.log(3.0)
+        return np.column_stack([probabilities, expected_net, mae, mfe, entropy])
+
+    def fit(self, frame: pd.DataFrame, feature_columns: Sequence[str]) -> "TwoStageAlphaModel":
+        if len(frame) < 50:
+            raise ValueError("at least 50 pooled observations are required")
+        data = frame.copy().reset_index(drop=True)
+        net, mae, _, _ = self._labels(data)
+        (
+            oof_probabilities,
+            oof_net,
+            oof_mae,
+            oof_mfe,
+            oof_valid,
+            oof_audit,
+        ) = self._oof_level_one(data, feature_columns)
+        meta_x = self._compose_meta_features(
+            oof_probabilities[oof_valid],
+            oof_net[oof_valid],
+            oof_mae[oof_valid],
+            oof_mfe[oof_valid],
+        )
         meta_design = np.column_stack([np.ones(len(meta_x)), meta_x])
-        utility = net - self.config.tail_penalty * mae
+        utility = net[oof_valid] - self.config.tail_penalty * mae[oof_valid]
         trade_target = (utility > 0).astype(float)
         self.meta_weights = np.zeros(meta_design.shape[1], dtype=float)
         sample_weight = 1.0 + np.minimum(10.0, np.abs(utility) / max(float(np.median(np.abs(utility))) if len(utility) else 1.0, 1e-12))
@@ -212,6 +321,23 @@ class TwoStageAlphaModel:
             gradient = meta_design.T @ ((probability - trade_target) * sample_weight) / len(meta_x)
             gradient[1:] += self.config.l2 * self.meta_weights[1:]
             self.meta_weights -= self.config.learning_rate * gradient
+        residuals = net[oof_valid] - oof_net[oof_valid]
+        self.residual_quantiles = np.quantile(residuals, [0.10, 0.50, 0.90])
+        self.conformal_lower_residual = float(
+            np.quantile(residuals, 1.0 - self.config.uncertainty_quantile, method="lower")
+        )
+        self.training_audit = {
+            "level_two_training_source": "out_of_fold_level_one",
+            "return_calibration_source": "out_of_fold_residuals",
+            "calibration_method": "oof_residual_quantiles_and_one_sided_conformal",
+            "pit_label_cutoff_enforced": True,
+            "training_rows": len(data),
+            "oof_rows": int(oof_valid.sum()),
+            "oof_fold_count": len(oof_audit),
+            "oof_folds": oof_audit,
+        }
+        self.encoder = _Encoder()
+        self._fit_level_one_only(data, feature_columns)
         self.fitted = True
         self.release_stage = "rejected"
         return self
@@ -228,8 +354,7 @@ class TwoStageAlphaModel:
 
     def _meta_features(self, x: np.ndarray) -> np.ndarray:
         probabilities, expected_net, mae, mfe = self._level_one(x)
-        entropy = -np.sum(probabilities * np.log(np.clip(probabilities, 1e-12, 1.0)), axis=1) / math.log(3.0)
-        return np.column_stack([probabilities, expected_net, mae, mfe, entropy])
+        return self._compose_meta_features(probabilities, expected_net, mae, mfe)
 
     def predict(self, frame: pd.DataFrame) -> list[TwoStagePrediction]:
         if not self.fitted or self.meta_weights is None:
@@ -239,12 +364,13 @@ class TwoStageAlphaModel:
         meta_x = self._meta_features(x)
         trade_probability = _sigmoid(np.column_stack([np.ones(len(meta_x)), meta_x]) @ self.meta_weights)
         entropy = meta_x[:, -1]
+        conformal_lower = expected_net + self.conformal_lower_residual
         p10 = expected_net + self.residual_quantiles[0]
         p50 = expected_net + self.residual_quantiles[1]
         p90 = expected_net + self.residual_quantiles[2]
         output: list[TwoStagePrediction] = []
         for index in range(len(frame)):
-            lower_edge = float(p10[index])
+            lower_edge = float(min(p10[index], conformal_lower[index]))
             decision = (
                 "TRADE"
                 if trade_probability[index] >= self.config.meta_trade_probability and lower_edge > 0
@@ -285,6 +411,8 @@ class TwoStageAlphaModel:
             "mfe_weights": self.mfe_weights.tolist(),
             "meta_weights": self.meta_weights.tolist(),
             "residual_quantiles": self.residual_quantiles.tolist(),
+            "conformal_lower_residual": self.conformal_lower_residual,
+            "training_audit": self.training_audit,
         }
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(path.suffix + ".tmp")
@@ -306,6 +434,19 @@ class TwoStageAlphaModel:
             "residual_quantiles",
         ):
             setattr(model, name, np.asarray(payload[name], dtype=float))
+        model.conformal_lower_residual = float(
+            payload.get("conformal_lower_residual", model.residual_quantiles[0])
+        )
+        model.training_audit = dict(
+            payload.get(
+                "training_audit",
+                {
+                    "level_two_training_source": "legacy_unknown",
+                    "return_calibration_source": "legacy_unknown",
+                    "pit_label_cutoff_enforced": False,
+                },
+            )
+        )
         model.fitted = True
         model.release_stage = "rejected"
         return model

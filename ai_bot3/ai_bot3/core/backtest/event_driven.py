@@ -91,11 +91,32 @@ class TradeRecord:
     partial_fill: bool
     exit_reason: str
     cancel_fill_race: bool
+    entry_fill_price: float
+    exit_fill_price: float
+    filled_quantity: float
+    market_key: str
 
     def to_dict(self) -> dict[str, object]:
         payload = asdict(self)
         for key in ("decision_at", "entry_at", "exit_at"):
             payload[key] = payload[key].astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        return payload
+
+
+@dataclass(frozen=True)
+class EquityPoint:
+    observed_at: datetime
+    equity_usdt: float
+    realized_pnl_usdt: float
+    unrealized_pnl_usdt: float
+    gross_exposure_usdt: float
+    active_positions: int
+
+    def to_dict(self) -> dict[str, object]:
+        payload = asdict(self)
+        payload["observed_at"] = self.observed_at.astimezone(timezone.utc).isoformat().replace(
+            "+00:00", "Z"
+        )
         return payload
 
 
@@ -114,10 +135,14 @@ class EventDrivenReport:
     total_funding_cost: float
     cancel_fill_race_count: int
     intrabar_path_used: bool = True
+    mark_to_market_used: bool = True
+    equity_curve: tuple[EquityPoint, ...] = ()
+    maximum_gross_exposure_usdt: float = 0.0
 
     def to_dict(self, *, include_trades: bool = True) -> dict[str, object]:
         payload = asdict(self)
         payload["trades"] = [trade.to_dict() for trade in self.trades] if include_trades else []
+        payload["equity_curve"] = [point.to_dict() for point in self.equity_curve]
         return payload
 
 
@@ -129,6 +154,66 @@ def _drawdown(curve: Sequence[float]) -> float:
         if peak > 0:
             maximum = max(maximum, (peak - value) / peak)
     return maximum
+
+
+def _mark_to_market_curve(
+    trades: Sequence[TradeRecord],
+    market_bars: Mapping[str, Sequence[MarketBar]],
+    initial_equity: float,
+) -> tuple[EquityPoint, ...]:
+    if not trades:
+        return ()
+    bars_by_key = {
+        str(key): sorted(values, key=lambda bar: (bar.available_at, bar.close_time))
+        for key, values in market_bars.items()
+    }
+    observations = {trade.decision_at for trade in trades}
+    observations.update(trade.entry_at for trade in trades)
+    observations.update(trade.exit_at for trade in trades)
+    for trade in trades:
+        for bar in bars_by_key.get(trade.market_key, ()):
+            if trade.entry_at <= bar.available_at <= trade.exit_at:
+                observations.add(bar.available_at)
+    points: list[EquityPoint] = []
+    for observed_at in sorted(observations):
+        realized = sum(trade.net_pnl for trade in trades if trade.exit_at <= observed_at)
+        unrealized = 0.0
+        gross_exposure = 0.0
+        active_positions = 0
+        for trade in trades:
+            if not (trade.entry_at <= observed_at < trade.exit_at):
+                continue
+            active_positions += 1
+            gross_exposure += trade.notional_usdt
+            mark = trade.entry_fill_price
+            for bar in bars_by_key.get(trade.market_key, ()):
+                if bar.available_at > observed_at:
+                    break
+                if bar.close_time > trade.entry_at:
+                    mark = bar.close
+            direction = 1.0 if trade.side == "BUY" else -1.0
+            gross_open_pnl = trade.notional_usdt * direction * (
+                mark / trade.entry_fill_price - 1.0
+            )
+            holding_seconds = max(1.0, (trade.exit_at - trade.entry_at).total_seconds())
+            elapsed_fraction = min(
+                1.0,
+                max(0.0, (observed_at - trade.entry_at).total_seconds()) / holding_seconds,
+            )
+            entry_cost = 0.5 * (trade.fee_cost + trade.slippage_cost)
+            accrued_funding = trade.funding_cost * elapsed_fraction
+            unrealized += gross_open_pnl - entry_cost - accrued_funding
+        points.append(
+            EquityPoint(
+                observed_at=observed_at,
+                equity_usdt=initial_equity + realized + unrealized,
+                realized_pnl_usdt=realized,
+                unrealized_pnl_usdt=unrealized,
+                gross_exposure_usdt=gross_exposure,
+                active_positions=active_positions,
+            )
+        )
+    return tuple(points)
 
 
 class EventDrivenBacktest:
@@ -307,12 +392,18 @@ class EventDrivenBacktest:
                 partial_fill=label.partial_fill,
                 exit_reason=label.exit_reason,
                 cancel_fill_race=race,
+                entry_fill_price=float(label.entry_fill_price),
+                exit_fill_price=float(label.exit_fill_price),
+                filled_quantity=float(label.filled_quantity),
+                market_key=signal.market_key or signal.symbol.upper(),
             )
             trades.append(trade)
             pending.append(trade)
             active_until[symbol] = label.exit_at
 
         settle_until(datetime.max.replace(tzinfo=timezone.utc))
+        equity_curve = _mark_to_market_curve(trades, market_bars, cfg.initial_equity_usdt)
+        mtm_values = [cfg.initial_equity_usdt] + [point.equity_usdt for point in equity_curve]
 
         return EventDrivenReport(
             configuration={**asdict(cfg), "execution": asdict(execution), "cost_multiplier": cost_multiplier},
@@ -321,12 +412,16 @@ class EventDrivenBacktest:
             initial_equity_usdt=cfg.initial_equity_usdt,
             final_equity_usdt=equity,
             net_return=equity / cfg.initial_equity_usdt - 1.0,
-            max_drawdown=_drawdown(curve),
+            max_drawdown=_drawdown(mtm_values),
             profit_factor=(gross_profit / gross_loss if gross_loss > 0 else None),
             total_fee_cost=sum(trade.fee_cost for trade in trades),
             total_slippage_cost=sum(trade.slippage_cost for trade in trades),
             total_funding_cost=sum(trade.funding_cost for trade in trades),
             cancel_fill_race_count=sum(trade.cancel_fill_race for trade in trades),
+            equity_curve=equity_curve,
+            maximum_gross_exposure_usdt=max(
+                (point.gross_exposure_usdt for point in equity_curve), default=0.0
+            ),
         )
 
 
@@ -334,6 +429,7 @@ __all__: Sequence[str] = (
     "BacktestConfig",
     "EventDrivenBacktest",
     "EventDrivenReport",
+    "EquityPoint",
     "SignalEvent",
     "TradeRecord",
 )

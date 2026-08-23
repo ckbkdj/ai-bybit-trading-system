@@ -90,3 +90,31 @@ def test_triple_barrier_records_partial_fill_and_rejects_future_feature():
     assert 0 < label.fill_fraction < 1
     assert label.partial_fill is True
     assert label.filled_quantity < label.requested_quantity
+
+
+def test_triple_barrier_evaluates_every_observation_through_max_holding():
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    spec = EntrySpec(
+        symbol="BTCUSDT",
+        side="BUY",
+        signal_at=start,
+        reference_price=100.0,
+        quantity=1.0,
+        take_profit_bps=500.0,
+        stop_loss_bps=500.0,
+        max_holding_sec=300,
+        max_wait_sec=30,
+    )
+    bars = [
+        _bar(
+            start + timedelta(minutes=index),
+            high=100.2 + index * 0.05,
+            low=99.8,
+            close=100.0 + index * 0.02,
+        )
+        for index in range(6)
+    ]
+    label = build_triple_barrier_label(spec, bars, TripleBarrierConfig(latency_ms=0))
+    assert label.exit_reason == "MAX_HOLDING"
+    assert label.path_observations == 6
+    assert label.exit_at == start + timedelta(minutes=5)

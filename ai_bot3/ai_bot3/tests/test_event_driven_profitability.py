@@ -75,3 +75,31 @@ def test_event_driven_backtest_fails_closed_on_nonpositive_edge():
     report = EventDrivenBacktest().run([signal], {"BTCUSDT": [_bar(start, 102, 99, 101)]})
     assert not report.trades
     assert report.rejected_signals["non_positive_lower_bound_edge"] == 1
+
+
+def test_drawdown_uses_mark_to_market_path_not_only_realized_closes():
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    signal = SignalEvent(
+        signal_id="alpha-mtm-1",
+        symbol="BTCUSDT",
+        side="BUY",
+        decision_at=start,
+        reference_price=100.0,
+        lower_bound_net_edge=0.001,
+        take_profit_bps=5_000,
+        stop_loss_bps=2_000,
+        max_holding_sec=180,
+        feature_available_at=(start,),
+    )
+    bars = [
+        _bar(start, 101.0, 89.0, 90.0),
+        _bar(start + timedelta(minutes=1), 101.0, 90.0, 100.0),
+        _bar(start + timedelta(minutes=2), 103.0, 99.0, 102.0),
+    ]
+    report = EventDrivenBacktest().run([signal], {"BTCUSDT": bars})
+    assert len(report.trades) == 1
+    assert report.trades[0].net_pnl > 0
+    assert report.mark_to_market_used is True
+    assert report.max_drawdown > 0
+    assert len(report.equity_curve) >= 3
+    assert min(point.equity_usdt for point in report.equity_curve) < report.initial_equity_usdt

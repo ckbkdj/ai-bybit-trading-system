@@ -24,7 +24,13 @@ from core.labels.triple_barrier import EntrySpec, MarketBar, TripleBarrierConfig
 from core.models.two_stage import TwoStageAlphaModel, TwoStageConfig, TwoStagePrediction
 from core.release.profitability_release import create_candidate_manifest
 from core.risk.capital_preservation import CapitalPreservationConfig, policy_report
-from core.training.pooled_panel import HORIZON_TIMEFRAME, HORIZONS_SEC, PooledPanelBuilder, dataset_manifest
+from core.training.pooled_panel import (
+    HORIZON_TIMEFRAME,
+    HORIZONS_SEC,
+    PooledPanelBuilder,
+    causal_regime_labels,
+    dataset_manifest,
+)
 
 
 SYMBOLS: tuple[str, ...] = ("BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "1000PEPEUSDT")
@@ -182,13 +188,15 @@ def _market_bars(frame: pd.DataFrame) -> list[MarketBar]:
 
 def _panel_rows(frame: pd.DataFrame, horizon_sec: int, bars: Sequence[MarketBar]) -> list[dict[str, object]]:
     features = _engineer_features(frame)
+    features["regime"] = causal_regime_labels(
+        features.rename(columns={"close_at": "decision_at"})
+    ).to_numpy()
     output: list[dict[str, object]] = []
     feature_names = (
         "ret_1", "ret_2", "ret_3", "ret_6", "ret_12", "ret_24",
         "range_pct", "body_pct", "volume_zscore", "momentum_vol_ratio", "ma_gap_8_24",
     )
-    volatility_threshold = float(features["volatility"].quantile(0.70))
-    for index in range(48, len(features) - 2):
+    for index in range(48, len(features) - 1):
         row = features.iloc[index]
         if row[list(feature_names) + ["volatility", "liquidity"]].isna().any():
             continue
@@ -197,7 +205,9 @@ def _panel_rows(frame: pd.DataFrame, horizon_sec: int, bars: Sequence[MarketBar]
         volatility_bps = max(20.0, min(300.0, float(row["volatility"]) * 10_000.0))
         stop_bps = max(25.0, volatility_bps * 1.25)
         take_profit_bps = stop_bps * 1.50
-        path = bars[index + 1 : index + 3]
+        # Give the label builder the complete future stream.  It performs its
+        # own max-holding cutoff; a fixed two-bar slice is not a holding path.
+        path = bars[index + 1 :]
         labels = {}
         for side in ("BUY", "SELL"):
             labels[side] = build_triple_barrier_label(
@@ -224,7 +234,7 @@ def _panel_rows(frame: pd.DataFrame, horizon_sec: int, bars: Sequence[MarketBar]
             direction_label = "up" if long_net >= short_net else "down"
         hour = signal_at.hour
         session = "asia" if hour < 8 else "europe" if hour < 16 else "americas"
-        regime = "high_volatility" if float(row["volatility"]) > volatility_threshold else "normal"
+        regime = str(row["regime"])
         for side, label in labels.items():
             if label.label_available_at <= signal_at:
                 raise ValueError("label PIT invariant failed")
@@ -252,6 +262,7 @@ def _panel_rows(frame: pd.DataFrame, horizon_sec: int, bars: Sequence[MarketBar]
                 "fill_fraction": label.fill_fraction,
                 "partial_fill": label.partial_fill,
                 "exit_reason": label.exit_reason,
+                "path_observations": label.path_observations,
                 "stop_loss_bps": stop_bps,
                 "take_profit_bps": take_profit_bps,
             }
