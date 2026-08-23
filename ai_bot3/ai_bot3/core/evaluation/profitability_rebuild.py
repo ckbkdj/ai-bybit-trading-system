@@ -68,7 +68,12 @@ MINIMUM_COVERAGE_DAYS: Mapping[str, float] = {
 SHORT_FACTOR_GROUPS: Mapping[str, tuple[str, ...]] = {
     "bybit_orderbook": ("bybit_orderbook_delta_l5", "orderbook_spread_bps", "orderbook_depth_usdt_l5", "microprice_deviation_bps"),
     "public_trades": ("public_trade_imbalance_1m", "ofi_1m", "aggressive_cvd_1m"),
-    "crypto_derivatives": ("perpetual_basis_bps", "funding_rate", "open_interest_change_1h", "liquidation_imbalance_5m"),
+    "basis_funding_oi": (
+        "perpetual_basis_bps",
+        "funding_rate",
+        "open_interest_change_1h",
+    ),
+    "liquidations": ("liquidation_imbalance_5m",),
     "execution_quality": ("fill_probability", "expected_slippage_bps"),
 }
 LEGACY_FACTOR_GROUPS: Mapping[str, tuple[str, ...]] = {

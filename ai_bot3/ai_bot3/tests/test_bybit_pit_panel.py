@@ -18,6 +18,17 @@ from core.evaluation.profitability_rebuild import (
 from core.training.bybit_pit_panel import BybitPITFeatureSource
 
 
+def test_settled_derivatives_and_forward_only_liquidations_are_separate_ablations():
+    assert SHORT_FACTOR_GROUPS["basis_funding_oi"] == (
+        "perpetual_basis_bps",
+        "funding_rate",
+        "open_interest_change_1h",
+    )
+    assert SHORT_FACTOR_GROUPS["liquidations"] == (
+        "liquidation_imbalance_5m",
+    )
+
+
 def _snapshot(symbol: str, event_time: datetime, bid_size: int) -> dict:
     timestamp = int(event_time.timestamp() * 1000)
     return {
