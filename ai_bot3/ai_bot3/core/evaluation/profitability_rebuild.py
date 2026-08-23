@@ -80,6 +80,8 @@ LONG_FACTOR_GROUPS: Mapping[str, tuple[str, ...]] = {
     "macro_vintage": ("fred_vintage_surprise", "alfred_revision_surprise"),
     "tier_a_events": ("tier_a_event_state",),
 }
+MINIMUM_ABLATION_OOS_TRADES = 30
+MINIMUM_ABLATION_TRADED_FOLDS = 2
 
 
 @dataclass(frozen=True)
@@ -441,6 +443,69 @@ def _factor_ablation_report(
     }
 
 
+def _ablation_execution_evidence(
+    baseline_folds: Sequence[Mapping[str, float]],
+    augmented_folds: Sequence[Mapping[str, float]],
+) -> dict[str, object]:
+    """Require real OOS executions in both arms before calling an ablation evaluated."""
+
+    def summarize(folds: Sequence[Mapping[str, float]]) -> dict[str, int]:
+        return {
+            "signals": sum(int(fold.get("signal_count", 0)) for fold in folds),
+            "trades": sum(int(fold.get("trade_count", 0)) for fold in folds),
+            "traded_folds": sum(
+                int(fold.get("trade_count", 0)) > 0 for fold in folds
+            ),
+        }
+
+    baseline = summarize(baseline_folds)
+    augmented = summarize(augmented_folds)
+    passed = all(
+        summary["trades"] >= MINIMUM_ABLATION_OOS_TRADES
+        and summary["traded_folds"] >= MINIMUM_ABLATION_TRADED_FOLDS
+        for summary in (baseline, augmented)
+    )
+    return {
+        "passed": passed,
+        "minimum_oos_trades_per_arm": MINIMUM_ABLATION_OOS_TRADES,
+        "minimum_traded_folds_per_arm": MINIMUM_ABLATION_TRADED_FOLDS,
+        "baseline": baseline,
+        "augmented": augmented,
+    }
+
+
+def _failed_ablation_execution_result(
+    *,
+    cadence: str,
+    group: str,
+    factors: Sequence[str],
+    fold_evidence: Sequence[Mapping[str, object]],
+    baseline_folds: Sequence[Mapping[str, float]],
+    augmented_folds: Sequence[Mapping[str, float]],
+    extra: Mapping[str, object] | None = None,
+) -> dict[str, object] | None:
+    evidence = _ablation_execution_evidence(baseline_folds, augmented_folds)
+    if bool(evidence["passed"]):
+        return None
+    result: dict[str, object] = {
+        "cadence": cadence,
+        "factor_group": group,
+        "factors": list(factors),
+        "oos_ablation_status": "FAILED_INSUFFICIENT_OOS_TRADES",
+        "evaluated": False,
+        "pit_observation_count": sum(
+            int(item.get("test_rows", 0)) for item in fold_evidence
+        ),
+        "oos_fold_count": len(baseline_folds),
+        "execution_evidence": evidence,
+        "retained": False,
+        "formal_feature_set": False,
+        "folds": list(fold_evidence),
+    }
+    result.update(dict(extra or {}))
+    return result
+
+
 def _evaluate_legacy_technical_ablation(
     datasets: Mapping[int, object],
     market: Mapping[str, Sequence[MarketBar]],
@@ -491,8 +556,20 @@ def _evaluate_legacy_technical_ablation(
             )
             baseline_report = backtest.run(baseline_signals, market)
             augmented_report = backtest.run(augmented_signals, market)
-            baseline_folds.append({"net_return": baseline_report.net_return})
-            augmented_folds.append({"net_return": augmented_report.net_return})
+            baseline_folds.append(
+                {
+                    "net_return": baseline_report.net_return,
+                    "signal_count": len(baseline_signals),
+                    "trade_count": len(baseline_report.trades),
+                }
+            )
+            augmented_folds.append(
+                {
+                    "net_return": augmented_report.net_return,
+                    "signal_count": len(augmented_signals),
+                    "trade_count": len(augmented_report.trades),
+                }
+            )
             fold_evidence.append(
                 {
                     "horizon_sec": horizon,
@@ -535,6 +612,19 @@ def _evaluate_legacy_technical_ablation(
                 "folds": fold_evidence,
             }
         }
+    insufficient_execution = _failed_ablation_execution_result(
+        cadence="all_horizons",
+        group=group,
+        factors=columns,
+        fold_evidence=fold_evidence,
+        baseline_folds=baseline_folds,
+        augmented_folds=augmented_folds,
+        extra={
+            "source": "legacy Brain causal OHLCV logic without current-snapshot broadcast"
+        },
+    )
+    if insufficient_execution is not None:
+        return {group: insufficient_execution}
     comparison = compare_factor_groups(
         baseline_folds,
         {group: augmented_folds},
@@ -556,6 +646,9 @@ def _evaluate_legacy_technical_ablation(
                 int(item.get("test_rows", 0)) for item in fold_evidence
             ),
             "oos_fold_count": len(baseline_folds),
+            "execution_evidence": _ablation_execution_evidence(
+                baseline_folds, augmented_folds
+            ),
             "metric": comparison.metric,
             "baseline_mean": comparison.baseline_mean,
             "augmented_mean": comparison.augmented_mean,
@@ -627,8 +720,20 @@ def _evaluate_trad_panel_ablation(
                     augmented_predictions,
                     meta_threshold=augmented_selection.selected_config.meta_trade_probability,
                 )
-                baseline_folds.append({"net_return": baseline_report.net_return})
-                augmented_folds.append({"net_return": augmented_report.net_return})
+                baseline_folds.append(
+                    {
+                        "net_return": baseline_report.net_return,
+                        "signal_count": len(baseline_signals),
+                        "trade_count": len(baseline_report.trades),
+                    }
+                )
+                augmented_folds.append(
+                    {
+                        "net_return": augmented_report.net_return,
+                        "signal_count": len(augmented_signals),
+                        "trade_count": len(augmented_report.trades),
+                    }
+                )
                 fold_evidence.append(
                     {
                         "horizon_sec": horizon,
@@ -662,6 +767,22 @@ def _evaluate_trad_panel_ablation(
                 "folds": fold_evidence,
             }
             continue
+        missing_required = TRAD_PANEL_MISSING_REQUIRED_FACTORS.get(group, ())
+        insufficient_execution = _failed_ablation_execution_result(
+            cadence="medium_long",
+            group=group,
+            factors=columns + tuple(missing_required),
+            fold_evidence=fold_evidence,
+            baseline_folds=baseline_folds,
+            augmented_folds=augmented_folds,
+            extra={
+                "evaluated_factors": list(columns),
+                "missing_required_factors": list(missing_required),
+            },
+        )
+        if insufficient_execution is not None:
+            results[group] = insufficient_execution
+            continue
         comparison = compare_factor_groups(
             baseline_folds,
             {group: augmented_folds},
@@ -671,7 +792,6 @@ def _evaluate_trad_panel_ablation(
             minimum_improved_fold_ratio=0.60,
             minimum_worst_fold_improvement=-0.002,
         )[0]
-        missing_required = TRAD_PANEL_MISSING_REQUIRED_FACTORS.get(group, ())
         complete_group = not missing_required
         results[group] = {
             "cadence": "medium_long",
@@ -689,6 +809,9 @@ def _evaluate_trad_panel_ablation(
                 int(item.get("test_rows", 0)) for item in fold_evidence
             ),
             "oos_fold_count": len(baseline_folds),
+            "execution_evidence": _ablation_execution_evidence(
+                baseline_folds, augmented_folds
+            ),
             "metric": comparison.metric,
             "baseline_mean": comparison.baseline_mean,
             "augmented_mean": comparison.augmented_mean,
@@ -795,8 +918,20 @@ def _evaluate_bybit_pit_ablation(
                 )
                 baseline_report = backtest.run(baseline_signals, market)
                 augmented_report = backtest.run(augmented_signals, market)
-                baseline_folds.append({"net_return": baseline_report.net_return})
-                augmented_folds.append({"net_return": augmented_report.net_return})
+                baseline_folds.append(
+                    {
+                        "net_return": baseline_report.net_return,
+                        "signal_count": len(baseline_signals),
+                        "trade_count": len(baseline_report.trades),
+                    }
+                )
+                augmented_folds.append(
+                    {
+                        "net_return": augmented_report.net_return,
+                        "signal_count": len(augmented_signals),
+                        "trade_count": len(augmented_report.trades),
+                    }
+                )
                 fold_evidence.append(
                     {
                         "horizon_sec": horizon,
@@ -838,6 +973,17 @@ def _evaluate_bybit_pit_ablation(
                 "folds": fold_evidence,
             }
             continue
+        insufficient_execution = _failed_ablation_execution_result(
+            cadence="short",
+            group=group,
+            factors=columns,
+            fold_evidence=fold_evidence,
+            baseline_folds=baseline_folds,
+            augmented_folds=augmented_folds,
+        )
+        if insufficient_execution is not None:
+            results[group] = insufficient_execution
+            continue
         comparison = compare_factor_groups(
             baseline_folds,
             {group: augmented_folds},
@@ -857,6 +1003,9 @@ def _evaluate_bybit_pit_ablation(
                 int(item.get("test_rows", 0)) for item in fold_evidence
             ),
             "oos_fold_count": len(baseline_folds),
+            "execution_evidence": _ablation_execution_evidence(
+                baseline_folds, augmented_folds
+            ),
             "metric": comparison.metric,
             "baseline_mean": comparison.baseline_mean,
             "augmented_mean": comparison.augmented_mean,
