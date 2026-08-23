@@ -1,0 +1,124 @@
+name: repository-ci
+
+on:
+  push:
+    branches:
+      - main
+      - "review/**"
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: repository-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  execution-tests:
+    name: execution tests (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: BybitContractBotV4/requirements.txt
+      - name: Install execution dependencies
+        run: |
+          python -m pip install --upgrade pip wheel
+          python -m pip install -r BybitContractBotV4/requirements.txt "pytest>=8.4,<10" jsonschema
+      - name: Run execution regression
+        run: python -m pytest BybitContractBotV4/tests -q
+      - name: Compile active execution service
+        run: python -m compileall -q BybitContractBotV4
+
+  prediction-tests:
+    name: prediction tests (ubuntu, py3.11)
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            ai_bot3/ai_bot3/requirements.txt
+            ai_bot3/ai_bot3/requirements-dev.txt
+      - name: Install prediction dependencies
+        working-directory: ai_bot3/ai_bot3
+        run: |
+          python -m pip install --upgrade pip wheel
+          python -m pip install -r requirements-dev.txt jsonschema
+      - name: Run prediction regression
+        working-directory: ai_bot3/ai_bot3
+        run: python -m pytest tests -q
+      - name: Compile active prediction service
+        run: python -m compileall -q ai_bot3/ai_bot3
+
+  shadow-e2e:
+    name: cross-process shadow E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: BybitContractBotV4/requirements.txt
+      - name: Install minimal E2E dependencies
+        run: |
+          python -m pip install --upgrade pip wheel
+          python -m pip install -r BybitContractBotV4/requirements.txt fastapi uvicorn jsonschema
+      - name: Run real HTTP shadow loop
+        run: python scripts/run_shadow_e2e.py
+
+  repository-audit:
+    name: tracked-secret and dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Generate audit evidence
+        shell: bash
+        run: |
+          set +e
+          python scripts/supply_chain_audit.py --output supply-chain-audit.json
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ] && [ "$status" -ne 2 ]; then
+            exit "$status"
+          fi
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          report = json.loads(Path("supply-chain-audit.json").read_text(encoding="utf-8"))
+          secrets = report["tracked_secret_scan"]
+          node = report["node_lock_integrity"]
+          if secrets["finding_count"] or secrets["tracked_sensitive_paths"]:
+              raise SystemExit("tracked credential finding blocks CI")
+          if node["missing_integrity_entries"]:
+              raise SystemExit("Node lockfile integrity is incomplete")
+          print("Repository scan passed; dependency locking/vulnerability attestation remain release gates.")
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: supply-chain-audit
+          path: supply-chain-audit.json
+          if-no-files-found: error
