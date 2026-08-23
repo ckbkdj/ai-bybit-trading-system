@@ -62,9 +62,21 @@ def _run(name: str, command: list[str], *, cwd: Path = ROOT, env: dict[str, str]
 
 
 def _git_commit() -> str:
+    split_git_dir = ROOT / ".version-history"
+    command = (
+        [
+            "git",
+            f"--git-dir={split_git_dir}",
+            f"--work-tree={ROOT}",
+            "rev-parse",
+            "HEAD",
+        ]
+        if split_git_dir.exists()
+        else ["git", "-C", str(ROOT), "rev-parse", "HEAD"]
+    )
     try:
         return subprocess.run(
-            ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+            command,
             check=True,
             capture_output=True,
             text=True,

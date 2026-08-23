@@ -12,6 +12,7 @@ import pandas as pd
 
 from contracts.horizons import horizon_for_mode
 from core.features.profitability_technical import (
+    LEGACY_BRAIN_FEATURE_COLUMNS,
     TECHNICAL_FEATURE_COLUMNS,
     engineer_profitability_features,
 )
@@ -190,6 +191,13 @@ def build_current_feature_rows(
         "regime": str(latest["regime"]),
     }
     base.update({name: float(latest[name]) for name in TECHNICAL_FEATURE_COLUMNS})
+    base.update(
+        {
+            name: float(latest[name])
+            for name in LEGACY_BRAIN_FEATURE_COLUMNS
+            if name in model_feature_columns
+        }
+    )
     base.update(external)
     base.update(bybit_values)
     missing = [

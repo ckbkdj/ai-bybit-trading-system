@@ -23,6 +23,7 @@ from core.evaluation.profitability_gate import (
 from core.evaluation.ablation import compare_factor_groups
 from core.evaluation.statistical_governance import TrialLedger, TrialRecord
 from core.features.profitability_technical import (
+    LEGACY_BRAIN_FEATURE_COLUMNS,
     TECHNICAL_FEATURE_COLUMNS,
     engineer_profitability_features,
 )
@@ -63,6 +64,9 @@ SHORT_FACTOR_GROUPS: Mapping[str, tuple[str, ...]] = {
     "public_trades": ("public_trade_imbalance_1m", "ofi_1m", "aggressive_cvd_1m"),
     "crypto_derivatives": ("perpetual_basis_bps", "funding_rate", "open_interest_change_1h", "liquidation_imbalance_5m"),
     "execution_quality": ("fill_probability", "expected_slippage_bps"),
+}
+LEGACY_FACTOR_GROUPS: Mapping[str, tuple[str, ...]] = {
+    "legacy_brain_technical": LEGACY_BRAIN_FEATURE_COLUMNS,
 }
 LONG_FACTOR_GROUPS: Mapping[str, tuple[str, ...]] = {
     "us_risk": ("spy_return", "qqq_return", "vix_level"),
@@ -236,7 +240,7 @@ def _panel_rows(frame: pd.DataFrame, horizon_sec: int, bars: Sequence[MarketBar]
         features.rename(columns={"close_at": "decision_at"})
     ).to_numpy()
     output: list[dict[str, object]] = []
-    feature_names = TECHNICAL_FEATURE_COLUMNS
+    feature_names = TECHNICAL_FEATURE_COLUMNS + LEGACY_BRAIN_FEATURE_COLUMNS
     next_allowed_decision_at: datetime | None = None
     for index in range(48, len(features) - 1):
         row = features.iloc[index]
@@ -385,7 +389,11 @@ def _factor_ablation_report(
 ) -> dict[str, object]:
     evaluated = dict(evaluated_groups or {})
     groups = []
-    for cadence, definitions in (("short", SHORT_FACTOR_GROUPS), ("medium_long", LONG_FACTOR_GROUPS)):
+    for cadence, definitions in (
+        ("all_horizons", LEGACY_FACTOR_GROUPS),
+        ("short", SHORT_FACTOR_GROUPS),
+        ("medium_long", LONG_FACTOR_GROUPS),
+    ):
         for group, factors in definitions.items():
             if group in evaluated:
                 groups.append(dict(evaluated[group]))
@@ -414,6 +422,134 @@ def _factor_ablation_report(
         ],
         "groups": groups,
         "blocker": "current local store has OHLCV and snapshots, but not complete PIT histories for required orderbook/trades/macro-vintage groups",
+    }
+
+
+def _evaluate_legacy_technical_ablation(
+    datasets: Mapping[int, object],
+    market: Mapping[str, Sequence[MarketBar]],
+    selector: NestedWalkForwardSelector,
+    backtest: EventDrivenBacktest,
+) -> dict[str, dict[str, object]]:
+    """Evaluate reusable legacy Brain indicators on untouched outer folds."""
+
+    group = "legacy_brain_technical"
+    columns = LEGACY_FACTOR_GROUPS[group]
+    baseline_folds: list[dict[str, float]] = []
+    augmented_folds: list[dict[str, float]] = []
+    fold_evidence: list[dict[str, object]] = []
+    for horizon, dataset in datasets.items():
+        for fold in dataset.folds:
+            train = dataset.development.iloc[list(fold.train_indices)]
+            test = dataset.development.iloc[list(fold.test_indices)]
+            eligible_train = train.loc[
+                train[list(columns)].notna().all(axis=1)
+            ].reset_index(drop=True)
+            eligible_test = test.loc[
+                test[list(columns)].notna().all(axis=1)
+            ].reset_index(drop=True)
+            if len(eligible_train) < 100 or len(eligible_test) < 30:
+                fold_evidence.append(
+                    {
+                        "horizon_sec": horizon,
+                        "fold_id": fold.fold_id,
+                        "status": "FAILED_INSUFFICIENT_PIT_ROWS",
+                        "train_rows": len(eligible_train),
+                        "test_rows": len(eligible_test),
+                    }
+                )
+                continue
+            baseline_selection = selector.select_and_fit(
+                eligible_train, FEATURE_COLUMNS
+            )
+            augmented_selection = selector.select_and_fit(
+                eligible_train, FEATURE_COLUMNS + tuple(columns)
+            )
+            baseline_predictions = baseline_selection.model.predict(eligible_test)
+            augmented_predictions = augmented_selection.model.predict(eligible_test)
+            baseline_signals = _signals_from_predictions(
+                eligible_test, baseline_predictions, horizon
+            )
+            augmented_signals = _signals_from_predictions(
+                eligible_test, augmented_predictions, horizon
+            )
+            baseline_report = backtest.run(baseline_signals, market)
+            augmented_report = backtest.run(augmented_signals, market)
+            baseline_folds.append({"net_return": baseline_report.net_return})
+            augmented_folds.append({"net_return": augmented_report.net_return})
+            fold_evidence.append(
+                {
+                    "horizon_sec": horizon,
+                    "fold_id": fold.fold_id,
+                    "status": "EVALUATED_OOS",
+                    "train_rows": len(eligible_train),
+                    "test_rows": len(eligible_test),
+                    "baseline_signals": len(baseline_signals),
+                    "baseline_trades": len(baseline_report.trades),
+                    "baseline_net_return": baseline_report.net_return,
+                    "baseline_prediction_gate": prediction_gate_diagnostics(
+                        eligible_test,
+                        baseline_predictions,
+                        meta_threshold=baseline_selection.selected_config.meta_trade_probability,
+                    ),
+                    "augmented_signals": len(augmented_signals),
+                    "augmented_trades": len(augmented_report.trades),
+                    "augmented_net_return": augmented_report.net_return,
+                    "augmented_prediction_gate": prediction_gate_diagnostics(
+                        eligible_test,
+                        augmented_predictions,
+                        meta_threshold=augmented_selection.selected_config.meta_trade_probability,
+                    ),
+                }
+            )
+    if len(baseline_folds) < 2:
+        return {
+            group: {
+                "cadence": "all_horizons",
+                "factor_group": group,
+                "factors": list(columns),
+                "oos_ablation_status": "FAILED_INSUFFICIENT_PIT_ROWS",
+                "evaluated": False,
+                "pit_observation_count": sum(
+                    int(item.get("test_rows", 0)) for item in fold_evidence
+                ),
+                "oos_fold_count": len(baseline_folds),
+                "retained": False,
+                "formal_feature_set": False,
+                "folds": fold_evidence,
+            }
+        }
+    comparison = compare_factor_groups(
+        baseline_folds,
+        {group: augmented_folds},
+        primary_metric="net_return",
+        higher_is_better=True,
+        minimum_mean_improvement=0.0,
+        minimum_improved_fold_ratio=0.60,
+        minimum_worst_fold_improvement=-0.002,
+    )[0]
+    return {
+        group: {
+            "cadence": "all_horizons",
+            "factor_group": group,
+            "factors": list(columns),
+            "source": "legacy Brain causal OHLCV logic without current-snapshot broadcast",
+            "oos_ablation_status": "EVALUATED_OOS",
+            "evaluated": True,
+            "pit_observation_count": sum(
+                int(item.get("test_rows", 0)) for item in fold_evidence
+            ),
+            "oos_fold_count": len(baseline_folds),
+            "metric": comparison.metric,
+            "baseline_mean": comparison.baseline_mean,
+            "augmented_mean": comparison.augmented_mean,
+            "mean_improvement": comparison.mean_improvement,
+            "improved_fold_ratio": comparison.improved_fold_ratio,
+            "worst_fold_improvement": comparison.worst_fold_improvement,
+            "retained": comparison.retained,
+            "formal_feature_set": comparison.retained,
+            "folds": fold_evidence,
+        }
     }
 
 
@@ -816,11 +952,13 @@ class ProfitabilityRebuild:
         )
         selector = NestedWalkForwardSelector(candidate_configs, inner_folds=3)
         backtest = EventDrivenBacktest(BacktestConfig())
-        evaluated_factor_groups = (
-            _evaluate_trad_panel_ablation(datasets, market, selector, backtest)
-            if trad_panel_evidence is not None
-            else {}
+        evaluated_factor_groups = _evaluate_legacy_technical_ablation(
+            datasets, market, selector, backtest
         )
+        if trad_panel_evidence is not None:
+            evaluated_factor_groups.update(
+                _evaluate_trad_panel_ablation(datasets, market, selector, backtest)
+            )
         if bybit_pit_evidence is not None:
             evaluated_factor_groups.update(
                 _evaluate_bybit_pit_ablation(
@@ -839,6 +977,8 @@ class ProfitabilityRebuild:
         for horizon in HORIZONS_SEC:
             retained_factor_columns: list[str] = []
             for group in retained_groups:
+                if group in LEGACY_FACTOR_GROUPS:
+                    retained_factor_columns.extend(LEGACY_FACTOR_GROUPS[group])
                 if horizon in {180, 900} and group in SHORT_FACTOR_GROUPS:
                     retained_factor_columns.extend(SHORT_FACTOR_GROUPS[group])
                 if horizon >= 7200 and group in TRAD_PANEL_FACTOR_GROUPS:
