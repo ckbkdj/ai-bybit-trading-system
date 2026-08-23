@@ -47,6 +47,7 @@ from .kline_feature_store import (
     select_persisted_features,
 )
 from .model_monitoring import factor_group_scores, scaled_feature_ood_score, source_is_reliable
+from .models.profitability_runtime import generate_profitability_alpha_prediction
 
 
 def _now_iso() -> str:
@@ -368,6 +369,7 @@ def run_keras_inference_in_process(prepared_data: Dict[str, Any]) -> Dict[str, A
         "openai_prediction": prepared_data.get("openai_prediction"),
         "online_calibration": prepared_data.get("online_calibration"),
         "data_sources_generated_at": prepared_data.get("data_sources_generated_at") or {},
+        "external_panel_context": prepared_data.get("external_panel_context"),
         # 行情数据源溯源（来自 df.attrs，由 data_fetch.get_ohlcv 写入）
         "market_data_source": prepared_data.get("market_data_source"),
         "data_source_status": prepared_data.get("data_source_status"),
@@ -449,6 +451,17 @@ def run_keras_inference_in_process(prepared_data: Dict[str, Any]) -> Dict[str, A
             result["confidence"] = max(float(result.get("confidence") or 0.0), float(brain_pred.get("confidence") or 0.0))
     except Exception as exc:
         result["brain_prediction"] = {"status": "error", "direction": "flat", "actionable": False, "error": str(exc)}
+    result["alpha_prediction"] = generate_profitability_alpha_prediction(
+        prepared_data.get("brain_df") if prepared_data.get("brain_df") is not None else pd.DataFrame(),
+        symbol=sym,
+        mode=mode,
+        latest_decision_at=prepared_data.get("latest_kline_ts"),
+        external_panel_context=prepared_data.get("external_panel_context"),
+    )
+    # Brain remains visible as a rejected comparison baseline.  Only the new
+    # profitability Alpha may mark a production result actionable.
+    result["trade_actionable"] = bool(result["alpha_prediction"].get("actionable"))
+    result["external_panel_context"] = extras["external_panel_context"]
     result["data_sources_generated_at"] = extras["data_sources_generated_at"]
     # 把行情溯源字段固化进 JSON 结果，便于 API/前端展示与陈旧检测。
     for k in (
@@ -690,6 +703,26 @@ class InferencerDataPreparer:
         except Exception as exc:
             self.log.warning("模型训练元数据不可读，LSTM 仅作为未验证展示输出: %s", exc)
 
+        try:
+            panel_as_of = df.index[-1]
+            if df.attrs.get("latest_kline_ts"):
+                panel_as_of = pd.to_datetime(
+                    df.attrs.get("latest_kline_ts"), utc=True, errors="raise"
+                ).to_pydatetime()
+            elif isinstance(panel_as_of, pd.Timestamp):
+                panel_as_of = panel_as_of.to_pydatetime()
+            external_panel_context = self.fetcher.get_external_panel_context(
+                as_of=panel_as_of
+            )
+        except Exception as exc:
+            external_panel_context = {
+                "status": "outage",
+                "source": "trad_data_service.canonical_panel",
+                "data": None,
+                "warnings": [],
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
         return {
             "sym": self.sym,
             "tf_code": self.tf_code,
@@ -717,6 +750,7 @@ class InferencerDataPreparer:
             "online_calibration": None,
             "loaded_model_metadata": loaded_model_metadata,
             "data_sources_generated_at": self._collect_source_times(),
+            "external_panel_context": external_panel_context,
             # 行情数据源溯源（由 data_fetch.get_ohlcv 写入 df.attrs）
             "market_data_source": df.attrs.get("data_source"),
             "data_source_status": df.attrs.get("source_status"),

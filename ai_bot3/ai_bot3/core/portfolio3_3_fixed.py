@@ -1193,15 +1193,13 @@ class PortfolioPredictor:
                 # Persist the slow external panel as shadow evidence only.  It
                 # is intentionally not passed into the model or direction
                 # fusion until PIT/OOS ablation approves a versioned contract.
-                try:
-                    result["external_panel_context"] = self.fetcher.get_external_panel_context()
-                except Exception as external_exc:
+                if not isinstance(result.get("external_panel_context"), dict):
                     result["external_panel_context"] = {
                         "status": "outage",
                         "source": "trad_data_service.canonical_panel",
                         "data": None,
                         "warnings": [],
-                        "error": f"{type(external_exc).__name__}: {external_exc}",
+                        "error": "worker did not return PIT external panel context",
                     }
                 # 在线学习记录预测，便于后续回填学习
                 try:

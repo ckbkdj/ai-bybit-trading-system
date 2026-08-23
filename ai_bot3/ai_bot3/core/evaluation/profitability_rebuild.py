@@ -22,8 +22,13 @@ from core.evaluation.profitability_gate import (
 )
 from core.evaluation.ablation import compare_factor_groups
 from core.evaluation.statistical_governance import TrialLedger, TrialRecord
+from core.features.profitability_technical import (
+    TECHNICAL_FEATURE_COLUMNS,
+    engineer_profitability_features,
+)
 from core.labels.triple_barrier import EntrySpec, MarketBar, TripleBarrierConfig, build_triple_barrier_label
 from core.models.two_stage import (
+    TwoStageAlphaModel,
     TwoStageConfig,
     TwoStagePrediction,
     prediction_gate_diagnostics,
@@ -107,6 +112,14 @@ def _hash_payload(payload: object) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _archive_candidate_manifest(output_dir: Path, run_id: str) -> str | None:
     """Preserve, but deactivate, a manifest left by an older successful run."""
 
@@ -182,23 +195,7 @@ def validate_source_coverage(frame: pd.DataFrame, timeframe: str) -> dict[str, o
     }
 
 
-def _engineer_features(frame: pd.DataFrame) -> pd.DataFrame:
-    data = frame.copy()
-    close = data["close"].replace(0, np.nan)
-    volume = data["volume"].clip(lower=0.0)
-    for window in (1, 2, 3, 6, 12, 24):
-        data[f"ret_{window}"] = close.pct_change(window)
-    data["range_pct"] = (data["high"] - data["low"]) / close
-    data["body_pct"] = (data["close"] - data["open"]) / data["open"].replace(0, np.nan)
-    data["volume_zscore"] = (
-        (volume - volume.rolling(48, min_periods=8).mean())
-        / (volume.rolling(48, min_periods=8).std() + 1e-12)
-    )
-    data["volatility"] = close.pct_change().rolling(24, min_periods=8).std()
-    data["liquidity"] = close * volume
-    data["momentum_vol_ratio"] = data["ret_12"] / (data["volatility"] + 1e-12)
-    data["ma_gap_8_24"] = close.rolling(8, min_periods=4).mean() / (close.rolling(24, min_periods=8).mean() + 1e-12) - 1.0
-    return data.replace([np.inf, -np.inf], np.nan)
+_engineer_features = engineer_profitability_features
 
 
 def _market_bars(frame: pd.DataFrame) -> list[MarketBar]:
@@ -237,10 +234,7 @@ def _panel_rows(frame: pd.DataFrame, horizon_sec: int, bars: Sequence[MarketBar]
         features.rename(columns={"close_at": "decision_at"})
     ).to_numpy()
     output: list[dict[str, object]] = []
-    feature_names = (
-        "ret_1", "ret_2", "ret_3", "ret_6", "ret_12", "ret_24",
-        "range_pct", "body_pct", "volume_zscore", "momentum_vol_ratio", "ma_gap_8_24",
-    )
+    feature_names = TECHNICAL_FEATURE_COLUMNS
     next_allowed_decision_at: datetime | None = None
     for index in range(48, len(features) - 1):
         row = features.iloc[index]
@@ -734,6 +728,44 @@ class ProfitabilityRebuild:
             policy_report(CapitalPreservationConfig()),
         )
 
+        # A rejected model is still useful for auditable shadow collection.
+        # It is fitted on development only and cannot promote itself.  Saving
+        # it here does not inspect or consume the sealed lockbox.
+        model_dir = self.config.model_output_dir / self.trial_id
+        model_paths: dict[str, str] = {}
+        model_sha256: dict[str, str] = {}
+        final_selection: dict[str, object] = {}
+        final_models: dict[int, TwoStageAlphaModel] = {}
+        for horizon, dataset in datasets.items():
+            selection = selector.select_and_fit(
+                dataset.development, model_feature_columns
+            )
+            path = model_dir / f"horizon_{horizon}.json"
+            selection.model.save(path)
+            final_models[horizon] = selection.model
+            model_paths[str(horizon)] = path.name
+            model_sha256[str(horizon)] = _sha256_file(path)
+            final_selection[str(horizon)] = {
+                "audit": dict(selection.audit),
+                "candidate_results": list(selection.candidate_results),
+            }
+        bundle_path = model_dir / "model_bundle.json"
+        rejected_bundle = {
+            "schema_version": "profitability-model-bundle.v2",
+            "trial_id": self.trial_id,
+            "model_family": "profitability_two_stage",
+            "release_stage": "rejected",
+            "profitability_gate": "FAILED",
+            "models": model_paths,
+            "model_sha256": model_sha256,
+            "formal_feature_columns": list(model_feature_columns),
+            "retained_factor_groups": list(retained_groups),
+            "lockbox_fingerprint": None,
+            "lockbox_consumed": False,
+            "code_commit": self.config.code_commit,
+        }
+        _atomic_json(bundle_path, rejected_bundle)
+
         if not development_gate.passed:
             _atomic_json(
                 output / "lockbox_report.json",
@@ -744,6 +776,7 @@ class ProfitabilityRebuild:
                     "used_for_parameter_selection": False,
                     "reason": "development profitability, factor, or execution gate failed",
                     "source_evidence": source_evidence,
+                    "rejected_shadow_model_bundle": str(bundle_path),
                 },
             )
             record = TrialRecord(
@@ -780,23 +813,11 @@ class ProfitabilityRebuild:
             lockbox_fingerprint, self.trial_id, purpose="final_evaluation"
         )
         lockbox_signals: list[SignalEvent] = []
-        model_paths: dict[str, str] = {}
-        final_selection: dict[str, object] = {}
         for horizon, dataset in datasets.items():
-            selection = selector.select_and_fit(
-                dataset.development, model_feature_columns
-            )
-            path = self.config.model_output_dir / self.trial_id / f"horizon_{horizon}.json"
-            selection.model.save(path)
-            model_paths[str(horizon)] = str(path)
-            final_selection[str(horizon)] = {
-                "audit": dict(selection.audit),
-                "candidate_results": list(selection.candidate_results),
-            }
             lockbox_signals.extend(
                 _signals_from_predictions(
                     dataset.lockbox,
-                    selection.model.predict(dataset.lockbox),
+                    final_models[horizon].predict(dataset.lockbox),
                     horizon,
                 )
             )
@@ -829,17 +850,21 @@ class ProfitabilityRebuild:
                 "result": lockbox_report.to_dict(include_trades=True),
             },
         )
-        bundle_path = self.config.model_output_dir / self.trial_id / "model_bundle.json"
         _atomic_json(
             bundle_path,
             {
+                "schema_version": "profitability-model-bundle.v2",
                 "trial_id": self.trial_id,
                 "model_family": "profitability_two_stage",
                 "release_stage": "candidate" if gate.passed else "rejected",
+                "profitability_gate": gate.profitability_gate,
                 "models": model_paths,
+                "model_sha256": model_sha256,
                 "formal_feature_columns": list(model_feature_columns),
                 "retained_factor_groups": list(retained_groups),
                 "lockbox_fingerprint": lockbox_fingerprint,
+                "lockbox_consumed": True,
+                "code_commit": self.config.code_commit,
             },
         )
         if gate.passed:
