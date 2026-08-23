@@ -26,6 +26,9 @@ class TwoStageConfig:
     expectancy_calibration_bins: int = 10
     minimum_expectancy_clusters: int = 20
     expectancy_lcb_z: float = 1.96
+    symbol_head_ridge_multiplier: float = 5.0
+    symbol_head_l2: float = 0.10
+    minimum_symbol_head_rows: int = 100
 
     def __post_init__(self) -> None:
         if min(self.direction_iterations, self.meta_iterations) <= 0:
@@ -45,6 +48,10 @@ class TwoStageConfig:
             raise ValueError("OOF folds and minimum row counts are invalid")
         if self.expectancy_lcb_z < 1.645:
             raise ValueError("expectancy lower bound must be at least one-sided 95%")
+        if min(self.symbol_head_ridge_multiplier, self.symbol_head_l2) < 0:
+            raise ValueError("symbol-head regularization cannot be negative")
+        if self.minimum_symbol_head_rows < 50:
+            raise ValueError("symbol residual heads require at least 50 rows")
 
 
 @dataclass(frozen=True)
@@ -227,6 +234,10 @@ class TwoStageAlphaModel:
         self.mae_weights: np.ndarray | None = None
         self.mfe_weights: np.ndarray | None = None
         self.meta_weights: np.ndarray | None = None
+        self.symbol_net_weights: dict[str, np.ndarray] = {}
+        self.symbol_mae_weights: dict[str, np.ndarray] = {}
+        self.symbol_mfe_weights: dict[str, np.ndarray] = {}
+        self.symbol_direction_weights: dict[str, np.ndarray] = {}
         self.residual_quantiles = np.zeros(3, dtype=float)
         self.conformal_lower_residual = 0.0
         self.expectancy_cutpoints = np.zeros(0, dtype=float)
@@ -236,6 +247,77 @@ class TwoStageAlphaModel:
         self.training_audit: dict[str, object] = {}
         self.fitted = False
         self.release_stage = "rejected"
+
+    @staticmethod
+    def _symbols(frame: pd.DataFrame) -> np.ndarray | None:
+        if "symbol" not in frame:
+            return None
+        return frame["symbol"].astype(str).str.upper().to_numpy()
+
+    def _fit_symbol_regression_heads(
+        self,
+        x: np.ndarray,
+        symbols: np.ndarray | None,
+        targets: np.ndarray,
+        global_weights: np.ndarray,
+    ) -> dict[str, np.ndarray]:
+        """Fit regularized per-symbol corrections around the pooled model."""
+
+        if symbols is None:
+            return {}
+        residual = targets - _ridge_predict(x, global_weights)
+        heads: dict[str, np.ndarray] = {}
+        penalty = self.config.ridge * self.config.symbol_head_ridge_multiplier
+        for symbol in sorted(set(symbols.tolist())):
+            positions = np.flatnonzero(symbols == symbol)
+            if len(positions) < self.config.minimum_symbol_head_rows:
+                continue
+            heads[str(symbol)] = _fit_ridge(x[positions], residual[positions], penalty)
+        return heads
+
+    def _fit_symbol_direction_heads(
+        self,
+        direction_x: np.ndarray,
+        symbols: np.ndarray | None,
+        targets: np.ndarray,
+    ) -> dict[str, np.ndarray]:
+        if symbols is None or self.direction_weights is None:
+            return {}
+        design = np.column_stack([np.ones(len(direction_x)), direction_x])
+        global_logits = design @ self.direction_weights
+        one_hot = np.eye(3)[targets]
+        heads: dict[str, np.ndarray] = {}
+        for symbol in sorted(set(symbols.tolist())):
+            positions = np.flatnonzero(symbols == symbol)
+            if len(positions) < self.config.minimum_symbol_head_rows:
+                continue
+            local_design = design[positions]
+            local_global = global_logits[positions]
+            local_targets = one_hot[positions]
+            weights = np.zeros_like(self.direction_weights)
+            for _ in range(max(20, self.config.direction_iterations // 2)):
+                probabilities = _softmax(local_global + local_design @ weights)
+                gradient = local_design.T @ (probabilities - local_targets) / len(positions)
+                gradient[1:] += self.config.symbol_head_l2 * weights[1:]
+                weights -= self.config.learning_rate * gradient
+            heads[str(symbol)] = weights
+        return heads
+
+    @staticmethod
+    def _apply_symbol_regression_heads(
+        values: np.ndarray,
+        x: np.ndarray,
+        symbols: np.ndarray | None,
+        heads: Mapping[str, np.ndarray],
+    ) -> np.ndarray:
+        output = values.copy()
+        if symbols is None:
+            return output
+        for symbol, weights in heads.items():
+            positions = np.flatnonzero(symbols == symbol)
+            if len(positions):
+                output[positions] += _ridge_predict(x[positions], weights)
+        return output
 
     def _action_frame(self, frame: pd.DataFrame) -> pd.DataFrame:
         """Add signed numeric interactions for action-conditional outcomes.
@@ -322,12 +404,27 @@ class TwoStageAlphaModel:
             gradient = design.T @ (probabilities - targets) / len(direction_x)
             gradient[1:] += self.config.l2 * self.direction_weights[1:]
             self.direction_weights -= self.config.learning_rate * gradient
+        self.symbol_direction_weights = self._fit_symbol_direction_heads(
+            direction_x,
+            self._symbols(direction_frame),
+            direction,
+        )
 
         # Level one predicts the actual after-cost net return.  Tail penalties
         # belong in the meta utility, not in a field named expected_net_return.
         self.net_weights = _fit_ridge(x, net, self.config.ridge)
         self.mae_weights = _fit_ridge(x, mae, self.config.ridge)
         self.mfe_weights = _fit_ridge(x, mfe, self.config.ridge)
+        action_symbols = self._symbols(frame)
+        self.symbol_net_weights = self._fit_symbol_regression_heads(
+            x, action_symbols, net, self.net_weights
+        )
+        self.symbol_mae_weights = self._fit_symbol_regression_heads(
+            x, action_symbols, mae, self.mae_weights
+        )
+        self.symbol_mfe_weights = self._fit_symbol_regression_heads(
+            x, action_symbols, mfe, self.mfe_weights
+        )
         return x, net, mae, mfe
 
     def _oof_level_one(
@@ -379,7 +476,9 @@ class TwoStageAlphaModel:
                 frame.iloc[validation_positions]
             )
             fold_probabilities, fold_net, fold_mae, fold_mfe = local._level_one(
-                validation_x, validation_direction_x
+                validation_x,
+                validation_direction_x,
+                symbols=local._symbols(frame.iloc[validation_positions]),
             )
             probabilities[validation_positions] = fold_probabilities
             expected_net[validation_positions] = fold_net
@@ -532,6 +631,10 @@ class TwoStageAlphaModel:
             "action_outcome_side_interactions": list(
                 self.action_interaction_columns
             ),
+            "pooled_model_structure": "global_pooled_model_plus_regularized_symbol_residual_heads",
+            "symbol_outcome_heads": sorted(self.symbol_net_weights),
+            "symbol_direction_heads": sorted(self.symbol_direction_weights),
+            "symbol_head_outer_oos_validation_required": True,
             "expected_net_target": "after_cost_net_return",
             "lower_bound_edge_method": "oof_predicted_net_bins_with_utc_day_clustered_95pct_lcb",
             "expectancy_calibration": self.expectancy_calibration,
@@ -544,6 +647,12 @@ class TwoStageAlphaModel:
         self.encoder = _Encoder()
         self.direction_encoder = _Encoder()
         self._fit_level_one_only(data, feature_columns)
+        self.training_audit["symbol_outcome_heads"] = sorted(
+            self.symbol_net_weights
+        )
+        self.training_audit["symbol_direction_heads"] = sorted(
+            self.symbol_direction_weights
+        )
         self.fitted = True
         self.release_stage = "rejected"
         return self
@@ -552,22 +661,49 @@ class TwoStageAlphaModel:
         self,
         x: np.ndarray,
         direction_x: np.ndarray,
+        *,
+        symbols: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         if any(value is None for value in (self.direction_weights, self.net_weights, self.mae_weights, self.mfe_weights)):
             raise RuntimeError("model is not fitted")
         design = np.column_stack([np.ones(len(direction_x)), direction_x])
-        probabilities = _softmax(design @ self.direction_weights)
+        direction_logits = design @ self.direction_weights
+        if symbols is not None:
+            for symbol, weights in self.symbol_direction_weights.items():
+                positions = np.flatnonzero(symbols == symbol)
+                if len(positions):
+                    direction_logits[positions] += design[positions] @ weights
+        probabilities = _softmax(direction_logits)
         expected_net = _ridge_predict(x, self.net_weights)
-        mae = np.maximum(0.0, _ridge_predict(x, self.mae_weights))
-        mfe = np.maximum(0.0, _ridge_predict(x, self.mfe_weights))
+        mae = _ridge_predict(x, self.mae_weights)
+        mfe = _ridge_predict(x, self.mfe_weights)
+        expected_net = self._apply_symbol_regression_heads(
+            expected_net, x, symbols, self.symbol_net_weights
+        )
+        mae = np.maximum(
+            0.0,
+            self._apply_symbol_regression_heads(
+                mae, x, symbols, self.symbol_mae_weights
+            ),
+        )
+        mfe = np.maximum(
+            0.0,
+            self._apply_symbol_regression_heads(
+                mfe, x, symbols, self.symbol_mfe_weights
+            ),
+        )
         return probabilities, expected_net, mae, mfe
 
     def _meta_features(
         self,
         x: np.ndarray,
         direction_x: np.ndarray,
+        *,
+        symbols: np.ndarray | None = None,
     ) -> np.ndarray:
-        probabilities, expected_net, mae, mfe = self._level_one(x, direction_x)
+        probabilities, expected_net, mae, mfe = self._level_one(
+            x, direction_x, symbols=symbols
+        )
         return self._compose_meta_features(probabilities, expected_net, mae, mfe)
 
     def predict(self, frame: pd.DataFrame) -> list[TwoStagePrediction]:
@@ -575,8 +711,11 @@ class TwoStageAlphaModel:
             raise RuntimeError("model is not fitted")
         x = self.encoder.transform(self._action_frame(frame))
         direction_x = self.direction_encoder.transform(frame)
-        probabilities, expected_net, mae, mfe = self._level_one(x, direction_x)
-        meta_x = self._meta_features(x, direction_x)
+        symbols = self._symbols(frame)
+        probabilities, expected_net, mae, mfe = self._level_one(
+            x, direction_x, symbols=symbols
+        )
+        meta_x = self._meta_features(x, direction_x, symbols=symbols)
         trade_probability = _sigmoid(np.column_stack([np.ones(len(meta_x)), meta_x]) @ self.meta_weights)
         entropy = meta_x[:, -1]
         p10 = expected_net + self.residual_quantiles[0]
@@ -628,6 +767,22 @@ class TwoStageAlphaModel:
             "mae_weights": self.mae_weights.tolist(),
             "mfe_weights": self.mfe_weights.tolist(),
             "meta_weights": self.meta_weights.tolist(),
+            "symbol_net_weights": {
+                symbol: weights.tolist()
+                for symbol, weights in self.symbol_net_weights.items()
+            },
+            "symbol_mae_weights": {
+                symbol: weights.tolist()
+                for symbol, weights in self.symbol_mae_weights.items()
+            },
+            "symbol_mfe_weights": {
+                symbol: weights.tolist()
+                for symbol, weights in self.symbol_mfe_weights.items()
+            },
+            "symbol_direction_weights": {
+                symbol: weights.tolist()
+                for symbol, weights in self.symbol_direction_weights.items()
+            },
             "residual_quantiles": self.residual_quantiles.tolist(),
             "conformal_lower_residual": self.conformal_lower_residual,
             "expectancy_cutpoints": self.expectancy_cutpoints.tolist(),
@@ -666,6 +821,20 @@ class TwoStageAlphaModel:
             "residual_quantiles",
         ):
             setattr(model, name, np.asarray(payload[name], dtype=float))
+        for name in (
+            "symbol_net_weights",
+            "symbol_mae_weights",
+            "symbol_mfe_weights",
+            "symbol_direction_weights",
+        ):
+            setattr(
+                model,
+                name,
+                {
+                    str(symbol): np.asarray(weights, dtype=float)
+                    for symbol, weights in dict(payload.get(name, {})).items()
+                },
+            )
         model.conformal_lower_residual = float(
             payload.get("conformal_lower_residual", model.residual_quantiles[0])
         )

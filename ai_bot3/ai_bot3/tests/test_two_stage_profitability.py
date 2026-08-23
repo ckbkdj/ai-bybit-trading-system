@@ -114,3 +114,65 @@ def test_direction_model_is_side_invariant_for_paired_action_alternatives():
     )
     positive_predictions = model.predict(positive)
     assert positive_predictions[0].expected_net_return > positive_predictions[1].expected_net_return
+
+
+def test_pooled_model_learns_regularized_symbol_specific_signal_response(tmp_path):
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    rows = []
+    for index in range(180):
+        signal = float(np.sin(index / 7.0))
+        decision_at = start + timedelta(days=index)
+        for symbol, symbol_sign in (("BTCUSDT", 1.0), ("ETHUSDT", -1.0)):
+            market_edge = symbol_sign * signal
+            direction = (
+                "up" if market_edge > 0.1 else "down" if market_edge < -0.1 else "flat"
+            )
+            for side, side_sign in (("BUY", 1.0), ("SELL", -1.0)):
+                rows.append(
+                    {
+                        "signal": signal,
+                        "symbol": symbol,
+                        "side": side,
+                        "net_return": 0.004 * side_sign * market_edge - 0.0003,
+                        "mae": 0.001 + 0.0002 * max(0.0, -side_sign * market_edge),
+                        "mfe": 0.001 + 0.003 * max(0.0, side_sign * market_edge),
+                        "direction_label": direction,
+                        "decision_at": decision_at,
+                        "label_available_at": decision_at + timedelta(hours=1),
+                    }
+                )
+    frame = pd.DataFrame(rows)
+    model = TwoStageAlphaModel(
+        TwoStageConfig(
+            direction_iterations=120,
+            meta_iterations=60,
+            minimum_symbol_head_rows=100,
+        )
+    ).fit(frame, ["signal", "symbol", "side"])
+    alternatives = pd.DataFrame(
+        [
+            {"signal": 1.0, "symbol": symbol, "side": side}
+            for symbol in ("BTCUSDT", "ETHUSDT")
+            for side in ("BUY", "SELL")
+        ]
+    )
+    predictions = model.predict(alternatives)
+
+    assert sorted(model.symbol_net_weights) == ["BTCUSDT", "ETHUSDT"]
+    assert sorted(model.symbol_direction_weights) == ["BTCUSDT", "ETHUSDT"]
+    assert predictions[0].expected_net_return > predictions[1].expected_net_return
+    assert predictions[3].expected_net_return > predictions[2].expected_net_return
+    assert predictions[0].p_up > predictions[0].p_down
+    assert predictions[2].p_down > predictions[2].p_up
+    assert model.training_audit["pooled_model_structure"].endswith(
+        "regularized_symbol_residual_heads"
+    )
+
+    artifact = tmp_path / "symbol-heads.json"
+    model.save(artifact)
+    loaded = TwoStageAlphaModel.load(artifact)
+    replay = loaded.predict(alternatives)
+    assert np.allclose(
+        [item.expected_net_return for item in predictions],
+        [item.expected_net_return for item in replay],
+    )
