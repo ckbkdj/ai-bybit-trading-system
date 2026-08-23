@@ -11,6 +11,7 @@ import pytest
 from core.providers import bybit_historical_derivatives as derivatives
 from core.providers.bybit_historical_derivatives import (
     HTTPPayload,
+    record_historical_api_failure,
     replay_basis_day,
     replay_funding_day,
     replay_open_interest_day,
@@ -198,3 +199,39 @@ def test_historical_api_rejects_non_official_hosts() -> None:
         derivatives._validate_url(
             "https://example.com/v5/market/open-interest?symbol=BTCUSDT"
         )
+
+
+def test_completed_historical_api_evidence_cannot_be_downgraded_by_late_failure(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "bybit-pit.sqlite3"
+    store = BybitPublicPITStore(database)
+    completed = replay_funding_day(
+        store, symbol=SYMBOL, trading_date=DAY, requester=_fake_requester
+    )
+
+    record_historical_api_failure(
+        store,
+        data_kind="funding",
+        symbol=SYMBOL,
+        trading_date=DAY,
+        error="a concurrent retry failed after the completed commit",
+    )
+
+    with store.connect() as connection:
+        row = connection.execute(
+            """SELECT batch_id,status,error,request_manifest_sha256,rows_read,
+                      feature_observation_count,response_count
+                 FROM bybit_historical_api_batches
+                WHERE data_kind='funding' AND symbol=? AND trading_date=?""",
+            (SYMBOL, DAY.isoformat()),
+        ).fetchone()
+    assert dict(row) == {
+        "batch_id": completed.batch_id,
+        "status": "completed",
+        "error": None,
+        "request_manifest_sha256": completed.request_manifest_sha256,
+        "rows_read": completed.rows_read,
+        "feature_observation_count": completed.feature_observation_count,
+        "response_count": completed.response_count,
+    }

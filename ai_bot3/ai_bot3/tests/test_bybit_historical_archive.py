@@ -16,6 +16,7 @@ from core.providers.bybit_historical_archive import (
     archive_already_completed,
     download_official_archive,
     orderbook_archive_url,
+    record_archive_failure,
     replay_orderbook_archive,
     replay_trade_archive,
     trade_archive_url,
@@ -204,3 +205,46 @@ def test_invalid_archive_is_rejected_before_any_feature_rows_are_committed(tmp_p
             "SELECT COUNT(*) FROM bybit_feature_observations"
         ).fetchone()[0]
     assert count == 0
+
+
+def test_completed_archive_evidence_cannot_be_downgraded_by_late_failure(tmp_path):
+    database = tmp_path / "pit.sqlite3"
+    archive = tmp_path / "book.zip"
+    _orderbook_zip(archive)
+    store = BybitPublicPITStore(database)
+    completed = replay_orderbook_archive(
+        store,
+        archive,
+        symbol=SYMBOL,
+        trading_date=DAY,
+        source_url=orderbook_archive_url(SYMBOL, DAY),
+        fetched_at=FETCHED,
+        feature_emit_interval_sec=15,
+    )
+
+    record_archive_failure(
+        store,
+        data_kind="orderbook",
+        symbol=SYMBOL,
+        trading_date=DAY,
+        source_url=completed.source_url,
+        fetched_at=FETCHED + timedelta(seconds=1),
+        error="a concurrent retry failed after the completed commit",
+    )
+
+    with store.connect() as connection:
+        row = connection.execute(
+            """SELECT archive_id,status,error,content_sha256,rows_read,
+                      feature_observation_count
+                 FROM bybit_historical_archive_files
+                WHERE data_kind='orderbook' AND symbol=? AND trading_date=?""",
+            (SYMBOL, DAY.isoformat()),
+        ).fetchone()
+    assert dict(row) == {
+        "archive_id": completed.archive_id,
+        "status": "completed",
+        "error": None,
+        "content_sha256": completed.content_sha256,
+        "rows_read": completed.rows_read,
+        "feature_observation_count": completed.feature_observation_count,
+    }

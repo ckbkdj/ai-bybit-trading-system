@@ -272,7 +272,8 @@ def record_historical_api_failure(
                    completed_at=excluded.completed_at,
                    response_count=0,rows_read=0,feature_observation_count=0,
                    request_manifest_sha256=excluded.request_manifest_sha256,
-                   status='failed',error=excluded.error""",
+                   status='failed',error=excluded.error
+               WHERE bybit_historical_api_batches.status <> 'completed'""",
             (
                 batch_id,
                 data_kind,

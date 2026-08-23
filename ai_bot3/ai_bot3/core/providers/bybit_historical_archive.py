@@ -103,7 +103,7 @@ def download_official_archive(
         raise ValueError("archive URL is outside the official Bybit allow-list")
     target = Path(target)
     target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_suffix(target.suffix + ".partial")
+    temporary = target.with_name(target.name + f".partial.{os.getpid()}")
     request = urllib.request.Request(url, headers={"User-Agent": "ai-bot3-pit-archive/1"})
     digest = hashlib.sha256()
     written = 0
@@ -183,7 +183,8 @@ def _record_evidence(store: BybitPublicPITStore, evidence: ArchiveReplayEvidence
                    rows_read=excluded.rows_read,
                    feature_observation_count=excluded.feature_observation_count,
                    status=excluded.status,
-                   error=excluded.error""",
+                   error=excluded.error
+               WHERE bybit_historical_archive_files.status <> 'completed'""",
             (
                 evidence.archive_id,
                 evidence.data_kind,
