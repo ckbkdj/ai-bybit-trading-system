@@ -74,6 +74,38 @@ def test_multi_horizon_signal_book_nets_once_and_ticket_references_decision():
     assert ticket.guards.forecast_market == "binance"
 
 
+def test_one_horizon_event_block_vetoes_the_whole_portfolio():
+    near = _forecast("scalping", "up", 0.01)
+    far = _forecast("swing", "up", 0.008)
+    for event_regime in ("blackout", "reduce_only"):
+        blocked = far.model_copy(
+            update={
+                "regime": far.regime.model_copy(
+                    update={"event_regime": event_regime}
+                )
+            }
+        )
+        intent = PortfolioIntentBuilder().build(
+            [near, blocked],
+            strategy_release_id=RELEASE_ID,
+            decision_version=2,
+            now=datetime(2026, 8, 21, 8, 1, tzinfo=timezone.utc),
+        )
+        assert intent is None
+
+
+def test_expired_horizons_cannot_create_a_new_portfolio_intent():
+    scalping = _forecast("scalping", "up", 0.01)
+    mid_short = _forecast("mid_short", "up", 0.009)
+    intent = PortfolioIntentBuilder().build(
+        [scalping, mid_short],
+        strategy_release_id=RELEASE_ID,
+        decision_version=3,
+        now=datetime(2026, 8, 21, 8, 20, tzinfo=timezone.utc),
+    )
+    assert intent is None
+
+
 def test_strategy_release_loader_hashes_manifest_and_every_artifact():
     artifact_names = (
         "brain_model_sha256",
