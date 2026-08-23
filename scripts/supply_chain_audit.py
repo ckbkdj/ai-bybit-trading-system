@@ -15,6 +15,7 @@ REQUIREMENTS = (
     ROOT / "ai_bot3" / "ai_bot3" / "requirements-dev.txt",
     ROOT / "BybitContractBotV4" / "requirements.txt",
 )
+PYTHON_LOCKS = (ROOT / "requirements" / "windows-py312.lock",)
 LOCKFILES = (ROOT / "ai_bot3" / "ai_bot3" / "package-lock.json",)
 SECRET_PATTERNS = {
     "private_key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
@@ -27,6 +28,11 @@ SECRET_PATTERNS = {
 }
 MAX_HISTORY_BLOB_BYTES = 5 * 1024 * 1024
 MAX_HISTORY_BLOBS = 25_000
+REQUIREMENT_NAME = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)")
+LOCKED_REQUIREMENT = re.compile(
+    r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s;]+)\s+"
+    r"--hash=sha256:([0-9a-f]{64})$"
+)
 
 
 def sha256(path: Path) -> str:
@@ -37,8 +43,14 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _package_name(value: str) -> str:
+    return re.sub(r"[-_.]+", "-", value).lower()
+
+
 def dependency_pinning() -> dict[str, Any]:
-    unpinned = []
+    """Verify every declared dependency is covered by a hashed deployment lock."""
+
+    declared: list[dict[str, Any]] = []
     files = []
     for path in REQUIREMENTS:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -46,10 +58,138 @@ def dependency_pinning() -> dict[str, Any]:
             line = raw.split("#", 1)[0].strip()
             if not line or line.startswith("-r "):
                 continue
-            if "==" not in line:
-                unpinned.append({"path": str(path.relative_to(ROOT)), "line": number})
+            match = REQUIREMENT_NAME.match(line)
+            if not match:
+                declared.append(
+                    {
+                        "path": str(path.relative_to(ROOT)),
+                        "line": number,
+                        "name": None,
+                    }
+                )
+                continue
+            declared.append(
+                {
+                    "path": str(path.relative_to(ROOT)),
+                    "line": number,
+                    "name": _package_name(match.group(1)),
+                }
+            )
         files.append({"path": str(path.relative_to(ROOT)), "sha256": sha256(path)})
-    return {"files": files, "unpinned_entries": unpinned}
+
+    locked: dict[str, str] = {}
+    invalid_lock_entries = []
+    lock_files = []
+    for path in PYTHON_LOCKS:
+        if not path.is_file():
+            invalid_lock_entries.append({"path": str(path.relative_to(ROOT)), "reason": "missing"})
+            continue
+        lock_files.append({"path": str(path.relative_to(ROOT)), "sha256": sha256(path)})
+        for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            match = LOCKED_REQUIREMENT.fullmatch(line)
+            if not match:
+                invalid_lock_entries.append(
+                    {
+                        "path": str(path.relative_to(ROOT)),
+                        "line": number,
+                        "reason": "not_exactly_pinned_and_sha256_hashed",
+                    }
+                )
+                continue
+            name = _package_name(match.group(1))
+            version = match.group(2)
+            if name in locked and locked[name] != version:
+                invalid_lock_entries.append(
+                    {
+                        "path": str(path.relative_to(ROOT)),
+                        "line": number,
+                        "reason": "conflicting_locked_versions",
+                    }
+                )
+                continue
+            locked[name] = version
+
+    unpinned = [
+        {"path": item["path"], "line": item["line"], "name": item["name"]}
+        for item in declared
+        if not item["name"] or item["name"] not in locked
+    ]
+    return {
+        "files": files,
+        "lock_files": lock_files,
+        "locked_package_count": len(locked),
+        "locked_packages": locked,
+        "unpinned_entries": unpinned,
+        "invalid_lock_entries": invalid_lock_entries,
+    }
+
+
+def vulnerability_scan(path: Path | None, locked_packages: Mapping[str, str]) -> dict[str, Any]:
+    """Validate a current pip-audit JSON report against the exact lock closure."""
+
+    if path is None or not path.is_file():
+        return {
+            "status": "NOT_RUN_ATTESTATION_REQUIRED",
+            "report_attached": False,
+            "finding_count": None,
+            "missing_locked_packages": sorted(locked_packages),
+        }
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {
+            "status": "INVALID_REPORT",
+            "report_attached": True,
+            "report_sha256": sha256(path),
+            "error": type(exc).__name__,
+            "finding_count": None,
+            "missing_locked_packages": sorted(locked_packages),
+        }
+    dependencies = payload.get("dependencies") if isinstance(payload, dict) else payload
+    if not isinstance(dependencies, list):
+        return {
+            "status": "INVALID_REPORT",
+            "report_attached": True,
+            "report_sha256": sha256(path),
+            "error": "dependencies_array_missing",
+            "finding_count": None,
+            "missing_locked_packages": sorted(locked_packages),
+        }
+    audited: set[str] = set()
+    skipped: list[dict[str, str]] = []
+    findings: list[dict[str, Any]] = []
+    for dependency in dependencies:
+        if not isinstance(dependency, dict) or not dependency.get("name"):
+            continue
+        name = _package_name(str(dependency["name"]))
+        audited.add(name)
+        if dependency.get("skip_reason"):
+            skipped.append({"name": name, "reason": str(dependency["skip_reason"])})
+        for finding in dependency.get("vulns") or []:
+            findings.append(
+                {
+                    "name": name,
+                    "version": str(dependency.get("version") or ""),
+                    "id": str(finding.get("id") or "UNKNOWN"),
+                    "fix_versions": list(finding.get("fix_versions") or []),
+                }
+            )
+    missing = sorted(set(locked_packages) - audited)
+    status = "PASS" if not findings and not missing and not skipped else "BLOCKED"
+    return {
+        "status": status,
+        "report_attached": True,
+        "report_path": str(path),
+        "report_sha256": sha256(path),
+        "audited_package_count": len(audited),
+        "finding_count": len(findings),
+        "findings": findings,
+        "skipped_packages": skipped,
+        "missing_locked_packages": missing,
+    }
 
 
 def node_lock_integrity() -> dict[str, Any]:
@@ -224,14 +364,21 @@ def history_secret_scan() -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Offline supply-chain and secret gate")
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--vulnerability-report", type=Path)
     args = parser.parse_args()
     pinning = dependency_pinning()
     node = node_lock_integrity()
     secrets = secret_scan()
     history = history_secret_scan()
+    vulnerabilities = vulnerability_scan(
+        args.vulnerability_report,
+        pinning["locked_packages"],
+    )
     blockers = []
     if pinning["unpinned_entries"]:
-        blockers.append("python dependencies are not fully locked")
+        blockers.append("declared Python dependencies are not covered by the deployment lock")
+    if pinning["invalid_lock_entries"]:
+        blockers.append("Python deployment lock is missing or malformed")
     if node["missing_integrity_entries"]:
         blockers.append("node lock entries are missing integrity hashes")
     if secrets["finding_count"] or secrets["tracked_sensitive_paths"]:
@@ -240,10 +387,8 @@ def main() -> int:
         blockers.append("reachable Git history may contain credentials")
     if history["scan_limit_reached"]:
         blockers.append("Git history scan limit was reached")
-    # An offline source/config scan cannot establish that dependencies have no
-    # currently disclosed vulnerabilities.  The release pipeline must attach
-    # pip-audit/npm-audit or an equivalent signed report.
-    blockers.append("current vulnerability scan attestation is not attached")
+    if vulnerabilities["status"] != "PASS":
+        blockers.append("current vulnerability scan attestation did not pass")
     payload = {
         "status": "BLOCKED" if blockers else "PASS",
         "blockers": blockers,
@@ -251,7 +396,7 @@ def main() -> int:
         "node_lock_integrity": node,
         "tracked_secret_scan": secrets,
         "git_history_secret_scan": history,
-        "vulnerability_scan": "NOT_RUN_ATTESTATION_REQUIRED",
+        "vulnerability_scan": vulnerabilities,
     }
     rendered = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
     if args.output:

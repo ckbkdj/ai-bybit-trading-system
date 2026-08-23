@@ -104,9 +104,14 @@ def _environment_gate() -> dict[str, Any]:
     }
 
 
-def _audit_evidence(env: dict[str, str]) -> dict[str, Any]:
+def _audit_evidence(
+    env: dict[str, str],
+    vulnerability_report: Path | None = None,
+) -> dict[str, Any]:
     output = ROOT / "truth-supply-chain-audit.json"
     command = [sys.executable, "scripts/supply_chain_audit.py", "--output", str(output)]
+    if vulnerability_report is not None:
+        command.extend(["--vulnerability-report", str(vulnerability_report.resolve())])
     started = time.monotonic()
     completed = subprocess.run(
         command,
@@ -160,6 +165,11 @@ def main() -> int:
         description="Run shadow-only authenticity regression and emit machine evidence"
     )
     parser.add_argument("--output", type=Path, default=ROOT / "truth-regression.json")
+    parser.add_argument(
+        "--vulnerability-report",
+        type=Path,
+        help="pip-audit JSON covering the exact deployment lock",
+    )
     args = parser.parse_args()
 
     environment_gate = _environment_gate()
@@ -249,7 +259,7 @@ def main() -> int:
                 env=safe_env,
             )
         )
-        checks.append(_audit_evidence(safe_env))
+        checks.append(_audit_evidence(safe_env, args.vulnerability_report))
 
     external_gates = [
         {
