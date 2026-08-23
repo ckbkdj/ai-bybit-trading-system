@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Mapping, Sequence
@@ -77,6 +78,7 @@ class HorizonDataset:
     development: pd.DataFrame
     lockbox: pd.DataFrame
     folds: tuple[WalkForwardFold, ...]
+    development_fingerprint: str
     lockbox_fingerprint: str
     lockbox_start: str
 
@@ -89,17 +91,22 @@ def _as_utc(series: pd.Series, name: str) -> pd.Series:
 
 
 def _frame_fingerprint(frame: pd.DataFrame) -> str:
-    columns = [
-        column
-        for column in ("symbol", "horizon_sec", "decision_at", "label_available_at", "net_return")
-        if column in frame
-    ]
+    """Fingerprint labels, features, PIT timestamps and schema without huge JSON."""
+
+    columns = sorted(str(column) for column in frame.columns)
     payload = frame[columns].copy()
-    for column in ("decision_at", "label_available_at"):
-        if column in payload:
-            payload[column] = pd.to_datetime(payload[column], utc=True).astype(str)
-    encoded = payload.to_json(orient="records", date_format="iso", double_precision=12)
-    return hashlib.sha256(encoded.encode()).hexdigest()
+    for column in columns:
+        if isinstance(payload[column].dtype, pd.DatetimeTZDtype):
+            payload[column] = pd.to_datetime(payload[column], utc=True).astype("int64")
+    digest = hashlib.sha256()
+    schema = [(column, str(payload[column].dtype)) for column in columns]
+    digest.update(json.dumps(schema, separators=(",", ":")).encode("utf-8"))
+    digest.update(
+        pd.util.hash_pandas_object(payload, index=False, categorize=True)
+        .to_numpy(dtype="uint64")
+        .tobytes()
+    )
+    return digest.hexdigest()
 
 
 class PooledPanelBuilder:
@@ -228,6 +235,7 @@ class PooledPanelBuilder:
             development=development,
             lockbox=lockbox,
             folds=folds,
+            development_fingerprint=_frame_fingerprint(development),
             lockbox_fingerprint=_frame_fingerprint(lockbox),
             lockbox_start=lockbox_start.isoformat().replace("+00:00", "Z"),
         )
@@ -290,6 +298,7 @@ def dataset_manifest(dataset: HorizonDataset) -> dict[str, object]:
     return {
         "horizon_sec": dataset.horizon_sec,
         "development_rows": len(dataset.development),
+        "development_fingerprint": dataset.development_fingerprint,
         "lockbox_rows": len(dataset.lockbox),
         "lockbox_start": dataset.lockbox_start,
         "lockbox_fingerprint": dataset.lockbox_fingerprint,

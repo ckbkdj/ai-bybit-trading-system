@@ -123,3 +123,30 @@ def test_ofi_source_contract_keeps_legacy_trade_semantics_for_audit_only(tmp_pat
         "BTCUSDT", ["ofi_1m"], decision_at=received + timedelta(seconds=2)
     )
     assert latest["ofi_1m"] == 0.0
+
+
+def test_bybit_training_snapshot_is_frozen_at_append_only_sequence(tmp_path):
+    database = tmp_path / "bybit.sqlite3"
+    store = BybitPublicPITStore(database)
+    ingestor = BybitPublicPITIngestor(store, session_id="frozen-sequence")
+    first_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    ingestor.ingest(
+        _snapshot("BTCUSDT", first_time, 8),
+        received_at=first_time + timedelta(milliseconds=250),
+    )
+    source = BybitPITFeatureSource(database)
+    frozen_sequence = source.maximum_sequence()
+    second_time = first_time + timedelta(minutes=1)
+    ingestor.ingest(
+        _snapshot("BTCUSDT", second_time, 12),
+        received_at=second_time + timedelta(milliseconds=250),
+    )
+
+    frozen, evidence = source.load(
+        ["orderbook_depth_usdt_l5"], maximum_sequence=frozen_sequence
+    )
+    current, _ = source.load(["orderbook_depth_usdt_l5"])
+    assert len(frozen) == 1
+    assert len(current) == 2
+    assert evidence["snapshot_maximum_sequence"] == frozen_sequence
+    assert len(evidence["snapshot_sha256"]) == 64

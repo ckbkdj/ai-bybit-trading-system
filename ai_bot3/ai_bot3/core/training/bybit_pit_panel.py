@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -48,9 +50,55 @@ class BybitPITFeatureSource:
         connection.row_factory = sqlite3.Row
         return connection
 
+    def maximum_sequence(self) -> int:
+        """Freeze an append-only observation boundary for one experiment."""
+
+        with closing(self._connect()) as connection:
+            table = connection.execute(
+                """SELECT 1 FROM sqlite_master
+                     WHERE type='table' AND name='bybit_feature_observations'"""
+            ).fetchone()
+            if not table:
+                raise RuntimeError("Bybit PIT database predates symbol-partitioned features")
+            row = connection.execute(
+                "SELECT COALESCE(MAX(sequence),0) FROM bybit_feature_observations"
+            ).fetchone()
+        return int(row[0])
+
+    @staticmethod
+    def _snapshot_digest(frame: pd.DataFrame) -> str:
+        columns = [
+            "sequence",
+            "observation_id",
+            "symbol",
+            "name",
+            "value",
+            "unit",
+            "event_time",
+            "available_at",
+            "ingested_at",
+            "source",
+            "quality",
+        ]
+        payload = frame[columns].copy().sort_values("sequence")
+        for column in ("event_time", "available_at", "ingested_at"):
+            payload[column] = pd.to_datetime(payload[column], utc=True).astype(str)
+        digest = hashlib.sha256()
+        digest.update(
+            json.dumps(columns, separators=(",", ":")).encode("utf-8")
+        )
+        digest.update(
+            pd.util.hash_pandas_object(payload, index=False, categorize=True)
+            .to_numpy(dtype="uint64")
+            .tobytes()
+        )
+        return digest.hexdigest()
+
     def load(
         self,
         names: Sequence[str],
+        *,
+        maximum_sequence: int | None = None,
     ) -> tuple[pd.DataFrame, dict[str, object]]:
         requested = tuple(dict.fromkeys(str(name) for name in names))
         if not requested:
@@ -60,6 +108,13 @@ class BybitPITFeatureSource:
             if name not in BYBIT_FEATURE_SOURCE_CONTRACTS:
                 raise ValueError(f"Bybit PIT feature has no source contract: {name}")
         placeholders = ",".join("?" for _ in requested)
+        frozen_sequence = (
+            self.maximum_sequence()
+            if maximum_sequence is None
+            else int(maximum_sequence)
+        )
+        if frozen_sequence < 0:
+            raise ValueError("Bybit PIT maximum_sequence cannot be negative")
         with closing(self._connect()) as connection:
             table = connection.execute(
                 """SELECT 1 FROM sqlite_master
@@ -71,9 +126,9 @@ class BybitPITFeatureSource:
                 f"""SELECT sequence,observation_id,symbol,name,value,unit,event_time,
                             available_at,ingested_at,source,quality
                        FROM bybit_feature_observations
-                      WHERE name IN ({placeholders})
+                      WHERE name IN ({placeholders}) AND sequence<=?
                       ORDER BY symbol,name,available_at,sequence""",
-                requested,
+                requested + (frozen_sequence,),
             ).fetchall()
         frame = pd.DataFrame([dict(row) for row in rows])
         if frame.empty:
@@ -84,6 +139,8 @@ class BybitPITFeatureSource:
                 "observation_count": 0,
                 "symbol_count": 0,
                 "feature_coverage": {},
+                "snapshot_maximum_sequence": frozen_sequence,
+                "snapshot_sha256": hashlib.sha256(b"").hexdigest(),
             }
         accepted_source = frame.apply(
             lambda row: str(row["source"])
@@ -101,6 +158,8 @@ class BybitPITFeatureSource:
                 "symbol_count": 0,
                 "feature_coverage": {},
                 "rejected_source_contract_count": rejected_source_contract_count,
+                "snapshot_maximum_sequence": frozen_sequence,
+                "snapshot_sha256": hashlib.sha256(b"").hexdigest(),
             }
         for column in ("event_time", "available_at", "ingested_at"):
             frame[column] = pd.to_datetime(frame[column], utc=True, errors="coerce")
@@ -156,6 +215,8 @@ class BybitPITFeatureSource:
             "feature_source_contracts": {
                 name: BYBIT_FEATURE_SOURCE_CONTRACTS[name] for name in requested
             },
+            "snapshot_maximum_sequence": frozen_sequence,
+            "snapshot_sha256": self._snapshot_digest(frame),
             "pit_policy": "symbol-specific latest available_at at or before decision_at with registry staleness cutoff",
         }
 

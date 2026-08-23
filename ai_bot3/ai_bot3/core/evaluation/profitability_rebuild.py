@@ -860,9 +860,17 @@ class ProfitabilityRebuild:
         self.config = config
         self.source = KlinePanelSource(config.feature_store_path)
         self.ledger = TrialLedger(config.trial_ledger_path)
+        self.bybit_pit_snapshot_maximum_sequence = None
+        if config.bybit_pit_store_path is not None:
+            self.bybit_pit_snapshot_maximum_sequence = BybitPITFeatureSource(
+                config.bybit_pit_store_path
+            ).maximum_sequence()
+        feature_store_stat = config.feature_store_path.stat()
         run_payload = {
             "code_commit": config.code_commit,
             "feature_store": str(config.feature_store_path.resolve()),
+            "feature_store_size_bytes": feature_store_stat.st_size,
+            "feature_store_modified_ns": feature_store_stat.st_mtime_ns,
             "trad_panel_root": (
                 str(config.trad_panel_root.resolve()) if config.trad_panel_root else None
             ),
@@ -872,6 +880,7 @@ class ProfitabilityRebuild:
                 if config.bybit_pit_store_path
                 else None
             ),
+            "bybit_pit_snapshot_maximum_sequence": self.bybit_pit_snapshot_maximum_sequence,
             "max_bars_per_symbol": config.max_bars_per_symbol,
             "horizons": HORIZONS_SEC,
             "symbols": SYMBOLS,
@@ -924,7 +933,10 @@ class ProfitabilityRebuild:
                 )
             )
             bybit_source = BybitPITFeatureSource(self.config.bybit_pit_store_path)
-            bybit_history, bybit_pit_evidence = bybit_source.load(bybit_names)
+            bybit_history, bybit_pit_evidence = bybit_source.load(
+                bybit_names,
+                maximum_sequence=self.bybit_pit_snapshot_maximum_sequence,
+            )
             for horizon in (180, 900):
                 panels[horizon] = bybit_source.join(
                     panels[horizon], names=bybit_names, history=bybit_history

@@ -51,6 +51,7 @@ def test_pooled_panel_lockbox_and_walk_forward_are_disjoint_and_index_safe():
     assert dataset.lockbox["symbol"].nunique() == 2
     assert dataset.development["label_available_at"].max() < lockbox_start
     assert dataset.lockbox["decision_at"].min() >= lockbox_start
+    assert len(dataset.development_fingerprint) == 64
     assert len(dataset.lockbox_fingerprint) == 64
     for fold in dataset.folds:
         assert max(fold.train_indices + fold.test_indices) < len(dataset.development)
@@ -58,6 +59,24 @@ def test_pooled_panel_lockbox_and_walk_forward_are_disjoint_and_index_safe():
         test = dataset.development.iloc[list(fold.test_indices)]
         assert train["label_available_at"].max() < test["decision_at"].min()
         assert set(fold.train_indices).isdisjoint(fold.test_indices)
+
+
+def test_panel_fingerprint_includes_feature_values_not_only_labels():
+    original = _panel()
+    original["candidate_factor"] = 0.0
+    changed = original.copy()
+    changed.loc[changed.index[-1], "candidate_factor"] = 1.0
+    builder = PooledPanelBuilder(
+        lockbox_fraction=0.15,
+        minimum_train_rows=100,
+        minimum_test_rows=20,
+        maximum_folds=3,
+    )
+    first = builder.build_horizon(original, 180)
+    second = builder.build_horizon(changed, 180)
+
+    assert first.development_fingerprint == second.development_fingerprint
+    assert first.lockbox_fingerprint != second.lockbox_fingerprint
 
 
 def test_regime_is_causal_and_future_rows_cannot_rewrite_past_labels():
