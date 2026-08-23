@@ -162,7 +162,9 @@ class BybitPITFeatureSource:
                 "snapshot_sha256": hashlib.sha256(b"").hexdigest(),
             }
         for column in ("event_time", "available_at", "ingested_at"):
-            frame[column] = pd.to_datetime(frame[column], utc=True, errors="coerce")
+            frame[column] = pd.to_datetime(
+                frame[column], utc=True, errors="coerce", format="mixed"
+            )
         if frame[["event_time", "available_at", "ingested_at"]].isna().any().any():
             raise RuntimeError("Bybit PIT feature timestamps are invalid")
         violation = ~(

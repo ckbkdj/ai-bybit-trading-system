@@ -42,6 +42,10 @@ class CaptureConflict(RuntimeError):
     pass
 
 
+class StalePublicEvent(RuntimeError):
+    pass
+
+
 class BybitPublicPITStore:
     """Append-only raw public market events plus standardized PIT observations."""
 
@@ -326,15 +330,60 @@ class BybitPublicPITIngestor:
         *,
         session_id: str,
         execution_probe_notional_usdt: float = 1_000.0,
+        feature_emit_interval_sec: float = 0.0,
+        maximum_event_lag_sec: float = 10.0,
     ) -> None:
         self.store = store
         self.session_id = session_id
         self.execution_probe_notional_usdt = execution_probe_notional_usdt
+        if feature_emit_interval_sec < 0 or maximum_event_lag_sec <= 0:
+            raise ValueError("invalid public capture cadence or lag limit")
+        self.feature_emit_interval_sec = float(feature_emit_interval_sec)
+        self.maximum_event_lag_sec = float(maximum_event_lag_sec)
         self.books: dict[str, _Book] = defaultdict(_Book)
         self.trades: dict[str, Deque[tuple[datetime, float, float, str]]] = defaultdict(deque)
         self.liquidations: dict[str, Deque[tuple[datetime, float, str]]] = defaultdict(deque)
         self.open_interest: dict[str, Deque[tuple[datetime, float]]] = defaultdict(deque)
         self.order_flow_imbalance: dict[str, Deque[tuple[datetime, float]]] = defaultdict(deque)
+        self.last_feature_emit_at: dict[tuple[str, str], datetime] = {}
+
+    def _validate_event_lag(
+        self,
+        event_time: datetime,
+        received_at: datetime,
+        source: str,
+    ) -> None:
+        lag = (_utc(received_at) - _utc(event_time)).total_seconds()
+        if lag > self.maximum_event_lag_sec or lag < -2.0:
+            self.store.quality_store.source_event(
+                source,
+                "outage",
+                f"public_stream_event_lag_sec={lag:.3f}",
+                _utc(received_at),
+            )
+            raise StalePublicEvent(
+                f"{source} event lag {lag:.3f}s exceeds capture contract"
+            )
+
+    def _should_emit(
+        self,
+        symbol: str,
+        group: str,
+        received_at: datetime,
+        *,
+        force: bool = False,
+    ) -> bool:
+        key = (symbol, group)
+        previous = self.last_feature_emit_at.get(key)
+        if (
+            not force
+            and previous is not None
+            and (received_at - previous).total_seconds()
+            < self.feature_emit_interval_sec
+        ):
+            return False
+        self.last_feature_emit_at[key] = received_at
+        return True
 
     def invalidate_books(self, reason: str, received_at: datetime) -> None:
         for book in self.books.values():
@@ -408,6 +457,9 @@ class BybitPublicPITIngestor:
         update_id = int(data.get("u") or 0)
         cross_sequence = int(data.get("seq") or 0)
         event_time = _from_ms(message.get("cts") or message.get("ts"))
+        self._validate_event_lag(
+            event_time, received_at, "bybit.public.orderbook"
+        )
         event_type = str(message.get("type") or "delta").lower()
         payload_hash = hashlib.sha256(_canonical(data).encode()).hexdigest()[:24]
         event_id = f"book:{symbol}:{update_id}:{payload_hash}"
@@ -540,18 +592,30 @@ class BybitPublicPITIngestor:
             "fill_probability": (fill_probability, "probability"),
             "expected_slippage_bps": (slippage_bps, "bps"),
         }
-        for name, (value, unit) in factors.items():
-            self._feature(
-                event_id,
-                symbol,
-                name,
-                value,
-                unit,
-                event_time,
-                received_at,
-                "bybit.public.orderbook",
-            )
-        return {"status": "accepted", "event_id": event_id, "features": factors}
+        emitted = self._should_emit(
+            symbol,
+            "orderbook",
+            received_at,
+            force=is_snapshot,
+        )
+        if emitted:
+            for name, (value, unit) in factors.items():
+                self._feature(
+                    event_id,
+                    symbol,
+                    name,
+                    value,
+                    unit,
+                    event_time,
+                    received_at,
+                    "bybit.public.orderbook",
+                )
+        return {
+            "status": "accepted",
+            "event_id": event_id,
+            "features": factors if emitted else {},
+            "features_emitted": emitted,
+        }
 
     def _public_trades(
         self, message: Mapping[str, Any], received_at: datetime
@@ -567,6 +631,9 @@ class BybitPublicPITIngestor:
             trade_id = str(row.get("i") or hashlib.sha256(_canonical(row).encode()).hexdigest())
             event_id = f"trade:{symbol}:{trade_id}"
             event_time = _from_ms(row.get("T") or message.get("ts"))
+            self._validate_event_lag(
+                event_time, received_at, "bybit.public.trades"
+            )
             if not self.store.append_raw(
                 event_id=event_id,
                 session_id=self.session_id,
@@ -597,18 +664,25 @@ class BybitPublicPITIngestor:
             "public_trade_imbalance_1m": ((buy - sell) / total if total else 0.0, "ratio"),
             "aggressive_cvd_1m": (buy - sell, "base_asset"),
         }
-        for name, (value, unit) in factors.items():
-            self._feature(
-                latest_id,
-                symbol,
-                name,
-                value,
-                unit,
-                latest_event,
-                received_at,
-                "bybit.public.trades",
-            )
-        return {"status": "accepted", "accepted": accepted, "features": factors}
+        emitted = self._should_emit(symbol, "trades", received_at)
+        if emitted:
+            for name, (value, unit) in factors.items():
+                self._feature(
+                    latest_id,
+                    symbol,
+                    name,
+                    value,
+                    unit,
+                    latest_event,
+                    received_at,
+                    "bybit.public.trades",
+                )
+        return {
+            "status": "accepted",
+            "accepted": accepted,
+            "features": factors if emitted else {},
+            "features_emitted": emitted,
+        }
 
     def _liquidations(
         self, message: Mapping[str, Any], received_at: datetime
@@ -622,6 +696,9 @@ class BybitPublicPITIngestor:
             row = dict(item)
             symbol = str(row.get("s") or symbol).upper()
             event_time = _from_ms(row.get("T") or message.get("ts"))
+            self._validate_event_lag(
+                event_time, received_at, "bybit.public.liquidations"
+            )
             digest = hashlib.sha256(_canonical(row).encode()).hexdigest()[:40]
             event_id = f"liq:{symbol}:{digest}"
             if not self.store.append_raw(
@@ -670,6 +747,7 @@ class BybitPublicPITIngestor:
         data = dict(message.get("data") or {})
         symbol = str(data.get("symbol") or topic.rsplit(".", 1)[-1]).upper()
         event_time = _from_ms(message.get("ts"))
+        self._validate_event_lag(event_time, received_at, "bybit.public.ticker")
         digest = hashlib.sha256(_canonical(data).encode()).hexdigest()[:40]
         event_id = f"ticker:{symbol}:{int(message.get('ts') or 0)}:{digest}"
         if not self.store.append_raw(
@@ -726,11 +804,15 @@ class BybitPublicPITCollector:
         *,
         endpoint: str = BYBIT_PUBLIC_LINEAR_WS,
         orderbook_depth: int = 50,
+        feature_emit_interval_sec: float = 5.0,
+        maximum_event_lag_sec: float = 10.0,
     ) -> None:
         self.store = store
         self.symbols = tuple(sorted({str(symbol).upper() for symbol in symbols}))
         self.endpoint = endpoint
         self.orderbook_depth = orderbook_depth
+        self.feature_emit_interval_sec = feature_emit_interval_sec
+        self.maximum_event_lag_sec = maximum_event_lag_sec
         if not self.symbols:
             raise ValueError("at least one Bybit symbol is required")
         if orderbook_depth not in {1, 50, 200, 1000}:
@@ -761,7 +843,12 @@ class BybitPublicPITCollector:
             symbols=self.symbols,
             started_at=started_at,
         )
-        ingestor = BybitPublicPITIngestor(self.store, session_id=session_id)
+        ingestor = BybitPublicPITIngestor(
+            self.store,
+            session_id=session_id,
+            feature_emit_interval_sec=self.feature_emit_interval_sec,
+            maximum_event_lag_sec=self.maximum_event_lag_sec,
+        )
         try:
             timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=60)
             async with aiohttp.ClientSession(timeout=timeout) as client:
@@ -822,4 +909,5 @@ __all__ = (
     "BybitPublicPITIngestor",
     "BybitPublicPITStore",
     "CaptureConflict",
+    "StalePublicEvent",
 )

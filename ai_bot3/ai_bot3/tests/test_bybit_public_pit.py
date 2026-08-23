@@ -5,11 +5,17 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from core.providers.bybit_public_pit import BybitPublicPITIngestor, BybitPublicPITStore
+from core.providers.bybit_public_pit import (
+    BybitPublicPITIngestor,
+    BybitPublicPITStore,
+    StalePublicEvent,
+)
 
 
 def _ms(value: datetime) -> int:
@@ -213,3 +219,90 @@ def test_public_trades_liquidations_and_ticker_create_direct_observations(tmp_pa
     )
     assert point["open_interest_change_1h"]["value"] == 0.1
     assert point["funding_rate"]["value"] == 0.0002
+
+
+def test_collector_cadence_retains_raw_book_events_without_feature_write_amplification(
+    tmp_path,
+):
+    path = tmp_path / "bybit.sqlite3"
+    store = BybitPublicPITStore(path)
+    ingestor = BybitPublicPITIngestor(
+        store,
+        session_id="cadence",
+        feature_emit_interval_sec=5.0,
+    )
+    event_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    snapshot = {
+        "topic": "orderbook.50.BTCUSDT",
+        "type": "snapshot",
+        "ts": _ms(event_time),
+        "cts": _ms(event_time),
+        "data": {
+            "s": "BTCUSDT",
+            "u": 1,
+            "seq": 1,
+            "b": [["99.9", "5"]],
+            "a": [["100.1", "5"]],
+        },
+    }
+    first = ingestor.ingest(
+        snapshot, received_at=event_time + timedelta(milliseconds=100)
+    )
+    delta = {
+        **snapshot,
+        "type": "delta",
+        "ts": _ms(event_time + timedelta(seconds=1)),
+        "cts": _ms(event_time + timedelta(seconds=1)),
+        "data": {
+            **snapshot["data"],
+            "u": 2,
+            "seq": 2,
+            "b": [["99.9", "6"]],
+        },
+    }
+    second = ingestor.ingest(
+        delta,
+        received_at=event_time + timedelta(seconds=1, milliseconds=100),
+    )
+
+    assert first["features_emitted"] is True
+    assert second["features_emitted"] is False
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM bybit_raw_public_events"
+        ).fetchone()[0] == 2
+        assert connection.execute(
+            "SELECT COUNT(*) FROM bybit_feature_observations"
+        ).fetchone()[0] == 8
+
+
+def test_stale_public_stream_event_fails_closed_before_raw_or_feature_acceptance(
+    tmp_path,
+):
+    path = tmp_path / "bybit.sqlite3"
+    store = BybitPublicPITStore(path)
+    ingestor = BybitPublicPITIngestor(
+        store,
+        session_id="stale-stream",
+        maximum_event_lag_sec=10.0,
+    )
+    event_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    message = {
+        "topic": "tickers.BTCUSDT",
+        "ts": _ms(event_time),
+        "data": {
+            "symbol": "BTCUSDT",
+            "markPrice": "101",
+            "indexPrice": "100",
+        },
+    }
+
+    with pytest.raises(StalePublicEvent, match="event lag"):
+        ingestor.ingest(message, received_at=event_time + timedelta(seconds=11))
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM bybit_raw_public_events"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM bybit_feature_observations"
+        ).fetchone()[0] == 0

@@ -150,3 +150,30 @@ def test_bybit_training_snapshot_is_frozen_at_append_only_sequence(tmp_path):
     assert len(current) == 2
     assert evidence["snapshot_maximum_sequence"] == frozen_sequence
     assert len(evidence["snapshot_sha256"]) == 64
+
+
+def test_bybit_loader_accepts_mixed_iso_precision_without_coercing_valid_time(tmp_path):
+    database = tmp_path / "bybit.sqlite3"
+    store = BybitPublicPITStore(database)
+    exact = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    for index, received_at in enumerate(
+        (exact, exact + timedelta(seconds=1, microseconds=250_000))
+    ):
+        store.append_feature(
+            event_id=f"mixed-time-{index}",
+            symbol="BTCUSDT",
+            name="orderbook_spread_bps",
+            value=2.0 + index,
+            unit="bps",
+            event_time=received_at - timedelta(milliseconds=100),
+            received_at=received_at,
+            source="bybit.public.orderbook",
+            quality=0.98,
+        )
+
+    history, evidence = BybitPITFeatureSource(database).load(
+        ["orderbook_spread_bps"]
+    )
+    assert len(history) == 2
+    assert evidence["observation_count"] == 2
+    assert history[["event_time", "available_at", "ingested_at"]].notna().all().all()
