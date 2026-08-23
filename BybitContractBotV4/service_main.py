@@ -6,6 +6,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from bybit_executor import BybitExecutor
+from durable_execution_store import DurableExecutionStore
 from exchange_gateway import build_exchange_gateway
 from execution_reconciler import BybitReconciliationGateway, ExecutionReconciler
 from execution_reporter import ExecutionReporter
@@ -21,7 +22,6 @@ from sizing import PositionSizer
 from soak_monitor import SoakMonitor
 from ticket_client import TicketHttpClient
 from ticket_consumer import TicketConsumer
-from ticket_store import ExecutionStore
 from ticket_validator import TicketValidator
 
 
@@ -41,7 +41,7 @@ class TradingExecutionService:
         db_path = Path(settings.execution_db_path)
         if not db_path.is_absolute():
             db_path = settings.root / db_path
-        self.store = ExecutionStore(
+        self.store = DurableExecutionStore(
             db_path.resolve(), code_commit=settings.app_code_commit or None
         )
         log_paths = [

@@ -114,18 +114,11 @@ class ExecutionReconciler:
                         )
                     except Exception as exc:
                         response = {"cancel_error": f"{type(exc).__name__}: {exc}"}
+                    # The cancel endpoint is asynchronous.  Even if a REST/CCXT
+                    # wrapper renders the accepted response with status=canceled,
+                    # it is not exchange truth.  Persist the request and continue
+                    # into find_order/private-stream reconciliation below.
                     self.store.record_cancel_requested(order["order_link_id"], response)
-                    response_status = str(
-                        (response or {}).get("status")
-                        or ((response or {}).get("info") or {}).get("orderStatus")
-                        or (response or {}).get("orderStatus")
-                        or ""
-                    ).upper()
-                    if response_status in {"CANCELED", "CANCELLED", "DEACTIVATED"}:
-                        self.store.acknowledge_order(
-                            order["order_link_id"], response_status, response
-                        )
-                        continue
             remote = self.gateway.find_order(ticket.instrument.symbol, order["order_link_id"])
             if remote:
                 bybit_id = str(

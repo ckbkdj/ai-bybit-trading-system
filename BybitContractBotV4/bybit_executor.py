@@ -219,8 +219,19 @@ class BybitExecutor:
         self._update_rate_headers("POST:/v5/order/cancel")
         if not isinstance(response, dict):
             response = {"raw": repr(response)}
-        self.store.confirm_cancellation(ticket.ticket_id, target_link_id, response)
-        self.store.confirm_command(command_id, "CONFIRMED", response)
+
+        # Bybit's production cancel endpoint is asynchronous.  A successful REST
+        # response only proves that the request was accepted; it must not release
+        # risk or emit a final cancellation receipt before the private order stream
+        # (or deterministic reconciliation) observes a terminal cancelled status.
+        # The in-memory shadow exchange is intentionally synchronous so existing
+        # local shadow fixtures can complete without a synthetic WebSocket event.
+        if str(getattr(self.client, "mode", "")).strip().lower() == "shadow":
+            self.store.confirm_cancellation(ticket.ticket_id, target_link_id, response)
+            self.store.confirm_command(command_id, "CONFIRMED", response)
+        else:
+            self.store.record_cancel_requested(target_link_id, response)
+            self.store.confirm_command(command_id, "REST_ACCEPTED", response)
         return SubmissionResult(command_id, bybit_order_id, response, True)
 
     def submit_take_profits(
