@@ -12,6 +12,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+NETWORK_GUARD = ROOT / "scripts" / "truth_network_guard"
 SECRET_ENV_KEYS = (
     "BYBIT_API_KEY",
     "BYBIT_SECRET_KEY",
@@ -160,13 +161,36 @@ def main() -> int:
             "MAINNET_ENABLED": "false",
             "AI_BOT_TICKETS_ENABLED": "true",
             "AI_BOT_REQUIRED_BRAIN_RELEASE_STAGE": "live",
+            "TRUTH_REGRESSION_BLOCK_EXTERNAL_NETWORK": "1",
         }
     )
     for key in SECRET_ENV_KEYS:
         safe_env.pop(key, None)
+    existing_pythonpath = safe_env.get("PYTHONPATH", "")
+    safe_env["PYTHONPATH"] = str(NETWORK_GUARD) + (
+        os.pathsep + existing_pythonpath if existing_pythonpath else ""
+    )
 
     checks: list[dict[str, Any]] = []
     if environment_gate["status"] == "PASS":
+        checks.append(
+            _run(
+                "loopback-only network guard",
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import socket,sys; "
+                        "\ntry: socket.create_connection(('1.1.1.1',443), timeout=0.2)"
+                        "\nexcept OSError as exc:"
+                        "\n    print(type(exc).__name__ + ': ' + str(exc))"
+                        "\n    sys.exit(0 if 'truth regression blocked' in str(exc) else 2)"
+                        "\nraise SystemExit('external network guard did not block connection')"
+                    ),
+                ],
+                env=safe_env,
+            )
+        )
         checks.append(
             _run(
                 "exchange journal, async acknowledgement, duplicate event and recovery truth",
@@ -208,7 +232,7 @@ def main() -> int:
         )
         checks.append(
             _run(
-                "cross-process HTTP ticket-order-receipt shadow truth",
+                "cross-process release-gated HTTP ticket-order-receipt shadow truth",
                 [sys.executable, "scripts/run_shadow_e2e.py"],
                 env=safe_env,
             )
@@ -248,10 +272,15 @@ def main() -> int:
         "overall_status": "PASS" if required_pass else "FAIL",
         "release_conclusion": "SHADOW_ONLY",
         "environment_gate": environment_gate,
+        "child_process_network_policy": {
+            "external_tcp": "BLOCKED",
+            "allowed": ["127.0.0.0/8", "::1", "local/unix sockets"],
+            "guard": str(NETWORK_GUARD.relative_to(ROOT) / "sitecustomize.py"),
+        },
         "checks": checks,
         "external_testnet_and_time_gates": external_gates,
         "interpretation": (
-            "PASS proves reproducible software invariants in a clean shadow environment. "
+            "PASS proves reproducible software invariants in a clean, loopback-only shadow environment. "
             "It does not prove real-exchange behavior, continuous reliability, or profitability."
         ),
     }
