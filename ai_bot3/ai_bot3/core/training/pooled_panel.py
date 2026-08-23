@@ -79,8 +79,9 @@ class HorizonDataset:
     lockbox: pd.DataFrame
     folds: tuple[WalkForwardFold, ...]
     development_fingerprint: str
-    lockbox_fingerprint: str
+    lockbox_fingerprint: str | None
     lockbox_start: str
+    lockbox_labels_materialized: bool = True
 
 
 def _as_utc(series: pd.Series, name: str) -> pd.Series:
@@ -238,7 +239,47 @@ class PooledPanelBuilder:
             development_fingerprint=_frame_fingerprint(development),
             lockbox_fingerprint=_frame_fingerprint(lockbox),
             lockbox_start=lockbox_start.isoformat().replace("+00:00", "Z"),
+            lockbox_labels_materialized=True,
         )
+
+    def build_sealed_development(
+        self,
+        frame: pd.DataFrame,
+        horizon_sec: int,
+        *,
+        lockbox_start: object,
+    ) -> HorizonDataset:
+        """Build folds without materializing or fingerprinting lockbox labels."""
+
+        data = self.validate(frame, horizon_sec)
+        boundary = pd.to_datetime(lockbox_start, utc=True, errors="coerce")
+        if pd.isna(boundary):
+            raise ValueError("sealed lockbox boundary is invalid")
+        development = data[
+            (data["decision_at"] < boundary)
+            & (data["label_available_at"] < boundary)
+        ].copy().reset_index(drop=True)
+        if len(development) < self.minimum_train_rows + self.minimum_test_rows:
+            raise ValueError("sealed development panel is too small")
+        purge = int(round(horizon_sec * self.purge_multiplier))
+        embargo = int(round(horizon_sec * self.embargo_multiplier))
+        folds = self._walk_forward_folds(development, horizon_sec, purge, embargo)
+        if not folds:
+            raise ValueError("no valid sealed-development walk-forward folds")
+        return HorizonDataset(
+            horizon_sec=horizon_sec,
+            development=development,
+            lockbox=pd.DataFrame(columns=development.columns),
+            folds=folds,
+            development_fingerprint=_frame_fingerprint(development),
+            lockbox_fingerprint=None,
+            lockbox_start=boundary.isoformat().replace("+00:00", "Z"),
+            lockbox_labels_materialized=False,
+        )
+
+    @staticmethod
+    def fingerprint(frame: pd.DataFrame) -> str:
+        return _frame_fingerprint(frame)
 
     def _walk_forward_folds(
         self,
@@ -302,6 +343,12 @@ def dataset_manifest(dataset: HorizonDataset) -> dict[str, object]:
         "lockbox_rows": len(dataset.lockbox),
         "lockbox_start": dataset.lockbox_start,
         "lockbox_fingerprint": dataset.lockbox_fingerprint,
+        "lockbox_labels_materialized": dataset.lockbox_labels_materialized,
+        "lockbox_status": (
+            "MATERIALIZED"
+            if dataset.lockbox_labels_materialized
+            else "SEALED_UNLABELED"
+        ),
         "folds": [
             {
                 "fold_id": fold.fold_id,

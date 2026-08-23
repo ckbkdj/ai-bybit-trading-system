@@ -80,3 +80,37 @@ def test_label_decisions_do_not_treat_overlapping_execution_windows_as_independe
     for decision_at in decision_times:
         alternatives = [row for row in labels if row["decision_at"] == decision_at]
         assert {row["side"] for row in alternatives} == {"BUY", "SELL"}
+
+
+def test_development_label_materialization_stops_before_sealed_lockbox_path():
+    start = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    rows = []
+    for index in range(160):
+        open_at = start + timedelta(seconds=180 * index)
+        rows.append(
+            {
+                "symbol": "BTCUSDT",
+                "open_at": open_at,
+                "close_at": open_at + timedelta(seconds=179),
+                "open": 100.0,
+                "high": 100.2,
+                "low": 99.8,
+                "close": 100.01,
+                "volume": 1_000.0,
+            }
+        )
+    frame = pd.DataFrame(rows)
+    enriched = _engineer_features(frame)
+    bars = _market_bars(enriched)
+    lockbox_start = rows[130]["open_at"]
+    development_end = lockbox_start - timedelta(seconds=270)
+    labels = _panel_rows(
+        enriched,
+        180,
+        bars,
+        decision_before=development_end,
+    )
+
+    assert labels
+    assert max(row["decision_at"] for row in labels) < development_end
+    assert max(row["label_available_at"] for row in labels) < lockbox_start

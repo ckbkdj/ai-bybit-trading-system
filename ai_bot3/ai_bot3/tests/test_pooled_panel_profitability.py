@@ -11,7 +11,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from core.training.pooled_panel import PooledPanelBuilder
+from core.training.pooled_panel import PooledPanelBuilder, dataset_manifest
 
 
 def _panel(rows: int = 320) -> pd.DataFrame:
@@ -77,6 +77,24 @@ def test_panel_fingerprint_includes_feature_values_not_only_labels():
 
     assert first.development_fingerprint == second.development_fingerprint
     assert first.lockbox_fingerprint != second.lockbox_fingerprint
+
+
+def test_sealed_development_never_materializes_lockbox_labels():
+    panel = _panel()
+    boundary = panel["decision_at"].drop_duplicates().sort_values().iloc[-40]
+    dataset = PooledPanelBuilder(
+        minimum_train_rows=100,
+        minimum_test_rows=20,
+        maximum_folds=3,
+    ).build_sealed_development(panel, 180, lockbox_start=boundary)
+    manifest = dataset_manifest(dataset)
+
+    assert dataset.lockbox.empty
+    assert dataset.lockbox_fingerprint is None
+    assert dataset.lockbox_labels_materialized is False
+    assert dataset.development["label_available_at"].max() < boundary
+    assert manifest["lockbox_status"] == "SEALED_UNLABELED"
+    assert manifest["lockbox_rows"] == 0
 
 
 def test_regime_is_causal_and_future_rows_cannot_rewrite_past_labels():
