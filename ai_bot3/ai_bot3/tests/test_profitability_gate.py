@@ -9,7 +9,11 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from core.evaluation.profitability_gate import evaluate_profitability_gate, write_profitability_report
+from core.evaluation.profitability_gate import (
+    evaluate_development_gate,
+    evaluate_profitability_gate,
+    write_profitability_report,
+)
 from core.evaluation.profitability_rebuild import write_failed_outputs
 from core.evaluation.statistical_governance import TrialLedger
 from core.release.profitability_release import create_candidate_manifest
@@ -96,6 +100,22 @@ def test_profitability_gate_rejects_realized_only_or_excess_mtm_drawdown():
     )
     assert excessive.profitability_gate == "FAILED"
     assert excessive.checks["mark_to_market_drawdown"]["actual"] == 0.031
+
+
+def test_development_gate_can_pass_without_creating_a_candidate_or_opening_lockbox():
+    development = evaluate_development_gate(
+        _profitable_trades(),
+        [{"net_return": value} for value in (0.01, 0.02, -0.001, 0.015, 0.005)],
+        initial_equity_usdt=100_000,
+        two_x_cost_net_return=0.01,
+        mark_to_market_max_drawdown=0.02,
+        mark_to_market_evidence_complete=True,
+    )
+    assert development.profitability_gate == "PASSED"
+    assert development.stage == "development_validated"
+    assert development.candidate_count == 0 and development.live_count == 0
+    assert "development_oos_net_return" in development.checks
+    assert "lockbox_net_return" not in development.checks
 
 
 def test_pipeline_failure_archives_stale_candidate_manifest(tmp_path):

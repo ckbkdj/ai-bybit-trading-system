@@ -16,12 +16,13 @@ from core.backtest.event_driven import BacktestConfig, EventDrivenBacktest, Sign
 from core.evaluation.profitability_gate import (
     ProfitabilityGateResult,
     ProfitabilityThresholds,
+    evaluate_development_gate,
     evaluate_profitability_gate,
     write_profitability_report,
 )
 from core.evaluation.statistical_governance import TrialLedger, TrialRecord
 from core.labels.triple_barrier import EntrySpec, MarketBar, TripleBarrierConfig, build_triple_barrier_label
-from core.models.two_stage import TwoStageAlphaModel, TwoStageConfig, TwoStagePrediction
+from core.models.two_stage import TwoStageConfig, TwoStagePrediction
 from core.release.profitability_release import create_candidate_manifest
 from core.risk.capital_preservation import CapitalPreservationConfig, policy_report
 from core.training.pooled_panel import (
@@ -31,9 +32,17 @@ from core.training.pooled_panel import (
     causal_regime_labels,
     dataset_manifest,
 )
+from core.training.nested_walk_forward import NestedWalkForwardSelector
 
 
 SYMBOLS: tuple[str, ...] = ("BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "1000PEPEUSDT")
+MINIMUM_COVERAGE_DAYS: Mapping[str, float] = {
+    "3m": 180.0,
+    "15m": 180.0,
+    "2h": 730.0,
+    "4h": 730.0,
+    "1d": 1095.0,
+}
 SHORT_FACTOR_GROUPS: Mapping[str, tuple[str, ...]] = {
     "bybit_orderbook": ("bybit_orderbook_delta_l5", "orderbook_spread_bps", "orderbook_depth_usdt_l5", "microprice_deviation_bps"),
     "public_trades": ("public_trade_imbalance_1m", "ofi_1m", "aggressive_cvd_1m"),
@@ -60,14 +69,14 @@ class ProfitabilityRebuildConfig:
     trial_ledger_path: Path
     model_output_dir: Path
     code_commit: str
-    max_bars_per_symbol: int = 3000
+    max_bars_per_symbol: int = 200_000
     walk_forward_folds: int = 3
     lockbox_fraction: float = 0.15
     random_seed: int = 20260823
 
     def __post_init__(self) -> None:
-        if self.max_bars_per_symbol < 500:
-            raise ValueError("at least 500 bars per symbol are required")
+        if self.max_bars_per_symbol < 20_000:
+            raise ValueError("max_bars_per_symbol is too small for required short-horizon coverage")
         if not 2 <= self.walk_forward_folds <= 8:
             raise ValueError("walk_forward_folds must be between 2 and 8")
 
@@ -135,6 +144,31 @@ class KlinePanelSource:
         frame["open_at"] = pd.to_datetime(frame["open_time"], unit="ms", utc=True)
         frame["close_at"] = pd.to_datetime(frame["close_time"], unit="ms", utc=True)
         return frame.reset_index(drop=True)
+
+
+def validate_source_coverage(frame: pd.DataFrame, timeframe: str) -> dict[str, object]:
+    if timeframe not in MINIMUM_COVERAGE_DAYS:
+        raise ValueError(f"unsupported coverage timeframe: {timeframe}")
+    if frame.empty or "open_at" not in frame or "close_at" not in frame:
+        raise ValueError("source coverage requires open_at and close_at")
+    first = pd.to_datetime(frame["open_at"], utc=True, errors="coerce").min()
+    last = pd.to_datetime(frame["close_at"], utc=True, errors="coerce").max()
+    if pd.isna(first) or pd.isna(last) or last <= first:
+        raise ValueError("source coverage timestamps are invalid")
+    coverage_days = float((last - first).total_seconds() / 86_400.0)
+    minimum = float(MINIMUM_COVERAGE_DAYS[timeframe])
+    if coverage_days < minimum:
+        raise ValueError(
+            f"{timeframe} coverage {coverage_days:.2f} days is below required {minimum:.2f} days"
+        )
+    return {
+        "bars": len(frame),
+        "start": first.isoformat().replace("+00:00", "Z"),
+        "end": last.isoformat().replace("+00:00", "Z"),
+        "coverage_days": coverage_days,
+        "minimum_coverage_days": minimum,
+        "coverage_gate": "PASSED",
+    }
 
 
 def _engineer_features(frame: pd.DataFrame) -> pd.DataFrame:
@@ -334,7 +368,10 @@ def _factor_ablation_report() -> dict[str, object]:
                     "cadence": cadence,
                     "factor_group": group,
                     "factors": list(factors),
-                    "oos_ablation_status": "NOT_EVALUATED_MISSING_PIT_HISTORY",
+                    "oos_ablation_status": "FAILED_DATA_UNAVAILABLE",
+                    "evaluated": False,
+                    "pit_observation_count": 0,
+                    "oos_fold_count": 0,
                     "retained": False,
                     "formal_feature_set": False,
                 }
@@ -373,15 +410,14 @@ class ProfitabilityRebuild:
             rows: list[dict[str, object]] = []
             for symbol in SYMBOLS:
                 frame = self.source.load(symbol, timeframe, self.config.max_bars_per_symbol)
+                coverage = validate_source_coverage(frame, timeframe)
                 enriched = _engineer_features(frame)
                 bars = _market_bars(enriched)
                 market[f"{symbol}:{horizon}"] = bars
                 rows.extend(_panel_rows(enriched, horizon, bars))
                 source_evidence[f"{symbol}:{horizon}"] = {
                     "timeframe": timeframe,
-                    "bars": len(frame),
-                    "start": frame["open_at"].iloc[0].isoformat(),
-                    "end": frame["close_at"].iloc[-1].isoformat(),
+                    **coverage,
                 }
             panels[horizon] = pd.DataFrame(rows)
 
@@ -393,23 +429,37 @@ class ProfitabilityRebuild:
         )
         datasets = splitter.build(panels)
         walk_forward: list[dict[str, object]] = []
-        model_cfg = TwoStageConfig(
-            direction_iterations=80,
-            meta_iterations=80,
-            learning_rate=0.03,
-            l2=0.03,
-            ridge=2.0,
-            tail_penalty=0.75,
-            meta_trade_probability=0.60,
+        development_signals: list[SignalEvent] = []
+        candidate_configs = (
+            TwoStageConfig(
+                direction_iterations=80,
+                meta_iterations=80,
+                learning_rate=0.03,
+                l2=0.03,
+                ridge=1.0,
+                tail_penalty=0.75,
+                meta_trade_probability=0.58,
+            ),
+            TwoStageConfig(
+                direction_iterations=80,
+                meta_iterations=80,
+                learning_rate=0.03,
+                l2=0.03,
+                ridge=2.0,
+                tail_penalty=0.75,
+                meta_trade_probability=0.62,
+            ),
         )
+        selector = NestedWalkForwardSelector(candidate_configs, inner_folds=3)
         backtest = EventDrivenBacktest(BacktestConfig())
         for horizon, dataset in datasets.items():
             for fold in dataset.folds:
                 train = dataset.development.iloc[list(fold.train_indices)]
                 test = dataset.development.iloc[list(fold.test_indices)]
-                model = TwoStageAlphaModel(model_cfg).fit(train, FEATURE_COLUMNS)
-                predictions = model.predict(test)
+                selection = selector.select_and_fit(train, FEATURE_COLUMNS)
+                predictions = selection.model.predict(test)
                 signals = _signals_from_predictions(test, predictions, horizon)
+                development_signals.extend(signals)
                 report = backtest.run(signals, market)
                 walk_forward.append(
                     {
@@ -424,82 +474,166 @@ class ProfitabilityRebuild:
                         "profit_factor": report.profit_factor,
                         "purge_sec": fold.purge_sec,
                         "embargo_sec": fold.embargo_sec,
+                        "nested_selection": dict(selection.audit),
+                        "inner_candidate_results": list(selection.candidate_results),
+                        "outer_oos_used_for_tuning": False,
                     }
                 )
 
-        self.ledger.append_event(self.trial_id, "running", {"phase": "freeze_lockbox", "walk_forward_folds": len(walk_forward)})
-        lockbox_fingerprint = _hash_payload(
-            {horizon: dataset.lockbox_fingerprint for horizon, dataset in datasets.items()}
+        development_report = backtest.run(development_signals, market)
+        development_stress = backtest.run(
+            development_signals, market, cost_multiplier=2.0
         )
-        self.ledger.claim_lockbox(lockbox_fingerprint, self.trial_id, purpose="final_evaluation")
-        all_signals: list[SignalEvent] = []
-        model_paths: dict[str, str] = {}
-        for horizon, dataset in datasets.items():
-            model = TwoStageAlphaModel(model_cfg).fit(dataset.development, FEATURE_COLUMNS)
-            path = self.config.model_output_dir / self.trial_id / f"horizon_{horizon}.json"
-            model.save(path)
-            model_paths[str(horizon)] = str(path)
-            all_signals.extend(_signals_from_predictions(dataset.lockbox, model.predict(dataset.lockbox), horizon))
-
-        lockbox_report = backtest.run(all_signals, market)
-        stressed_report = backtest.run(all_signals, market, cost_multiplier=2.0)
         factor_report = _factor_ablation_report()
-        gate = evaluate_profitability_gate(
-            lockbox_report.trades,
+        execution_evidence_complete = False
+        development_gate = evaluate_development_gate(
+            development_report.trades,
             walk_forward,
-            initial_equity_usdt=lockbox_report.initial_equity_usdt,
-            two_x_cost_net_return=stressed_report.net_return,
-            execution_evidence_complete=False,
+            initial_equity_usdt=development_report.initial_equity_usdt,
+            two_x_cost_net_return=development_stress.net_return,
+            mark_to_market_max_drawdown=development_report.max_drawdown,
+            mark_to_market_evidence_complete=development_report.mark_to_market_used,
+            execution_evidence_complete=execution_evidence_complete,
             factor_ablation_complete=bool(factor_report["all_required_groups_evaluated"]),
             thresholds=ProfitabilityThresholds(),
         )
-
         output = self.config.output_dir
-        if not gate.passed:
-            _archive_candidate_manifest(output, self.trial_id)
-        write_profitability_report(output / "profitability_report.json", gate)
+        _archive_candidate_manifest(output, self.trial_id)
+        write_profitability_report(output / "profitability_report.json", development_gate)
         _atomic_json(
             output / "walk_forward_report.json",
             {
                 "trial_id": self.trial_id,
-                "method": "pooled panel walk-forward with purge and embargo",
+                "method": "nested pooled-panel walk-forward; inner OOS selects parameters, outer OOS scores once",
+                "outer_oos_used_for_tuning": False,
                 "folds": walk_forward,
-                "positive_fold_ratio": gate.metrics["positive_walk_forward_fold_ratio"],
+                "positive_fold_ratio": development_gate.metrics[
+                    "positive_walk_forward_fold_ratio"
+                ],
+                "development_portfolio": development_report.to_dict(include_trades=True),
                 "datasets": {str(h): dataset_manifest(ds) for h, ds in datasets.items()},
-            },
-        )
-        _atomic_json(
-            output / "lockbox_report.json",
-            {
-                "trial_id": self.trial_id,
-                "lockbox_fingerprint": lockbox_fingerprint,
-                "used_for_parameter_selection": False,
-                "source_evidence": source_evidence,
-                "result": lockbox_report.to_dict(include_trades=True),
             },
         )
         _atomic_json(output / "factor_ablation_report.json", factor_report)
         _atomic_json(
             output / "execution_cost_report.json",
             {
-                "execution_evidence_complete": False,
-                "normal_cost": lockbox_report.to_dict(include_trades=False),
-                "two_x_cost": stressed_report.to_dict(include_trades=False),
+                "evaluation_scope": "development_oos",
+                "execution_evidence_complete": execution_evidence_complete,
+                "normal_cost": development_report.to_dict(include_trades=False),
+                "two_x_cost": development_stress.to_dict(include_trades=False),
                 "limitations": [
                     "historical spread/depth/fill inputs are conservative OHLCV-derived proxies",
                     "PIT Bybit orderbook and public-trade histories are not present in the current store",
-                    "therefore execution evidence cannot authorize a candidate",
+                    "therefore execution evidence cannot authorize opening a new lockbox",
                 ],
             },
         )
-        _atomic_json(output / "capital_preservation_report.json", policy_report(CapitalPreservationConfig()))
+        _atomic_json(
+            output / "capital_preservation_report.json",
+            policy_report(CapitalPreservationConfig()),
+        )
+
+        if not development_gate.passed:
+            _atomic_json(
+                output / "lockbox_report.json",
+                {
+                    "trial_id": self.trial_id,
+                    "status": "SEALED_NOT_OPENED",
+                    "lockbox_evaluated": False,
+                    "used_for_parameter_selection": False,
+                    "reason": "development profitability, factor, or execution gate failed",
+                    "source_evidence": source_evidence,
+                },
+            )
+            record = TrialRecord(
+                trial_id=self.trial_id,
+                model_family="profitability_two_stage",
+                data_signature=_hash_payload(source_evidence)[:24],
+                parameter_hash=TrialLedger.parameter_hash(
+                    {
+                        "candidate_configs": [asdict(config) for config in candidate_configs],
+                        "features": FEATURE_COLUMNS,
+                        "nested_walk_forward": True,
+                    }
+                ),
+                code_commit=self.config.code_commit,
+                status="rejected",
+                metrics=development_gate.to_dict(),
+            )
+            self.ledger.append(record)
+            self.ledger.append_event(self.trial_id, "rejected", development_gate.to_dict())
+            return development_gate
+
+        self.ledger.append_event(
+            self.trial_id,
+            "running",
+            {
+                "phase": "open_new_lockbox_after_development_pass",
+                "walk_forward_folds": len(walk_forward),
+            },
+        )
+        lockbox_fingerprint = _hash_payload(
+            {horizon: dataset.lockbox_fingerprint for horizon, dataset in datasets.items()}
+        )
+        self.ledger.claim_lockbox(
+            lockbox_fingerprint, self.trial_id, purpose="final_evaluation"
+        )
+        lockbox_signals: list[SignalEvent] = []
+        model_paths: dict[str, str] = {}
+        final_selection: dict[str, object] = {}
+        for horizon, dataset in datasets.items():
+            selection = selector.select_and_fit(dataset.development, FEATURE_COLUMNS)
+            path = self.config.model_output_dir / self.trial_id / f"horizon_{horizon}.json"
+            selection.model.save(path)
+            model_paths[str(horizon)] = str(path)
+            final_selection[str(horizon)] = {
+                "audit": dict(selection.audit),
+                "candidate_results": list(selection.candidate_results),
+            }
+            lockbox_signals.extend(
+                _signals_from_predictions(
+                    dataset.lockbox,
+                    selection.model.predict(dataset.lockbox),
+                    horizon,
+                )
+            )
+
+        lockbox_report = backtest.run(lockbox_signals, market)
+        stressed_report = backtest.run(lockbox_signals, market, cost_multiplier=2.0)
+        gate = evaluate_profitability_gate(
+            lockbox_report.trades,
+            walk_forward,
+            initial_equity_usdt=lockbox_report.initial_equity_usdt,
+            two_x_cost_net_return=stressed_report.net_return,
+            mark_to_market_max_drawdown=lockbox_report.max_drawdown,
+            mark_to_market_evidence_complete=lockbox_report.mark_to_market_used,
+            execution_evidence_complete=execution_evidence_complete,
+            factor_ablation_complete=bool(factor_report["all_required_groups_evaluated"]),
+            thresholds=ProfitabilityThresholds(),
+        )
+        if not gate.passed:
+            _archive_candidate_manifest(output, self.trial_id)
+        write_profitability_report(output / "profitability_report.json", gate)
+        _atomic_json(
+            output / "lockbox_report.json",
+            {
+                "trial_id": self.trial_id,
+                "status": "EVALUATED_ONCE",
+                "lockbox_fingerprint": lockbox_fingerprint,
+                "used_for_parameter_selection": False,
+                "source_evidence": source_evidence,
+                "final_development_selection": final_selection,
+                "result": lockbox_report.to_dict(include_trades=True),
+            },
+        )
         bundle_path = self.config.model_output_dir / self.trial_id / "model_bundle.json"
         _atomic_json(
             bundle_path,
             {
                 "trial_id": self.trial_id,
                 "model_family": "profitability_two_stage",
-                "release_stage": "rejected" if not gate.passed else "candidate",
+                "release_stage": "candidate" if gate.passed else "rejected",
                 "models": model_paths,
                 "lockbox_fingerprint": lockbox_fingerprint,
             },
@@ -517,13 +651,21 @@ class ProfitabilityRebuild:
             trial_id=self.trial_id,
             model_family="profitability_two_stage",
             data_signature=_hash_payload(source_evidence)[:24],
-            parameter_hash=TrialLedger.parameter_hash({**asdict(model_cfg), "features": FEATURE_COLUMNS}),
+            parameter_hash=TrialLedger.parameter_hash(
+                {
+                    "candidate_configs": [asdict(config) for config in candidate_configs],
+                    "features": FEATURE_COLUMNS,
+                    "nested_walk_forward": True,
+                }
+            ),
             code_commit=self.config.code_commit,
             status="completed" if gate.passed else "rejected",
             metrics=gate.to_dict(),
         )
         self.ledger.append(record)
-        self.ledger.append_event(self.trial_id, "completed" if gate.passed else "rejected", gate.to_dict())
+        self.ledger.append_event(
+            self.trial_id, "completed" if gate.passed else "rejected", gate.to_dict()
+        )
         return gate
 
     def record_failure(self, reason: str) -> None:
@@ -587,6 +729,8 @@ def write_failed_outputs(output_dir: Path, *, reason: str) -> ProfitabilityGateR
 __all__: Sequence[str] = (
     "ProfitabilityRebuild",
     "ProfitabilityRebuildConfig",
+    "MINIMUM_COVERAGE_DAYS",
     "SYMBOLS",
+    "validate_source_coverage",
     "write_failed_outputs",
 )

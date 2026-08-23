@@ -50,7 +50,7 @@ def main() -> int:
         "--model-output-dir", type=Path, default=ROOT / "models" / "profitability"
     )
     parser.add_argument("--code-commit")
-    parser.add_argument("--max-bars-per-symbol", type=int, default=3000)
+    parser.add_argument("--max-bars-per-symbol", type=int, default=200_000)
     parser.add_argument("--walk-forward-folds", type=int, default=3)
     args = parser.parse_args()
     head_commit = _local_head_commit()

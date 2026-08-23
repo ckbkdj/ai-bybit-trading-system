@@ -216,6 +216,35 @@ def evaluate_profitability_gate(
     )
 
 
+def evaluate_development_gate(
+    development_oos_trades: Iterable[object],
+    walk_forward_folds: Sequence[Mapping[str, object]],
+    **kwargs: object,
+) -> ProfitabilityGateResult:
+    """Apply the full economic gate before any final lockbox may be opened."""
+
+    result = evaluate_profitability_gate(
+        development_oos_trades,
+        walk_forward_folds,
+        **kwargs,
+    )
+    checks = dict(result.checks)
+    checks["development_oos_net_return"] = checks.pop("lockbox_net_return")
+    blockers = tuple(
+        "development_oos_net_return" if blocker == "lockbox_net_return" else blocker
+        for blocker in result.blockers
+    )
+    return ProfitabilityGateResult(
+        profitability_gate=result.profitability_gate,
+        stage="development_validated" if result.passed else "rejected",
+        candidate_count=0,
+        live_count=0,
+        checks=checks,
+        metrics={**result.metrics, "evaluation_scope": "development_oos"},
+        blockers=blockers,
+    )
+
+
 def write_profitability_report(path: Path, result: ProfitabilityGateResult) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -226,6 +255,7 @@ def write_profitability_report(path: Path, result: ProfitabilityGateResult) -> N
 __all__: Sequence[str] = (
     "ProfitabilityGateResult",
     "ProfitabilityThresholds",
+    "evaluate_development_gate",
     "evaluate_profitability_gate",
     "write_profitability_report",
 )
