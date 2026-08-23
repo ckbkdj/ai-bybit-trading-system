@@ -4,7 +4,7 @@ import hashlib
 import json
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -96,13 +96,40 @@ def test_one_horizon_event_block_vetoes_the_whole_portfolio():
         assert intent is None
 
 
+def test_expired_event_block_does_not_veto_fresh_normal_horizons():
+    current = datetime(2026, 8, 21, 8, 1, tzinfo=timezone.utc)
+    scalping = _forecast("scalping", "up", 0.01)
+    mid_short = _forecast("mid_short", "up", 0.009)
+    old_event = _forecast("swing", "down", -0.02)
+    old_event = old_event.model_copy(
+        update={
+            "time": old_event.time.model_copy(
+                update={"forecast_target_at": current - timedelta(seconds=1)}
+            ),
+            "regime": old_event.regime.model_copy(
+                update={"event_regime": "blackout"}
+            ),
+        }
+    )
+
+    intent = PortfolioIntentBuilder().build(
+        [scalping, mid_short, old_event],
+        strategy_release_id=RELEASE_ID,
+        decision_version=3,
+        now=current,
+    )
+
+    assert intent is not None
+    assert {item.horizon_sec for item in intent.contributions} == {180, 900}
+
+
 def test_expired_horizons_cannot_create_a_new_portfolio_intent():
     scalping = _forecast("scalping", "up", 0.01)
     mid_short = _forecast("mid_short", "up", 0.009)
     intent = PortfolioIntentBuilder().build(
         [scalping, mid_short],
         strategy_release_id=RELEASE_ID,
-        decision_version=3,
+        decision_version=4,
         now=datetime(2026, 8, 21, 8, 20, tzinfo=timezone.utc),
     )
     assert intent is None
