@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import sqlite3
+import time
 import uuid
 from collections import defaultdict, deque
 from contextlib import closing
@@ -49,9 +50,24 @@ class StalePublicEvent(RuntimeError):
 class BybitPublicPITStore:
     """Append-only raw public market events plus standardized PIT observations."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        batch_writes: bool = False,
+        batch_max_operations: int = 1_000,
+        batch_max_interval_sec: float = 0.25,
+    ) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if batch_max_operations <= 0 or batch_max_interval_sec <= 0:
+            raise ValueError("invalid public PIT batch configuration")
+        self.batch_writes = bool(batch_writes)
+        self.batch_max_operations = int(batch_max_operations)
+        self.batch_max_interval_sec = float(batch_max_interval_sec)
+        self._batch_connection: sqlite3.Connection | None = None
+        self._pending_operations = 0
+        self._last_batch_commit = time.monotonic()
         self.registry = default_registry()
         self.quality_store = PointInTimeFeatureStore(self.path, self.registry)
         with self.connect() as connection:
@@ -101,6 +117,45 @@ class BybitPublicPITStore:
                     ON bybit_feature_observations(symbol,name,available_at,sequence);
                 """
             )
+        if self.batch_writes:
+            self._batch_connection = self.connect()
+
+    def _write_connection(self) -> tuple[sqlite3.Connection, bool]:
+        if self._batch_connection is not None:
+            return self._batch_connection, False
+        return self.connect(), True
+
+    def _complete_write(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        close_after: bool,
+        operations: int,
+    ) -> None:
+        if close_after:
+            connection.commit()
+            connection.close()
+            return
+        self._pending_operations += operations
+        now = time.monotonic()
+        if (
+            self._pending_operations >= self.batch_max_operations
+            or now - self._last_batch_commit >= self.batch_max_interval_sec
+        ):
+            self.flush()
+
+    def flush(self) -> None:
+        if self._batch_connection is None or self._pending_operations == 0:
+            return
+        self._batch_connection.commit()
+        self._pending_operations = 0
+        self._last_batch_commit = time.monotonic()
+
+    def close(self) -> None:
+        self.flush()
+        if self._batch_connection is not None:
+            self._batch_connection.close()
+            self._batch_connection = None
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(str(self.path), timeout=30)
@@ -118,6 +173,7 @@ class BybitPublicPITStore:
         symbols: Sequence[str],
         started_at: datetime,
     ) -> None:
+        self.flush()
         with self.connect() as connection:
             # A prior process can disappear without executing its cancellation
             # handler (host reboot, forced kill, interpreter crash). Reconcile
@@ -148,6 +204,7 @@ class BybitPublicPITStore:
     ) -> None:
         if status not in {"completed", "disconnected", "failed"}:
             raise ValueError("invalid capture session status")
+        self.flush()
         with self.connect() as connection:
             connection.execute(
                 """UPDATE bybit_capture_sessions
@@ -173,7 +230,8 @@ class BybitPublicPITStore:
     ) -> bool:
         encoded = _canonical(payload)
         digest = hashlib.sha256(encoded.encode()).hexdigest()
-        with self.connect() as connection:
+        connection, close_after = self._write_connection()
+        try:
             row = connection.execute(
                 "SELECT payload_sha256 FROM bybit_raw_public_events WHERE event_id=?",
                 (event_id,),
@@ -181,6 +239,8 @@ class BybitPublicPITStore:
             if row:
                 if row["payload_sha256"] != digest:
                     raise CaptureConflict("event_id already exists with different content")
+                if close_after:
+                    connection.close()
                 return False
             connection.execute(
                 """INSERT INTO bybit_raw_public_events(
@@ -203,7 +263,14 @@ class BybitPublicPITStore:
                     digest,
                 ),
             )
-            connection.commit()
+            self._complete_write(
+                connection, close_after=close_after, operations=1
+            )
+        except Exception:
+            if close_after:
+                connection.rollback()
+                connection.close()
+            raise
         return True
 
     def append_feature(
@@ -222,6 +289,7 @@ class BybitPublicPITStore:
         event_time = _utc(event_time)
         received_at = _utc(received_at)
         if event_time > received_at:
+            self.flush()
             self.quality_store.source_event(
                 source,
                 "degraded",
@@ -250,7 +318,8 @@ class BybitPublicPITStore:
             "quality": quality,
         }
         digest = hashlib.sha256(_canonical(payload).encode()).hexdigest()
-        with self.connect() as connection:
+        connection, close_after = self._write_connection()
+        try:
             row = connection.execute(
                 "SELECT payload_sha256 FROM bybit_feature_observations WHERE observation_id=?",
                 (observation_id,),
@@ -260,6 +329,8 @@ class BybitPublicPITStore:
                     raise CaptureConflict(
                         "feature observation_id already exists with different content"
                     )
+                if close_after:
+                    connection.close()
                 return False
             connection.execute(
                 """INSERT INTO bybit_feature_observations(
@@ -280,7 +351,14 @@ class BybitPublicPITStore:
                     digest,
                 ),
             )
-            connection.commit()
+            self._complete_write(
+                connection, close_after=close_after, operations=1
+            )
+        except Exception:
+            if close_after:
+                connection.rollback()
+                connection.close()
+            raise
         return True
 
     def latest_features(
@@ -355,6 +433,7 @@ class BybitPublicPITIngestor:
     ) -> None:
         lag = (_utc(received_at) - _utc(event_time)).total_seconds()
         if lag > self.maximum_event_lag_sec or lag < -2.0:
+            self.store.flush()
             self.store.quality_store.source_event(
                 source,
                 "outage",
@@ -388,6 +467,7 @@ class BybitPublicPITIngestor:
     def invalidate_books(self, reason: str, received_at: datetime) -> None:
         for book in self.books.values():
             book.valid = False
+        self.store.flush()
         self.store.quality_store.source_event(
             "bybit.public.orderbook", "outage", reason, _utc(received_at)
         )

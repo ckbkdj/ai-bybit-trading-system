@@ -14,7 +14,7 @@ from core.providers.bybit_public_pit import BybitPublicPITCollector, BybitPublic
 
 
 async def _run(args: argparse.Namespace) -> None:
-    store = BybitPublicPITStore(args.database)
+    store = BybitPublicPITStore(args.database, batch_writes=True)
     collector = BybitPublicPITCollector(
         store,
         args.symbol,
@@ -34,10 +34,13 @@ async def _run(args: argparse.Namespace) -> None:
         ),
         flush=True,
     )
-    if args.run_seconds is None:
-        await collector.run_forever()
-    else:
-        await asyncio.wait_for(collector.run_forever(), timeout=args.run_seconds)
+    try:
+        if args.run_seconds is None:
+            await collector.run_forever()
+        else:
+            await asyncio.wait_for(collector.run_forever(), timeout=args.run_seconds)
+    finally:
+        store.close()
 
 
 def main() -> int:

@@ -306,3 +306,40 @@ def test_stale_public_stream_event_fails_closed_before_raw_or_feature_acceptance
         assert connection.execute(
             "SELECT COUNT(*) FROM bybit_feature_observations"
         ).fetchone()[0] == 0
+
+
+def test_collector_batch_store_commits_explicitly_and_preserves_duplicate_identity(
+    tmp_path,
+):
+    path = tmp_path / "bybit.sqlite3"
+    store = BybitPublicPITStore(
+        path,
+        batch_writes=True,
+        batch_max_operations=1_000,
+        batch_max_interval_sec=60.0,
+    )
+    observed_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    arguments = {
+        "event_id": "batched-book",
+        "symbol": "BTCUSDT",
+        "name": "orderbook_spread_bps",
+        "value": 2.5,
+        "unit": "bps",
+        "event_time": observed_at,
+        "received_at": observed_at + timedelta(milliseconds=100),
+        "source": "bybit.public.orderbook",
+        "quality": 0.98,
+    }
+    assert store.append_feature(**arguments) is True
+    assert store.append_feature(**arguments) is False
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM bybit_feature_observations"
+        ).fetchone()[0] == 0
+
+    store.flush()
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM bybit_feature_observations"
+        ).fetchone()[0] == 1
+    store.close()
