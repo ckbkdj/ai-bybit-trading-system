@@ -63,6 +63,12 @@ def main() -> int:
         type=Path,
         default=Path(configured_bybit_pit) if configured_bybit_pit else None,
     )
+    configured_macro_pit = os.environ.get("MACRO_PIT_STORE", "").strip()
+    parser.add_argument(
+        "--macro-pit-store",
+        type=Path,
+        default=Path(configured_macro_pit) if configured_macro_pit else None,
+    )
     parser.add_argument("--max-bars-per-symbol", type=int, default=200_000)
     parser.add_argument("--walk-forward-folds", type=int, default=3)
     args = parser.parse_args()
@@ -79,6 +85,7 @@ def main() -> int:
         code_commit=head_commit,
         trad_panel_root=args.trad_panel_root,
         bybit_pit_store_path=args.bybit_pit_store,
+        macro_pit_store_path=args.macro_pit_store,
         max_bars_per_symbol=args.max_bars_per_symbol,
         walk_forward_folds=args.walk_forward_folds,
     )

@@ -46,11 +46,11 @@ from core.training.pooled_panel import (
 )
 from core.training.nested_walk_forward import NestedWalkForwardSelector
 from core.training.bybit_pit_panel import BybitPITFeatureSource
-from core.training.pit_factor_panel import (
-    TRAD_PANEL_FACTOR_GROUPS,
-    TradPanelHistorySource,
-    TRAD_PANEL_MISSING_REQUIRED_FACTORS,
+from core.training.macro_pit_panel import (
+    MACRO_FEATURE_CONTRACTS,
+    MacroPITFeatureSource,
 )
+from core.training.pit_factor_panel import TradPanelHistorySource
 
 
 SYMBOLS: tuple[str, ...] = ("BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "1000PEPEUSDT")
@@ -78,7 +78,13 @@ LONG_FACTOR_GROUPS: Mapping[str, tuple[str, ...]] = {
     "china": ("fxi_return", "kweb_return"),
     "crypto_equities": ("coin_return", "mstr_return"),
     "flows": ("crypto_etf_netflow_daily", "stablecoin_exchange_netflow_1h"),
-    "macro_vintage": ("fred_vintage_surprise", "alfred_revision_surprise"),
+    "macro_vintage": (
+        "fred_cpi_first_release_yoy_ratio",
+        "fred_payrolls_first_release_change_thousands",
+        "fred_unemployment_first_release_pct",
+        "alfred_cpi_mean_revision_delta",
+        "alfred_payrolls_mean_revision_delta",
+    ),
     "tier_a_events": ("tier_a_event_state",),
 }
 MINIMUM_ABLATION_OOS_TRADES = 30
@@ -97,6 +103,8 @@ class ProfitabilityRebuildConfig:
     trad_panel_root: Path | None = None
     verify_trad_panel_sha256: bool = True
     bybit_pit_store_path: Path | None = None
+    macro_pit_store_path: Path | None = None
+    verify_macro_raw_hashes: bool = True
     max_bars_per_symbol: int = 200_000
     walk_forward_folds: int = 3
     lockbox_fraction: float = 0.15
@@ -749,14 +757,44 @@ def _evaluate_legacy_technical_ablation(
     }
 
 
-def _evaluate_trad_panel_ablation(
+def _evaluate_long_factor_ablation(
     datasets: Mapping[int, object],
     market: Mapping[str, Sequence[MarketBar]],
     selector: NestedWalkForwardSelector,
     backtest: EventDrivenBacktest,
 ) -> dict[str, dict[str, object]]:
     results: dict[str, dict[str, object]] = {}
-    for group, columns in TRAD_PANEL_FACTOR_GROUPS.items():
+    long_datasets = {
+        horizon: dataset for horizon, dataset in datasets.items() if horizon >= 7200
+    }
+    for group, required_columns in LONG_FACTOR_GROUPS.items():
+        columns = tuple(
+            column
+            for column in required_columns
+            if long_datasets
+            and all(
+                column in dataset.development.columns
+                for dataset in long_datasets.values()
+            )
+        )
+        missing_required = tuple(
+            column for column in required_columns if column not in columns
+        )
+        if not columns:
+            results[group] = {
+                "cadence": "medium_long",
+                "factor_group": group,
+                "factors": list(required_columns),
+                "evaluated_factors": [],
+                "missing_required_factors": list(missing_required),
+                "oos_ablation_status": "FAILED_DATA_UNAVAILABLE",
+                "evaluated": False,
+                "pit_observation_count": 0,
+                "oos_fold_count": 0,
+                "retained": False,
+                "formal_feature_set": False,
+            }
+            continue
         baseline_folds: list[dict[str, float]] = []
         augmented_folds: list[dict[str, float]] = []
         fold_evidence: list[dict[str, object]] = []
@@ -842,7 +880,9 @@ def _evaluate_trad_panel_ablation(
             results[group] = {
                 "cadence": "medium_long",
                 "factor_group": group,
-                "factors": list(columns),
+                "factors": list(required_columns),
+                "evaluated_factors": list(columns),
+                "missing_required_factors": list(missing_required),
                 "oos_ablation_status": "FAILED_INSUFFICIENT_PIT_ROWS",
                 "evaluated": False,
                 "pit_observation_count": sum(
@@ -854,11 +894,10 @@ def _evaluate_trad_panel_ablation(
                 "folds": fold_evidence,
             }
             continue
-        missing_required = TRAD_PANEL_MISSING_REQUIRED_FACTORS.get(group, ())
         insufficient_execution = _failed_ablation_execution_result(
             cadence="medium_long",
             group=group,
-            factors=columns + tuple(missing_required),
+            factors=required_columns,
             fold_evidence=fold_evidence,
             baseline_folds=baseline_folds,
             augmented_folds=augmented_folds,
@@ -883,7 +922,7 @@ def _evaluate_trad_panel_ablation(
         results[group] = {
             "cadence": "medium_long",
             "factor_group": group,
-            "factors": list(columns + tuple(missing_required)),
+            "factors": list(required_columns),
             "evaluated_factors": list(columns),
             "missing_required_factors": list(missing_required),
             "oos_ablation_status": (
@@ -1116,6 +1155,12 @@ class ProfitabilityRebuild:
             self.bybit_pit_snapshot_maximum_sequence = BybitPITFeatureSource(
                 config.bybit_pit_store_path
             ).maximum_sequence()
+        self.macro_pit_snapshot_maximum_sequence = None
+        if config.macro_pit_store_path is not None:
+            self.macro_pit_snapshot_maximum_sequence = MacroPITFeatureSource(
+                config.macro_pit_store_path,
+                verify_raw_hashes=config.verify_macro_raw_hashes,
+            ).maximum_sequence()
         feature_store_stat = config.feature_store_path.stat()
         run_payload = {
             "code_commit": config.code_commit,
@@ -1132,6 +1177,13 @@ class ProfitabilityRebuild:
                 else None
             ),
             "bybit_pit_snapshot_maximum_sequence": self.bybit_pit_snapshot_maximum_sequence,
+            "macro_pit_store": (
+                str(config.macro_pit_store_path.resolve())
+                if config.macro_pit_store_path
+                else None
+            ),
+            "macro_pit_snapshot_maximum_sequence": self.macro_pit_snapshot_maximum_sequence,
+            "verify_macro_raw_hashes": config.verify_macro_raw_hashes,
             "max_bars_per_symbol": config.max_bars_per_symbol,
             "horizons": HORIZONS_SEC,
             "symbols": SYMBOLS,
@@ -1212,6 +1264,25 @@ class ProfitabilityRebuild:
                 )
             source_evidence["trad_data_service"] = trad_panel_evidence
 
+        macro_source: MacroPITFeatureSource | None = None
+        macro_history: pd.DataFrame | None = None
+        macro_pit_evidence: dict[str, object] | None = None
+        if self.config.macro_pit_store_path is not None:
+            macro_names = tuple(MACRO_FEATURE_CONTRACTS)
+            macro_source = MacroPITFeatureSource(
+                self.config.macro_pit_store_path,
+                verify_raw_hashes=self.config.verify_macro_raw_hashes,
+            )
+            macro_history, macro_pit_evidence = macro_source.load(
+                macro_names,
+                maximum_sequence=self.macro_pit_snapshot_maximum_sequence,
+            )
+            for horizon in HORIZONS_SEC:
+                panels[horizon] = macro_source.join(
+                    panels[horizon], names=macro_names, history=macro_history
+                )
+            source_evidence["fred_alfred_pit"] = macro_pit_evidence
+
         bybit_source: BybitPITFeatureSource | None = None
         bybit_history: pd.DataFrame | None = None
         bybit_names: tuple[str, ...] = ()
@@ -1290,9 +1361,9 @@ class ProfitabilityRebuild:
         evaluated_factor_groups = _evaluate_legacy_technical_ablation(
             datasets, market, selector, ablation_backtest
         )
-        if trad_panel_evidence is not None:
+        if trad_panel_evidence is not None or macro_pit_evidence is not None:
             evaluated_factor_groups.update(
-                _evaluate_trad_panel_ablation(
+                _evaluate_long_factor_ablation(
                     datasets, market, selector, ablation_backtest
                 )
             )
@@ -1331,8 +1402,8 @@ class ProfitabilityRebuild:
                     retained_factor_columns.extend(LEGACY_FACTOR_GROUPS[group])
                 if horizon in {180, 900} and group in SHORT_FACTOR_GROUPS:
                     retained_factor_columns.extend(SHORT_FACTOR_GROUPS[group])
-                if horizon >= 7200 and group in TRAD_PANEL_FACTOR_GROUPS:
-                    retained_factor_columns.extend(TRAD_PANEL_FACTOR_GROUPS[group])
+                if horizon >= 7200 and group in LONG_FACTOR_GROUPS:
+                    retained_factor_columns.extend(LONG_FACTOR_GROUPS[group])
             model_feature_columns_by_horizon[horizon] = FEATURE_COLUMNS + tuple(
                 dict.fromkeys(retained_factor_columns)
             )
