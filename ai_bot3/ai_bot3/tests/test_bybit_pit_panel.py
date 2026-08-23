@@ -94,3 +94,32 @@ def test_symbol_partitioned_bybit_history_joins_only_fresh_available_values(tmp_
         item["oos_ablation_status"] == "COLLECTING_INSUFFICIENT_PIT_HISTORY"
         for item in report.values()
     )
+
+
+def test_ofi_source_contract_keeps_legacy_trade_semantics_for_audit_only(tmp_path):
+    database = tmp_path / "bybit.sqlite3"
+    store = BybitPublicPITStore(database)
+    ingestor = BybitPublicPITIngestor(store, session_id="source-contract")
+    event_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    received = event_time + timedelta(milliseconds=250)
+    ingestor.ingest(_snapshot("BTCUSDT", event_time, 8), received_at=received)
+    store.append_feature(
+        event_id="legacy-trade-ofi",
+        symbol="BTCUSDT",
+        name="ofi_1m",
+        value=999.0,
+        unit="base_asset",
+        event_time=event_time + timedelta(seconds=1),
+        received_at=received + timedelta(seconds=1),
+        source="bybit.public.trades",
+        quality=0.98,
+    )
+
+    source = BybitPITFeatureSource(database)
+    history, evidence = source.load(["ofi_1m"])
+    assert history["source"].unique().tolist() == ["bybit.public.orderbook"]
+    assert evidence["rejected_source_contract_count"] == 1
+    latest, _ = source.latest(
+        "BTCUSDT", ["ofi_1m"], decision_at=received + timedelta(seconds=2)
+    )
+    assert latest["ofi_1m"] == 0.0

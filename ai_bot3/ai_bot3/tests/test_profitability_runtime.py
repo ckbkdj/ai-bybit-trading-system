@@ -180,7 +180,7 @@ def test_runtime_uses_fresh_symbol_specific_bybit_pit_features(tmp_path):
         unit="bps",
         event_time=received_at - timedelta(milliseconds=100),
         received_at=received_at,
-        source="bybit.ws.orderbook.50",
+        source="bybit.public.orderbook",
         quality=1.0,
     )
     alpha = generate_profitability_alpha_prediction(

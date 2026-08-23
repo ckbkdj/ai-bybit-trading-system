@@ -10,6 +10,24 @@ import pandas as pd
 from core.features.registry import FactorRegistry, default_registry
 
 
+BYBIT_FEATURE_SOURCE_CONTRACTS: Mapping[str, str] = {
+    "orderbook_spread_bps": "bybit.public.orderbook",
+    "bybit_orderbook_delta_l5": "bybit.public.orderbook",
+    "orderbook_imbalance_l5": "bybit.public.orderbook",
+    "ofi_1m": "bybit.public.orderbook",
+    "orderbook_depth_usdt_l5": "bybit.public.orderbook",
+    "microprice_deviation_bps": "bybit.public.orderbook",
+    "fill_probability": "bybit.public.orderbook",
+    "expected_slippage_bps": "bybit.public.orderbook",
+    "public_trade_imbalance_1m": "bybit.public.trades",
+    "aggressive_cvd_1m": "bybit.public.trades",
+    "perpetual_basis_bps": "bybit.public.ticker",
+    "funding_rate": "bybit.public.ticker",
+    "open_interest_change_1h": "bybit.public.ticker",
+    "liquidation_imbalance_5m": "bybit.public.liquidations",
+}
+
+
 class BybitPITFeatureSource:
     """Read symbol-partitioned Bybit observations with strict as-of joins."""
 
@@ -39,6 +57,8 @@ class BybitPITFeatureSource:
             raise ValueError("at least one Bybit PIT feature is required")
         for name in requested:
             self.registry.require(name)
+            if name not in BYBIT_FEATURE_SOURCE_CONTRACTS:
+                raise ValueError(f"Bybit PIT feature has no source contract: {name}")
         placeholders = ",".join("?" for _ in requested)
         with closing(self._connect()) as connection:
             table = connection.execute(
@@ -64,6 +84,23 @@ class BybitPITFeatureSource:
                 "observation_count": 0,
                 "symbol_count": 0,
                 "feature_coverage": {},
+            }
+        accepted_source = frame.apply(
+            lambda row: str(row["source"])
+            == BYBIT_FEATURE_SOURCE_CONTRACTS[str(row["name"])],
+            axis=1,
+        )
+        rejected_source_contract_count = int((~accepted_source).sum())
+        frame = frame.loc[accepted_source].copy()
+        if frame.empty:
+            return frame, {
+                "source": "bybit.public.pit",
+                "database": str(self.path),
+                "requested_features": list(requested),
+                "observation_count": 0,
+                "symbol_count": 0,
+                "feature_coverage": {},
+                "rejected_source_contract_count": rejected_source_contract_count,
             }
         for column in ("event_time", "available_at", "ingested_at"):
             frame[column] = pd.to_datetime(frame[column], utc=True, errors="coerce")
@@ -115,6 +152,10 @@ class BybitPITFeatureSource:
             "symbol_count": int(frame["symbol"].nunique()),
             "feature_coverage": coverage,
             "rejected_low_quality_count": rejected_low_quality_count,
+            "rejected_source_contract_count": rejected_source_contract_count,
+            "feature_source_contracts": {
+                name: BYBIT_FEATURE_SOURCE_CONTRACTS[name] for name in requested
+            },
             "pit_policy": "symbol-specific latest available_at at or before decision_at with registry staleness cutoff",
         }
 
@@ -182,15 +223,20 @@ class BybitPITFeatureSource:
         with closing(self._connect()) as connection:
             for name in names:
                 definition = self.registry.require(name)
+                expected_source = BYBIT_FEATURE_SOURCE_CONTRACTS.get(name)
+                if expected_source is None:
+                    raise ValueError(f"Bybit PIT feature has no source contract: {name}")
                 maximum_age = definition.maximum_age_sec
                 row = connection.execute(
                     """SELECT value,unit,event_time,available_at,ingested_at,quality,source
                          FROM bybit_feature_observations
-                         WHERE symbol=? AND name=? AND available_at<=? AND quality>=?
+                         WHERE symbol=? AND name=? AND source=?
+                           AND available_at<=? AND quality>=?
                          ORDER BY available_at DESC,sequence DESC LIMIT 1""",
                     (
                         normalized_symbol,
                         name,
+                        expected_source,
                         decision.isoformat().replace("+00:00", "Z"),
                         definition.minimum_quality,
                     ),
@@ -222,4 +268,7 @@ class BybitPITFeatureSource:
         }
 
 
-__all__: Sequence[str] = ("BybitPITFeatureSource",)
+__all__: Sequence[str] = (
+    "BYBIT_FEATURE_SOURCE_CONTRACTS",
+    "BybitPITFeatureSource",
+)
