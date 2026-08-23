@@ -69,13 +69,23 @@ def node_lock_integrity() -> dict[str, Any]:
 
 
 def tracked_files() -> list[Path]:
-    completed = subprocess.run(
-        [
+    """Return tracked paths in both the local split-Git layout and normal clones."""
+
+    split_git_dir = ROOT / ".version-history"
+    if split_git_dir.exists():
+        command = [
             "git",
-            f"--git-dir={ROOT / '.version-history'}",
+            f"--git-dir={split_git_dir}",
             f"--work-tree={ROOT}",
             "ls-files",
-        ],
+        ]
+    else:
+        # GitHub Actions and ordinary developer clones use the standard .git
+        # directory.  The previous hard-coded split layout made the audit itself
+        # fail before it could scan a clean checkout.
+        command = ["git", "-C", str(ROOT), "ls-files"]
+    completed = subprocess.run(
+        command,
         check=True,
         capture_output=True,
         text=True,
