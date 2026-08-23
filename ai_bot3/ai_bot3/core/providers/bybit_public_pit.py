@@ -300,6 +300,10 @@ class _Book:
     cross_sequence: int | None = None
     valid: bool = False
     imbalance_l5: float | None = None
+    best_bid: float | None = None
+    best_bid_size: float | None = None
+    best_ask: float | None = None
+    best_ask_size: float | None = None
 
 
 class BybitPublicPITIngestor:
@@ -319,6 +323,7 @@ class BybitPublicPITIngestor:
         self.trades: dict[str, Deque[tuple[datetime, float, float, str]]] = defaultdict(deque)
         self.liquidations: dict[str, Deque[tuple[datetime, float, str]]] = defaultdict(deque)
         self.open_interest: dict[str, Deque[tuple[datetime, float]]] = defaultdict(deque)
+        self.order_flow_imbalance: dict[str, Deque[tuple[datetime, float]]] = defaultdict(deque)
 
     def invalidate_books(self, reason: str, received_at: datetime) -> None:
         for book in self.books.values():
@@ -428,6 +433,12 @@ class BybitPublicPITIngestor:
             book.bids.clear()
             book.asks.clear()
             book.valid = True
+            book.best_bid = None
+            book.best_bid_size = None
+            book.best_ask = None
+            book.best_ask_size = None
+            book.imbalance_l5 = None
+            self.order_flow_imbalance[symbol].clear()
             self.store.quality_store.source_event(
                 "bybit.public.orderbook", "ok", "snapshot_recovered", received_at
             )
@@ -456,6 +467,33 @@ class BybitPublicPITIngestor:
         )
         delta = imbalance - (book.imbalance_l5 if book.imbalance_l5 is not None else imbalance)
         book.imbalance_l5 = imbalance
+        ofi_window = self.order_flow_imbalance[symbol]
+        if all(
+            value is not None
+            for value in (
+                book.best_bid,
+                book.best_bid_size,
+                book.best_ask,
+                book.best_ask_size,
+            )
+        ):
+            # Cont-style best-level OFI: bid additions/price improvements are
+            # positive, ask additions/price deterioration are negative. This
+            # is book event flow, deliberately distinct from trade CVD.
+            contribution = (
+                (best_bid_size if best_bid >= book.best_bid else 0.0)
+                - (book.best_bid_size if best_bid <= book.best_bid else 0.0)
+                - (best_ask_size if best_ask <= book.best_ask else 0.0)
+                + (book.best_ask_size if best_ask >= book.best_ask else 0.0)
+            )
+            ofi_window.append((received_at, float(contribution)))
+        book.best_bid = best_bid
+        book.best_bid_size = best_bid_size
+        book.best_ask = best_ask
+        book.best_ask_size = best_ask_size
+        ofi_cutoff = received_at - timedelta(minutes=1)
+        while ofi_window and ofi_window[0][0] < ofi_cutoff:
+            ofi_window.popleft()
         microprice = (
             best_ask * best_bid_size + best_bid * best_ask_size
         ) / max(best_bid_size + best_ask_size, 1e-12)
@@ -484,6 +522,7 @@ class BybitPublicPITIngestor:
         factors = {
             "orderbook_spread_bps": ((best_ask - best_bid) / midpoint * 10_000, "bps"),
             "bybit_orderbook_delta_l5": (delta, "ratio"),
+            "ofi_1m": (sum(value for _, value in ofi_window), "base_asset"),
             "orderbook_imbalance_l5": (imbalance, "ratio"),
             "orderbook_depth_usdt_l5": (total_depth, "usd"),
             "microprice_deviation_bps": ((microprice - midpoint) / midpoint * 10_000, "bps"),
@@ -545,7 +584,6 @@ class BybitPublicPITIngestor:
         total = buy + sell
         factors = {
             "public_trade_imbalance_1m": ((buy - sell) / total if total else 0.0, "ratio"),
-            "ofi_1m": (buy - sell, "base_asset"),
             "aggressive_cvd_1m": (buy - sell, "base_asset"),
         }
         for name, (value, unit) in factors.items():

@@ -25,10 +25,17 @@ TRAD_PANEL_INSTRUMENTS: Mapping[str, str] = {
 }
 
 TRAD_PANEL_FACTOR_GROUPS: Mapping[str, tuple[str, ...]] = {
+    "us_risk": ("spy_return", "qqq_return"),
+    "rates_usd": ("tlt_return", "uup_return"),
     "commodities": ("gld_return", "uso_return"),
     "healthcare": ("xlv_return", "ibb_return"),
     "china": ("fxi_return", "kweb_return"),
     "crypto_equities": ("coin_return", "mstr_return"),
+}
+
+TRAD_PANEL_MISSING_REQUIRED_FACTORS: Mapping[str, tuple[str, ...]] = {
+    "us_risk": ("vix_level",),
+    "rates_usd": ("real_yield_10y",),
 }
 
 
@@ -185,5 +192,6 @@ class TradPanelHistorySource:
 __all__: Sequence[str] = (
     "TRAD_PANEL_FACTOR_GROUPS",
     "TRAD_PANEL_INSTRUMENTS",
+    "TRAD_PANEL_MISSING_REQUIRED_FACTORS",
     "TradPanelHistorySource",
 )

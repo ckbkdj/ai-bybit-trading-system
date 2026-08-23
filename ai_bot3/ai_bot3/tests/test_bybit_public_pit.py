@@ -42,6 +42,7 @@ def test_orderbook_snapshot_delta_and_disconnect_are_pit_and_fail_closed(tmp_pat
         [
             "orderbook_spread_bps",
             "bybit_orderbook_delta_l5",
+            "ofi_1m",
             "orderbook_depth_usdt_l5",
             "microprice_deviation_bps",
             "fill_probability",
@@ -52,12 +53,14 @@ def test_orderbook_snapshot_delta_and_disconnect_are_pit_and_fail_closed(tmp_pat
     assert set(point) == {
         "orderbook_spread_bps",
         "bybit_orderbook_delta_l5",
+        "ofi_1m",
         "orderbook_depth_usdt_l5",
         "microprice_deviation_bps",
         "fill_probability",
         "expected_slippage_bps",
     }
     assert point["orderbook_depth_usdt_l5"]["value"] > 0
+    assert point["ofi_1m"]["value"] == 0.0
     assert 0.8 < point["fill_probability"]["value"] <= 1.0
     assert point["orderbook_spread_bps"]["available_at"].endswith(".250000Z")
     assert store.latest_features(
@@ -80,6 +83,10 @@ def test_orderbook_snapshot_delta_and_disconnect_are_pit_and_fail_closed(tmp_pat
     }
     assert ingestor.ingest(delta, received_at=delta_time + timedelta(milliseconds=250))["status"] == "accepted"
     assert ingestor.ingest(delta, received_at=delta_time + timedelta(milliseconds=300))["status"] == "duplicate"
+    ofi = store.latest_features(
+        "BTCUSDT", ["ofi_1m"], simulated_time=delta_time + timedelta(milliseconds=250)
+    )
+    assert ofi["ofi_1m"]["value"] == 3.0
 
     ingestor.invalidate_books("test_disconnect", delta_time + timedelta(seconds=1))
     after_disconnect = dict(delta)
@@ -164,7 +171,6 @@ def test_public_trades_liquidations_and_ticker_create_direct_observations(tmp_pa
         "BTCUSDT",
         [
             "public_trade_imbalance_1m",
-            "ofi_1m",
             "aggressive_cvd_1m",
             "liquidation_imbalance_5m",
             "perpetual_basis_bps",

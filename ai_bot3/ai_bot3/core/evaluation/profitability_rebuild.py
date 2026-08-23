@@ -48,6 +48,7 @@ from core.training.bybit_pit_panel import BybitPITFeatureSource
 from core.training.pit_factor_panel import (
     TRAD_PANEL_FACTOR_GROUPS,
     TradPanelHistorySource,
+    TRAD_PANEL_MISSING_REQUIRED_FACTORS,
 )
 
 
@@ -655,11 +656,19 @@ def _evaluate_trad_panel_ablation(
             minimum_improved_fold_ratio=0.60,
             minimum_worst_fold_improvement=-0.002,
         )[0]
+        missing_required = TRAD_PANEL_MISSING_REQUIRED_FACTORS.get(group, ())
+        complete_group = not missing_required
         results[group] = {
             "cadence": "medium_long",
             "factor_group": group,
-            "factors": list(columns),
-            "oos_ablation_status": "EVALUATED_OOS",
+            "factors": list(columns + tuple(missing_required)),
+            "evaluated_factors": list(columns),
+            "missing_required_factors": list(missing_required),
+            "oos_ablation_status": (
+                "EVALUATED_OOS"
+                if complete_group
+                else "EVALUATED_PARTIAL_OOS_MISSING_REQUIRED_FACTORS"
+            ),
             "evaluated": True,
             "pit_observation_count": sum(
                 int(item.get("test_rows", 0)) for item in fold_evidence
@@ -671,8 +680,9 @@ def _evaluate_trad_panel_ablation(
             "mean_improvement": comparison.mean_improvement,
             "improved_fold_ratio": comparison.improved_fold_ratio,
             "worst_fold_improvement": comparison.worst_fold_improvement,
-            "retained": comparison.retained,
-            "formal_feature_set": comparison.retained,
+            "measured_subset_would_retain": comparison.retained,
+            "retained": bool(complete_group and comparison.retained),
+            "formal_feature_set": bool(complete_group and comparison.retained),
             "folds": fold_evidence,
         }
     return results
@@ -928,6 +938,17 @@ class ProfitabilityRebuild:
             maximum_folds=self.config.walk_forward_folds,
         )
         datasets = splitter.build(panels)
+        self.ledger.append_event(
+            self.trial_id,
+            "running",
+            {
+                "phase": "labels_and_pooled_panels_ready",
+                "datasets": {
+                    str(horizon): dataset_manifest(dataset)
+                    for horizon, dataset in datasets.items()
+                },
+            },
+        )
         walk_forward: list[dict[str, object]] = []
         development_signals: list[SignalEvent] = []
         candidate_configs = (
@@ -970,6 +991,19 @@ class ProfitabilityRebuild:
                 )
             )
         factor_report = _factor_ablation_report(evaluated_factor_groups)
+        self.ledger.append_event(
+            self.trial_id,
+            "running",
+            {
+                "phase": "factor_ablation_ready",
+                "all_required_groups_evaluated": factor_report[
+                    "all_required_groups_evaluated"
+                ],
+                "retained_factor_groups": factor_report[
+                    "retained_factor_groups"
+                ],
+            },
+        )
         retained_groups = tuple(
             str(group) for group in factor_report["retained_factor_groups"]
         )
@@ -1001,6 +1035,18 @@ class ProfitabilityRebuild:
                 )
                 development_signals.extend(signals)
                 report = backtest.run(signals, market)
+                self.ledger.append_event(
+                    self.trial_id,
+                    "running",
+                    {
+                        "phase": "outer_walk_forward_fold_scored",
+                        "horizon_sec": horizon,
+                        "fold_id": fold.fold_id,
+                        "signals": len(signals),
+                        "trades": len(report.trades),
+                        "net_return": report.net_return,
+                    },
+                )
                 walk_forward.append(
                     {
                         "horizon_sec": horizon,
