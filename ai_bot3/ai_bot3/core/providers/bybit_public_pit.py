@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import sqlite3
 import time
@@ -19,6 +20,7 @@ from core.features.registry import default_registry
 
 
 BYBIT_PUBLIC_LINEAR_WS = "wss://stream.bybit.com/v5/public/linear"
+LOGGER = logging.getLogger(__name__)
 
 
 def _utc(value: datetime) -> datetime:
@@ -127,6 +129,24 @@ class BybitPublicPITStore:
                     reason TEXT NOT NULL,
                     correction_version TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS bybit_store_migrations(
+                    migration_id TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );
+                CREATE TRIGGER IF NOT EXISTS invalidate_bybit_liquidation_side_v1
+                AFTER INSERT ON bybit_feature_observations
+                WHEN NEW.name='liquidation_imbalance_5m'
+                 AND NEW.source='bybit.public.liquidations'
+                BEGIN
+                    INSERT OR IGNORE INTO bybit_feature_invalidations(
+                        observation_id,invalidated_at,reason,correction_version
+                    ) VALUES (
+                        NEW.observation_id,
+                        strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                        'Bybit allLiquidation S=Buy means a long position was liquidated; v1 inverted the side',
+                        'bybit-liquidation-side-v2'
+                    );
+                END;
                 CREATE TABLE IF NOT EXISTS bybit_historical_archive_files(
                     archive_id TEXT PRIMARY KEY,
                     data_kind TEXT NOT NULL,
@@ -208,21 +228,43 @@ class BybitPublicPITStore:
                     """ALTER TABLE bybit_feature_observations
                        ADD COLUMN api_batch_id TEXT"""
                 )
-            # The original liquidation-side interpretation was the inverse of
-            # Bybit's documented position-side contract. Preserve those rows for
-            # audit, but make them ineligible everywhere before v2 is rebuilt.
-            connection.execute(
-                """INSERT OR IGNORE INTO bybit_feature_invalidations(
-                       observation_id,invalidated_at,reason,correction_version
-                   )
-                   SELECT observation_id,?,
-                          'Bybit allLiquidation S=Buy means a long position was liquidated; v1 inverted the side',
-                          'bybit-liquidation-side-v2'
-                     FROM bybit_feature_observations
-                    WHERE name='liquidation_imbalance_5m'
-                      AND source='bybit.public.liquidations'""",
-                (_iso(datetime.now(timezone.utc)),),
-            )
+            migration_id = "invalidate-bybit-liquidation-side-v1"
+            migration_applied = connection.execute(
+                "SELECT 1 FROM bybit_store_migrations WHERE migration_id=?",
+                (migration_id,),
+            ).fetchone()
+            if not migration_applied:
+                # Databases upgraded by an earlier build already have the
+                # append-only invalidation evidence but not this migration
+                # marker. Avoid rescanning millions of observations at every
+                # collector restart when that evidence is present.
+                prior_evidence = connection.execute(
+                    """SELECT 1 FROM bybit_feature_invalidations
+                         WHERE correction_version='bybit-liquidation-side-v2'
+                         LIMIT 1"""
+                ).fetchone()
+                applied_at = _iso(datetime.now(timezone.utc))
+                if not prior_evidence:
+                    # The original liquidation-side interpretation was the
+                    # inverse of Bybit's documented position-side contract.
+                    # Preserve those rows for audit, but make them ineligible.
+                    connection.execute(
+                        """INSERT OR IGNORE INTO bybit_feature_invalidations(
+                               observation_id,invalidated_at,reason,correction_version
+                           )
+                           SELECT observation_id,?,
+                                  'Bybit allLiquidation S=Buy means a long position was liquidated; v1 inverted the side',
+                                  'bybit-liquidation-side-v2'
+                             FROM bybit_feature_observations
+                            WHERE name='liquidation_imbalance_5m'
+                              AND source='bybit.public.liquidations'""",
+                        (applied_at,),
+                    )
+                connection.execute(
+                    """INSERT INTO bybit_store_migrations(migration_id,applied_at)
+                       VALUES (?,?)""",
+                    (migration_id, applied_at),
+                )
         if self.batch_writes:
             self._batch_connection = self.connect()
 
@@ -1385,7 +1427,12 @@ class BybitPublicPITCollector:
                 backoff = 1.0
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                LOGGER.warning(
+                    "Bybit public collector retry after %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
                 await asyncio.sleep(backoff)
                 backoff = min(maximum_backoff_sec, backoff * 2.0)
 

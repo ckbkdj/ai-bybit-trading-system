@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
@@ -13,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from core.providers.bybit_public_pit import (
+    BybitPublicPITCollector,
     BybitPublicPITIngestor,
     BybitPublicPITStore,
     StalePublicEvent,
@@ -55,6 +58,26 @@ def test_new_capture_session_reconciles_unclean_previous_process(tmp_path):
         "collector_restarted_after_unclean_shutdown",
     )
     assert replacement == ("running",)
+
+
+def test_liquidation_v1_invalidation_migration_has_durable_marker(tmp_path):
+    path = tmp_path / "bybit.sqlite3"
+    store = BybitPublicPITStore(path)
+    with store.connect() as connection:
+        marker = connection.execute(
+            """SELECT migration_id FROM bybit_store_migrations
+                 WHERE migration_id='invalidate-bybit-liquidation-side-v1'"""
+        ).fetchone()
+    assert marker[0] == "invalidate-bybit-liquidation-side-v1"
+    store.close()
+
+    # Reopening uses the marker instead of repeating the historical scan.
+    reopened = BybitPublicPITStore(path)
+    with reopened.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM bybit_store_migrations"
+        ).fetchone()[0] == 1
+    reopened.close()
 
 
 def test_orderbook_snapshot_delta_and_disconnect_are_pit_and_fail_closed(tmp_path):
@@ -477,4 +500,26 @@ def test_batched_snapshot_quality_recovery_does_not_deadlock_its_writer(tmp_path
         assert connection.execute(
             "SELECT COUNT(*) FROM bybit_feature_observations"
         ).fetchone()[0] == 8
+    store.close()
+
+
+def test_collector_retry_failure_is_visible_in_operational_logs(
+    tmp_path, monkeypatch, caplog
+):
+    store = BybitPublicPITStore(tmp_path / "bybit.sqlite3", batch_writes=True)
+    collector = BybitPublicPITCollector(store, ["BTCUSDT"])
+
+    async def fail_before_session():
+        raise sqlite3.OperationalError("database is locked")
+
+    async def stop_after_first_retry(_seconds):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(collector, "run_once", fail_before_session)
+    monkeypatch.setattr(asyncio, "sleep", stop_after_first_retry)
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(collector.run_forever())
+    assert "Bybit public collector retry after OperationalError" in caplog.text
+    assert "database is locked" in caplog.text
     store.close()
