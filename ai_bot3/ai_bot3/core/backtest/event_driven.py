@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Iterable, Mapping, Sequence
 
 from core.labels.triple_barrier import (
@@ -82,6 +82,7 @@ class TradeRecord:
     gross_return: float
     net_return: float
     fee_cost: float
+    entry_fee_cost: float
     slippage_cost: float
     funding_cost: float
     mae: float
@@ -111,6 +112,7 @@ class EquityPoint:
     unrealized_pnl_usdt: float
     gross_exposure_usdt: float
     active_positions: int
+    mark_kind: str = "bar_close"
 
     def to_dict(self) -> dict[str, object]:
         payload = asdict(self)
@@ -160,59 +162,95 @@ def _mark_to_market_curve(
     trades: Sequence[TradeRecord],
     market_bars: Mapping[str, Sequence[MarketBar]],
     initial_equity: float,
+    *,
+    until: datetime | None = None,
 ) -> tuple[EquityPoint, ...]:
     if not trades:
         return ()
     bars_by_key = {
-        str(key): sorted(values, key=lambda bar: (bar.available_at, bar.close_time))
+        str(key): sorted(values, key=lambda bar: (bar.close_time, bar.available_at))
         for key, values in market_bars.items()
     }
+    cutoff = until.astimezone(timezone.utc) if until is not None else None
     observations = {trade.decision_at for trade in trades}
     observations.update(trade.entry_at for trade in trades)
     observations.update(trade.exit_at for trade in trades)
+    bar_observations: set[datetime] = set()
     for trade in trades:
         for bar in bars_by_key.get(trade.market_key, ()):
-            if trade.entry_at <= bar.available_at <= trade.exit_at:
-                observations.add(bar.available_at)
-    points: list[EquityPoint] = []
-    for observed_at in sorted(observations):
-        realized = sum(trade.net_pnl for trade in trades if trade.exit_at <= observed_at)
+            if cutoff is not None and bar.available_at > cutoff:
+                continue
+            if bar.close_time <= trade.entry_at or bar.open_time >= trade.exit_at:
+                continue
+            observed_at = min(bar.close_time, trade.exit_at)
+            observations.add(observed_at)
+            bar_observations.add(observed_at)
+    if cutoff is not None:
+        observations = {value for value in observations if value <= cutoff}
+        bar_observations = {value for value in bar_observations if value <= cutoff}
+
+    def point_at(observed_at: datetime, *, adverse: bool) -> EquityPoint:
+        # At an exit timestamp the conservative intrabar point is evaluated
+        # immediately before settlement; the close point is evaluated after it.
+        realized = sum(
+            trade.net_pnl
+            for trade in trades
+            if trade.exit_at < observed_at or (not adverse and trade.exit_at == observed_at)
+        )
         unrealized = 0.0
         gross_exposure = 0.0
         active_positions = 0
         for trade in trades:
-            if not (trade.entry_at <= observed_at < trade.exit_at):
+            active = trade.entry_at <= observed_at and (
+                trade.exit_at > observed_at or (adverse and trade.exit_at == observed_at)
+            )
+            if not active:
                 continue
             active_positions += 1
             gross_exposure += trade.notional_usdt
             mark = trade.entry_fill_price
+            current_bar: MarketBar | None = None
+            accrued_funding_bps = 0.0
             for bar in bars_by_key.get(trade.market_key, ()):
-                if bar.available_at > observed_at:
+                if cutoff is not None and bar.available_at > cutoff:
+                    continue
+                if bar.close_time > observed_at:
                     break
-                if bar.close_time > trade.entry_at:
-                    mark = bar.close
+                if bar.close_time <= trade.entry_at:
+                    continue
+                if bar.open_time >= trade.exit_at:
+                    break
+                mark = bar.close
+                accrued_funding_bps += bar.funding_bps
+                if bar.open_time < trade.exit_at and bar.close_time >= observed_at:
+                    current_bar = bar
+            if adverse and current_bar is not None:
+                mark = current_bar.low if trade.side == "BUY" else current_bar.high
             direction = 1.0 if trade.side == "BUY" else -1.0
             gross_open_pnl = trade.notional_usdt * direction * (
                 mark / trade.entry_fill_price - 1.0
             )
-            holding_seconds = max(1.0, (trade.exit_at - trade.entry_at).total_seconds())
-            elapsed_fraction = min(
-                1.0,
-                max(0.0, (observed_at - trade.entry_at).total_seconds()) / holding_seconds,
+            accrued_funding = (
+                trade.notional_usdt * direction * accrued_funding_bps / 10_000.0
             )
-            entry_cost = 0.5 * (trade.fee_cost + trade.slippage_cost)
-            accrued_funding = trade.funding_cost * elapsed_fraction
-            unrealized += gross_open_pnl - entry_cost - accrued_funding
-        points.append(
-            EquityPoint(
-                observed_at=observed_at,
-                equity_usdt=initial_equity + realized + unrealized,
-                realized_pnl_usdt=realized,
-                unrealized_pnl_usdt=unrealized,
-                gross_exposure_usdt=gross_exposure,
-                active_positions=active_positions,
-            )
+            # Fill-to-mark PnL already embeds entry slippage.  Only the entry
+            # fee is a separate cash debit while the position remains open.
+            unrealized += gross_open_pnl - trade.entry_fee_cost - accrued_funding
+        return EquityPoint(
+            observed_at=observed_at,
+            equity_usdt=initial_equity + realized + unrealized,
+            realized_pnl_usdt=realized,
+            unrealized_pnl_usdt=unrealized,
+            gross_exposure_usdt=gross_exposure,
+            active_positions=active_positions,
+            mark_kind="intrabar_adverse" if adverse else "bar_close",
         )
+
+    points: list[EquityPoint] = []
+    for observed_at in sorted(observations):
+        if observed_at in bar_observations:
+            points.append(point_at(observed_at, adverse=True))
+        points.append(point_at(observed_at, adverse=False))
     return tuple(points)
 
 
@@ -256,32 +294,23 @@ class EventDrivenBacktest:
         )
         ordered = sorted(signals, key=lambda item: (item.decision_at, item.signal_id))
         equity = cfg.initial_equity_usdt
-        peak = equity
         curve = [equity]
         trades: list[TradeRecord] = []
         pending: list[TradeRecord] = []
         active_until: dict[str, datetime] = {}
         rejected: dict[str, int] = defaultdict(int)
-        daily_pnl: dict[str, float] = defaultdict(float)
-        weekly_pnl: dict[str, float] = defaultdict(float)
         gross_profit = 0.0
         gross_loss = 0.0
 
         def settle_until(timestamp: datetime) -> None:
-            nonlocal equity, peak, gross_profit, gross_loss
+            nonlocal equity, gross_profit, gross_loss
             due = sorted(
                 (trade for trade in pending if trade.exit_at <= timestamp),
                 key=lambda trade: (trade.exit_at, trade.signal_id),
             )
             for trade in due:
                 equity += trade.net_pnl
-                peak = max(peak, equity)
                 curve.append(equity)
-                exit_day = trade.exit_at.date().isoformat()
-                exit_iso = trade.exit_at.isocalendar()
-                exit_week = f"{exit_iso.year}-W{exit_iso.week:02d}"
-                daily_pnl[exit_day] += trade.net_pnl
-                weekly_pnl[exit_week] += trade.net_pnl
                 if trade.net_pnl >= 0:
                     gross_profit += trade.net_pnl
                 else:
@@ -303,23 +332,40 @@ class EventDrivenBacktest:
             if active_until.get(symbol, datetime.min.replace(tzinfo=timezone.utc)) > now:
                 rejected["averaging_down_or_overlapping_position"] += 1
                 continue
-            day = now.date().isoformat()
-            iso = now.isocalendar()
-            week = f"{iso.year}-W{iso.week:02d}"
-            if daily_pnl[day] <= -cfg.initial_equity_usdt * cfg.daily_loss_limit:
+            state_curve = _mark_to_market_curve(
+                trades,
+                market_bars,
+                cfg.initial_equity_usdt,
+                until=now,
+            )
+            current_equity = state_curve[-1].equity_usdt if state_curve else equity
+            day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            week_start = day_start - timedelta(days=day_start.weekday())
+
+            def equity_before(cutoff: datetime) -> float:
+                prior = [point.equity_usdt for point in state_curve if point.observed_at < cutoff]
+                return prior[-1] if prior else cfg.initial_equity_usdt
+
+            if current_equity <= equity_before(day_start) * (1.0 - cfg.daily_loss_limit):
                 rejected["daily_loss_limit"] += 1
                 continue
-            if weekly_pnl[week] <= -cfg.initial_equity_usdt * cfg.weekly_loss_limit:
+            if current_equity <= equity_before(week_start) * (1.0 - cfg.weekly_loss_limit):
                 rejected["weekly_loss_limit"] += 1
                 continue
-            if peak > 0 and (peak - equity) / peak >= cfg.equity_drawdown_limit:
+            state_values = [cfg.initial_equity_usdt] + [
+                point.equity_usdt for point in state_curve
+            ]
+            if _drawdown(state_values) >= cfg.equity_drawdown_limit:
                 rejected["equity_drawdown_limit"] += 1
                 continue
-            risk_notional = equity * cfg.risk_per_trade / max(signal.stop_loss_bps / 10_000.0, 1e-12)
-            leverage_notional = equity * cfg.leverage_cap
+            if current_equity <= 0:
+                rejected["non_positive_equity"] += 1
+                continue
+            risk_notional = current_equity * cfg.risk_per_trade / max(signal.stop_loss_bps / 10_000.0, 1e-12)
+            leverage_notional = current_equity * cfg.leverage_cap
             portfolio_available = max(
                 0.0,
-                equity * cfg.max_gross_exposure - sum(trade.notional_usdt for trade in pending),
+                current_equity * cfg.max_gross_exposure - sum(trade.notional_usdt for trade in pending),
             )
             notional = min(risk_notional, leverage_notional, portfolio_available)
             if signal.requested_notional_usdt is not None:
@@ -364,6 +410,8 @@ class EventDrivenBacktest:
             gross_pnl = filled_notional * label.gross_return
             net_pnl = filled_notional * label.net_return
             fee_cost = filled_notional * label.fee_return
+            entry_fee_bps = execution.maker_fee_bps if signal.maker_entry else execution.taker_fee_bps
+            entry_fee_cost = filled_notional * entry_fee_bps / 10_000.0
             slippage_cost = filled_notional * label.slippage_return
             funding_cost = filled_notional * label.funding_return
             cancel_at = now.timestamp() + signal.max_wait_sec
@@ -383,6 +431,7 @@ class EventDrivenBacktest:
                 gross_return=label.gross_return,
                 net_return=label.net_return,
                 fee_cost=fee_cost,
+                entry_fee_cost=entry_fee_cost,
                 slippage_cost=slippage_cost,
                 funding_cost=funding_cost,
                 mae=label.mae,

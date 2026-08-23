@@ -188,12 +188,32 @@ def _entry_bar(spec: EntrySpec, bars: Sequence[MarketBar], config: TripleBarrier
     for bar in bars:
         if bar.symbol.upper() != spec.symbol.upper() or bar.close_time <= activation:
             continue
-        if max(bar.open_time, activation) > timeout:
+        if bar.open_time > timeout:
             break
+        if spec.order_type == "LIMIT" and (
+            bar.open_time < activation or bar.close_time > timeout
+        ):
+            # A completed OHLC bar cannot establish whether a limit touch in a
+            # straddling bar happened after activation and before cancellation.
+            # Treat that ambiguity as no fill instead of leaking the full bar.
+            continue
         probability = _fill_probability(spec, bar)
         if probability > 0:
             return bar, probability
     return None, 0.0
+
+
+def _timeout_available_at(
+    spec: EntrySpec,
+    bars: Sequence[MarketBar],
+) -> datetime:
+    """Earliest observation that can establish an entry timeout."""
+
+    timeout = _utc(spec.signal_at) + timedelta(seconds=spec.max_wait_sec)
+    for bar in bars:
+        if bar.close_time >= timeout:
+            return max(timeout, bar.available_at)
+    return max(timeout, bars[-1].available_at if bars else timeout)
 
 
 def build_triple_barrier_label(
@@ -217,7 +237,7 @@ def build_triple_barrier_label(
         raise ValueError("all bars must match EntrySpec.symbol")
     entry_bar, probability = _entry_bar(spec, ordered, cfg)
     if entry_bar is None:
-        available = max(_utc(spec.signal_at) + timedelta(seconds=spec.max_wait_sec), ordered[-1].available_at)
+        available = _timeout_available_at(spec, ordered)
         return _empty_label(spec, available, "ENTRY_TIMEOUT")
 
     notional = spec.reference_price * spec.quantity
@@ -231,27 +251,60 @@ def build_triple_barrier_label(
         return _empty_label(spec, entry_bar.available_at, "UNFILLED")
 
     direction = 1.0 if spec.side == "BUY" else -1.0
-    entry_fill_at = max(entry_bar.open_time, _utc(spec.signal_at) + timedelta(milliseconds=cfg.latency_ms))
-    entry_reference = spec.limit_price if spec.order_type == "LIMIT" else entry_bar.open
+    activation = _utc(spec.signal_at) + timedelta(milliseconds=cfg.latency_ms)
+    # A market decision already carries a PIT-safe reference price.  Reusing a
+    # candle open from before a mid-bar activation would be lookahead/mispricing.
+    entry_reference = spec.limit_price if spec.order_type == "LIMIT" else spec.reference_price
+    # A limit touch has no event timestamp in OHLC data.  It is only established
+    # when the completed bar becomes known, so its fill time is conservative.
+    entry_fill_at = entry_bar.close_time if spec.order_type == "LIMIT" else activation
     entry_slippage_bps = _slippage_bps(entry_bar, notional * fill_fraction, cfg)
     entry_fill = entry_reference * (1.0 + direction * entry_slippage_bps / 10_000.0)
     take_profit = entry_fill * (1.0 + direction * spec.take_profit_bps / 10_000.0)
     stop_loss = entry_fill * (1.0 - direction * spec.stop_loss_bps / 10_000.0)
     expiry = entry_fill_at + timedelta(seconds=spec.max_holding_sec)
 
-    path = [bar for bar in ordered if bar.close_time > entry_fill_at and bar.open_time <= expiry]
+    # Only completed bars at or before expiry may trigger a barrier.  Using the
+    # high/low/close of a bar that straddles max holding would incorporate price
+    # action after the position should already be closed.
+    path = [
+        bar
+        for bar in ordered
+        if bar.close_time > entry_fill_at and bar.close_time <= expiry
+    ]
     exit_bar: MarketBar | None = None
     exit_reference: float | None = None
+    exit_at: datetime | None = None
     exit_reason: ExitReason = "NO_EXIT_OBSERVATION"
     mfe = 0.0
     mae = 0.0
     for bar in path:
-        favorable = (bar.high / entry_fill - 1.0) if direction > 0 else (entry_fill / bar.low - 1.0)
-        adverse = (entry_fill / bar.low - 1.0) if direction > 0 else (bar.high / entry_fill - 1.0)
+        entry_bar_ambiguous = (
+            bar is entry_bar
+            and bar.open_time < entry_fill_at < bar.close_time
+        )
+        favorable = (
+            bar.high / entry_fill - 1.0
+            if direction > 0
+            else 1.0 - bar.low / entry_fill
+        )
+        adverse = (
+            1.0 - bar.low / entry_fill
+            if direction > 0
+            else bar.high / entry_fill - 1.0
+        )
+        # The adverse extreme is retained as a conservative same-bar bound. A
+        # favorable extreme cannot be credited because it may predate the fill.
+        if entry_bar_ambiguous:
+            favorable = 0.0
         mfe = max(mfe, favorable)
         mae = max(mae, adverse)
         stop_hit = bar.low <= stop_loss if direction > 0 else bar.high >= stop_loss
-        target_hit = bar.high >= take_profit if direction > 0 else bar.low <= take_profit
+        target_hit = (
+            False
+            if entry_bar_ambiguous
+            else (bar.high >= take_profit if direction > 0 else bar.low <= take_profit)
+        )
         if stop_hit and target_hit:
             exit_reason = "STOP_LOSS" if cfg.stop_first_when_same_bar else "TAKE_PROFIT"
             exit_reference = stop_loss if cfg.stop_first_when_same_bar else take_profit
@@ -259,17 +312,18 @@ def build_triple_barrier_label(
             exit_reason, exit_reference = "STOP_LOSS", stop_loss
         elif target_hit:
             exit_reason, exit_reference = "TAKE_PROFIT", take_profit
-        elif bar.close_time >= expiry:
-            exit_reason, exit_reference = "MAX_HOLDING", bar.close
         if exit_reference is not None:
             exit_bar = bar
+            exit_at = bar.close_time
             break
 
-    if exit_bar is None and path:
+    source_covers_expiry = bool(ordered and ordered[-1].close_time >= expiry)
+    if exit_bar is None and path and source_covers_expiry:
         exit_bar = path[-1]
         exit_reference = exit_bar.close
-        exit_reason = "MAX_HOLDING" if exit_bar.close_time >= expiry else "NO_EXIT_OBSERVATION"
-    if exit_bar is None or exit_reference is None:
+        exit_reason = "MAX_HOLDING"
+        exit_at = expiry
+    if exit_bar is None or exit_reference is None or exit_at is None:
         return _empty_label(spec, ordered[-1].available_at, "NO_EXIT_OBSERVATION", probability=probability)
 
     exit_slippage_bps = _slippage_bps(exit_bar, notional * fill_fraction, cfg)
@@ -284,7 +338,7 @@ def build_triple_barrier_label(
     funding_return = direction * funding_bps / 10_000.0
     net_return = gross_return - fee_return - slippage_return - funding_return
     label_id = hashlib.sha256(
-        f"{spec.symbol}|{spec.side}|{_utc(spec.signal_at).isoformat()}|{entry_fill_at.isoformat()}|{exit_bar.close_time.isoformat()}".encode()
+        f"{spec.symbol}|{spec.side}|{_utc(spec.signal_at).isoformat()}|{entry_fill_at.isoformat()}|{exit_at.isoformat()}".encode()
     ).hexdigest()[:32]
     return TripleBarrierLabel(
         label_id=label_id,
@@ -292,8 +346,8 @@ def build_triple_barrier_label(
         side=spec.side,
         signal_at=_utc(spec.signal_at),
         entry_fill_at=entry_fill_at,
-        exit_at=min(exit_bar.close_time, expiry),
-        label_available_at=exit_bar.available_at,
+        exit_at=exit_at,
+        label_available_at=max(exit_bar.available_at, exit_at),
         entry_reference_price=float(entry_reference),
         entry_fill_price=float(entry_fill),
         exit_reference_price=float(exit_reference),

@@ -297,6 +297,10 @@ def _panel_rows(
                 path,
                 TripleBarrierConfig(),
             )
+        # An incomplete holding path is not a zero-return observation.  It has
+        # no valid target and must not contaminate either level of the model.
+        if any(label.exit_reason == "NO_EXIT_OBSERVATION" for label in labels.values()):
+            continue
         long_net = labels["BUY"].net_return
         short_net = labels["SELL"].net_return
         if max(long_net, short_net) <= 0:
