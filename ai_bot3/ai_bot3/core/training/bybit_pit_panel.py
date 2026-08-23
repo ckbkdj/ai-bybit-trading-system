@@ -79,6 +79,8 @@ class BybitPITFeatureSource:
             "ingested_at",
             "source",
             "quality",
+            "provenance_kind",
+            "archive_id",
         ]
         payload = frame[columns].copy().sort_values("sequence")
         for column in ("event_time", "available_at", "ingested_at"):
@@ -122,9 +124,24 @@ class BybitPITFeatureSource:
             ).fetchone()
             if not table:
                 raise RuntimeError("Bybit PIT database predates symbol-partitioned features")
+            feature_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(bybit_feature_observations)"
+                ).fetchall()
+            }
+            provenance_expression = (
+                "provenance_kind"
+                if "provenance_kind" in feature_columns
+                else "'legacy_live_capture' AS provenance_kind"
+            )
+            archive_expression = (
+                "archive_id" if "archive_id" in feature_columns else "NULL AS archive_id"
+            )
             rows = connection.execute(
                 f"""SELECT sequence,observation_id,symbol,name,value,unit,event_time,
-                            available_at,ingested_at,source,quality
+                            available_at,ingested_at,source,quality,
+                            {provenance_expression},{archive_expression}
                        FROM bybit_feature_observations
                       WHERE name IN ({placeholders}) AND sequence<=?
                       ORDER BY symbol,name,available_at,sequence""",
@@ -173,6 +190,50 @@ class BybitPITFeatureSource:
         )
         if violation.any():
             raise RuntimeError("Bybit PIT feature chronology invariant failed")
+        allowed_provenance = {
+            "live_capture",
+            "legacy_live_capture",
+            "historical_archive_replay",
+        }
+        if not set(frame["provenance_kind"].astype(str)).issubset(allowed_provenance):
+            raise RuntimeError("Bybit PIT feature provenance kind is invalid")
+        archive_frame = frame[
+            frame["provenance_kind"] == "historical_archive_replay"
+        ].copy()
+        archive_provenance: list[dict[str, object]] = []
+        if not archive_frame.empty:
+            if archive_frame["archive_id"].isna().any():
+                raise RuntimeError("historical archive feature has no archive_id")
+            archive_ids = tuple(sorted(set(archive_frame["archive_id"].astype(str))))
+            placeholders = ",".join("?" for _ in archive_ids)
+            with closing(self._connect()) as connection:
+                archive_rows = connection.execute(
+                    f"""SELECT archive_id,data_kind,market,symbol,trading_date,
+                                source_url,fetched_at,content_length,content_sha256,
+                                rows_read,feature_observation_count,status
+                           FROM bybit_historical_archive_files
+                          WHERE archive_id IN ({placeholders})""",
+                    archive_ids,
+                ).fetchall()
+            by_id = {str(row["archive_id"]): dict(row) for row in archive_rows}
+            missing_archive_ids = sorted(set(archive_ids).difference(by_id))
+            if missing_archive_ids:
+                raise RuntimeError("historical archive feature provenance record is missing")
+            incomplete = [
+                archive_id
+                for archive_id, row in by_id.items()
+                if str(row["status"]) != "completed"
+            ]
+            if incomplete:
+                raise RuntimeError("historical archive feature references an incomplete file")
+            for archive_id, group in archive_frame.groupby("archive_id", sort=True):
+                record = by_id[str(archive_id)]
+                if set(group["symbol"].astype(str)) != {str(record["symbol"])}:
+                    raise RuntimeError("historical archive feature symbol provenance mismatch")
+                event_dates = set(group["event_time"].dt.date.astype(str))
+                if event_dates != {str(record["trading_date"])}:
+                    raise RuntimeError("historical archive feature day provenance mismatch")
+                archive_provenance.append(record)
         expected_units = {
             name: self.registry.require(name).unit for name in requested
         }
@@ -217,6 +278,17 @@ class BybitPITFeatureSource:
             "feature_source_contracts": {
                 name: BYBIT_FEATURE_SOURCE_CONTRACTS[name] for name in requested
             },
+            "provenance_observation_counts": {
+                str(kind): int(count)
+                for kind, count in frame["provenance_kind"].value_counts().items()
+            },
+            "historical_archive_files": archive_provenance,
+            "historical_archive_file_count": len(archive_provenance),
+            "historical_archive_claim": (
+                "exchange-event-time replay with conservative simulated availability; not live capture"
+                if archive_provenance
+                else None
+            ),
             "snapshot_maximum_sequence": frozen_sequence,
             "snapshot_sha256": self._snapshot_digest(frame),
             "pit_policy": "symbol-specific latest available_at at or before decision_at with registry staleness cutoff",

@@ -115,8 +115,46 @@ class BybitPublicPITStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_bybit_feature_pit
                     ON bybit_feature_observations(symbol,name,available_at,sequence);
+                CREATE TABLE IF NOT EXISTS bybit_historical_archive_files(
+                    archive_id TEXT PRIMARY KEY,
+                    data_kind TEXT NOT NULL,
+                    market TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    trading_date TEXT NOT NULL,
+                    source_url TEXT NOT NULL,
+                    fetched_at TEXT NOT NULL,
+                    content_length INTEGER NOT NULL,
+                    content_sha256 TEXT NOT NULL,
+                    member_name TEXT,
+                    member_size INTEGER,
+                    first_event_time TEXT,
+                    last_event_time TEXT,
+                    rows_read INTEGER NOT NULL DEFAULT 0,
+                    feature_observation_count INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL,
+                    error TEXT,
+                    UNIQUE(data_kind,market,symbol,trading_date)
+                );
+                CREATE INDEX IF NOT EXISTS idx_bybit_archive_status
+                    ON bybit_historical_archive_files(status,data_kind,trading_date,symbol);
                 """
             )
+            feature_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(bybit_feature_observations)"
+                ).fetchall()
+            }
+            if "provenance_kind" not in feature_columns:
+                connection.execute(
+                    """ALTER TABLE bybit_feature_observations
+                       ADD COLUMN provenance_kind TEXT NOT NULL DEFAULT 'live_capture'"""
+                )
+            if "archive_id" not in feature_columns:
+                connection.execute(
+                    """ALTER TABLE bybit_feature_observations
+                       ADD COLUMN archive_id TEXT"""
+                )
         if self.batch_writes:
             self._batch_connection = self.connect()
 
@@ -285,16 +323,18 @@ class BybitPublicPITStore:
         received_at: datetime,
         source: str,
         quality: float,
+        ingested_at: datetime | None = None,
     ) -> bool:
         event_time = _utc(event_time)
         received_at = _utc(received_at)
-        if event_time > received_at:
+        ingested_at = _utc(ingested_at or received_at)
+        if event_time > received_at or received_at > ingested_at:
             self.flush()
             self.quality_store.source_event(
                 source,
                 "degraded",
-                "exchange_timestamp_after_local_receive_clock",
-                received_at,
+                "feature_chronology_violation",
+                ingested_at,
             )
             return False
         definition = self.registry.require(name)
@@ -313,7 +353,7 @@ class BybitPublicPITStore:
             "unit": unit,
             "event_time": _iso(event_time),
             "available_at": _iso(received_at),
-            "ingested_at": _iso(received_at),
+            "ingested_at": _iso(ingested_at),
             "source": source,
             "quality": quality,
         }
@@ -345,7 +385,7 @@ class BybitPublicPITStore:
                     unit,
                     _iso(event_time),
                     _iso(received_at),
-                    _iso(received_at),
+                    _iso(ingested_at),
                     source,
                     quality,
                     digest,
@@ -360,6 +400,144 @@ class BybitPublicPITStore:
                 connection.close()
             raise
         return True
+
+    def append_feature_batch(
+        self,
+        observations: Sequence[Mapping[str, object]],
+        *,
+        archive_record: Mapping[str, object] | None = None,
+    ) -> int:
+        """Atomically append one validated archive file's derived observations."""
+
+        if not observations and archive_record is None:
+            return 0
+        self.flush()
+        inserted = 0
+        with self.connect() as connection:
+            for item in observations:
+                event_time = _utc(item["event_time"])  # type: ignore[arg-type]
+                available_at = _utc(item["available_at"])  # type: ignore[arg-type]
+                ingested_at = _utc(item["ingested_at"])  # type: ignore[arg-type]
+                if not event_time <= available_at <= ingested_at:
+                    raise ValueError("feature batch chronology invariant failed")
+                name = str(item["name"])
+                unit = str(item["unit"])
+                definition = self.registry.require(name)
+                if definition.unit != unit:
+                    raise ValueError(f"unit mismatch for {name}: {unit} != {definition.unit}")
+                symbol = str(item["symbol"]).strip().upper()
+                source = str(item["source"])
+                quality = float(item["quality"])
+                value = float(item["value"])
+                if not math.isfinite(value) or not 0 <= quality <= 1:
+                    raise ValueError("feature batch value or quality is invalid")
+                token = hashlib.sha256(
+                    f"{item['event_id']}|{symbol}|{name}".encode()
+                ).hexdigest()[:48]
+                observation_id = f"bp_{token}"
+                payload = {
+                    "observation_id": observation_id,
+                    "symbol": symbol,
+                    "name": name,
+                    "value": value,
+                    "unit": unit,
+                    "event_time": _iso(event_time),
+                    "available_at": _iso(available_at),
+                    "ingested_at": _iso(ingested_at),
+                    "source": source,
+                    "quality": quality,
+                    "provenance_kind": (
+                        "historical_archive_replay"
+                        if archive_record is not None
+                        else "live_capture"
+                    ),
+                    "archive_id": (
+                        str(archive_record["archive_id"])
+                        if archive_record is not None
+                        else None
+                    ),
+                }
+                digest = hashlib.sha256(_canonical(payload).encode()).hexdigest()
+                row = connection.execute(
+                    "SELECT payload_sha256 FROM bybit_feature_observations WHERE observation_id=?",
+                    (observation_id,),
+                ).fetchone()
+                if row:
+                    if row["payload_sha256"] != digest:
+                        raise CaptureConflict(
+                            "archive observation already exists with different content"
+                        )
+                    continue
+                connection.execute(
+                    """INSERT INTO bybit_feature_observations(
+                           observation_id,symbol,name,value,unit,event_time,available_at,
+                           ingested_at,source,quality,payload_sha256,provenance_kind,archive_id
+                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        observation_id,
+                        symbol,
+                        name,
+                        value,
+                        unit,
+                        _iso(event_time),
+                        _iso(available_at),
+                        _iso(ingested_at),
+                        source,
+                        quality,
+                        digest,
+                        payload["provenance_kind"],
+                        payload["archive_id"],
+                    ),
+                )
+                inserted += 1
+            if archive_record is not None:
+                connection.execute(
+                    """INSERT INTO bybit_historical_archive_files(
+                           archive_id,data_kind,market,symbol,trading_date,source_url,
+                           fetched_at,content_length,content_sha256,member_name,member_size,
+                           first_event_time,last_event_time,rows_read,
+                           feature_observation_count,status,error
+                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(data_kind,market,symbol,trading_date) DO UPDATE SET
+                           archive_id=excluded.archive_id,
+                           source_url=excluded.source_url,
+                           fetched_at=excluded.fetched_at,
+                           content_length=excluded.content_length,
+                           content_sha256=excluded.content_sha256,
+                           member_name=excluded.member_name,
+                           member_size=excluded.member_size,
+                           first_event_time=excluded.first_event_time,
+                           last_event_time=excluded.last_event_time,
+                           rows_read=excluded.rows_read,
+                           feature_observation_count=CASE
+                               WHEN excluded.feature_observation_count > 0
+                               THEN excluded.feature_observation_count
+                               ELSE bybit_historical_archive_files.feature_observation_count
+                           END,
+                           status=excluded.status,
+                           error=excluded.error""",
+                    (
+                        archive_record["archive_id"],
+                        archive_record["data_kind"],
+                        archive_record["market"],
+                        archive_record["symbol"],
+                        archive_record["trading_date"],
+                        archive_record["source_url"],
+                        archive_record["fetched_at"],
+                        int(archive_record["content_length"]),
+                        archive_record["content_sha256"],
+                        archive_record.get("member_name"),
+                        archive_record.get("member_size"),
+                        archive_record["first_event_time"],
+                        archive_record["last_event_time"],
+                        int(archive_record["rows_read"]),
+                        inserted,
+                        "completed",
+                        None,
+                    ),
+                )
+            connection.commit()
+        return inserted
 
     def latest_features(
         self,

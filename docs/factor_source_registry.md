@@ -1,6 +1,6 @@
 # 因子与数据源登记表
 
-更新时间：2026-08-23
+更新时间：2026-08-24
 
 ## 结论
 
@@ -25,14 +25,16 @@
 
 | 因子族 | 已有能力 | 推荐第一方/权威源 | 当前状态 |
 |---|---|---|---|
-| Bybit 订单簿 | spread、L5 imbalance、bid/ask depth | Bybit V5 public orderbook snapshot/delta，校验 `u/seq` 并在 gap 后重建 snapshot | 计算函数已实现；尚无持续 collector 证据，不进入真钱模型 |
-| Bybit 主动成交 | aggressive buy/sell、CVD、成交笔数、平均名义 | Bybit V5 public trade | 计算函数已实现；尚无持续 collector 证据 |
+| Bybit 订单簿 | spread、L5 delta/imbalance/depth、microprice、滚动 OFI、top-5 扫单完成比例与 VWAP slippage | Bybit 官方历史归档 + V5 public orderbook snapshot/delta，校验 `u/seq` 并重建每次 L2 状态 | 归档回放和实时 collector 已实现；一日真实文件验算通过，正式多币种覆盖、消融和成交回执仍未完成，不进入真钱模型 |
+| Bybit 主动成交 | aggressive buy/sell、滚动 CVD、成交笔数和名义 | Bybit 官方历史归档 + V5 public trade | 归档回放和实时 collector 已实现；一日真实文件验算通过，正式覆盖和消融未完成 |
 | 链上交易所流 | stablecoin/coin exchange netflow、确认数、标签修订风险 | 经批准的专业链上数据供应商或自建节点+版本化标签 | 数据结构已实现；无已批准 provider |
 | 美元流动性/宏观 | Fed balance sheet、RRP、TGA、实际利率、DXY、信用、增长/通胀 surprise | FRED/ALFRED vintage；美国财政部/纽约联储；EIA 等官方源 | PIT/vintage 存储和状态聚合已实现；未配置数据流 |
 | 监管/公司事件 | 申报、监管公告、重要公司文件 | SEC EDGAR API 和各监管机构第一方发布 | 研究任务/source tier 已实现；未配置数据流 |
 | 跨资产 | 黄金、原油、美股、风险偏好、美元、中国、医疗轮动 | 交易所/官方/已授权专业行情 | 只允许外部训练后的 regime 权重；无校准权重时函数拒绝运行 |
 
 参考面板虽然含 5,332 列，但 `asset_family` 有历史错标/漂移，故禁止按分类标签批量取因子，也禁止把全部字段直接输入模型。当前适配器只按显式 symbol 白名单读取基础收盘价，标签只输出供审计。
+
+Bybit 历史归档适配器会登记原始 URL、文件 SHA-256、事件范围、读取行数、派生特征数和 `historical_archive_replay` 来源，并强制 `event_time <= available_at <= ingested_at`。2026-08-01 的 1000PEPEUSDT 官方文件隔离验算读取 528,558 条订单簿事件和 118,194 条成交，PIT 时间违规为 0。这个结果只证明真实来源和回放正确性，不等于足量 OOS 数据或 execution evidence：top-5 深度扫单完成比例不是 maker 排队成交概率，真实 fill/partial fill 仍必须来自 shadow/testnet ExecutionReceipt。
 
 权威接口：
 
