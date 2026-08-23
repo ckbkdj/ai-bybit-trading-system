@@ -4,20 +4,18 @@ from contextlib import closing
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from ticket_store import ExecutionStore, iso, utc_now
+from execution_state import ExecutionState, require_transition
+from ticket_store import ExecutionStore, canonical, iso, utc_now
 
 
 class DurableExecutionStore(ExecutionStore):
-    """ExecutionStore with a kill switch that does not expire at UTC midnight.
+    """Safety extensions used by the active execution service.
 
     Daily PnL and cooldown state remain partitioned by ``risk_date``.  The manual
     kill switch is different: once enabled it must stay enabled until an explicit
-    operator action disables it.  The legacy store looked only at today's row,
-    which silently returned false after a UTC date rollover.
-
-    This subclass preserves the existing schema by carrying the most recently
-    written kill-switch value into a newly created daily risk row before any PnL
-    synchronization.  It is the store used by the active execution service.
+    operator action disables it.  This store also preserves the distinction
+    between an entry ticket and its deterministic child exit orders when a child
+    is cancelled.
     """
 
     @staticmethod
@@ -78,3 +76,111 @@ class DurableExecutionStore(ExecutionStore):
     def synchronize_risk_runtime(self, **kwargs) -> None:
         self._carry_kill_switch_to_today()
         super().synchronize_risk_runtime(**kwargs)
+
+    def confirm_cancellation(
+        self,
+        cancel_ticket_id: str,
+        target_order_link_id: str,
+        raw: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Confirm an exchange cancellation without corrupting parent-ticket state.
+
+        Cancelling the entry order may terminally cancel its ticket.  Cancelling a
+        take-profit, stop, trailing or time-exit child only changes that child and
+        the dedicated cancellation ticket; the already-filled entry ticket stays
+        FILLED/PARTIALLY_FILLED and continues to own the live position.
+        """
+
+        now = utc_now()
+        with self.transaction(immediate=True) as connection:
+            target_order = connection.execute(
+                """SELECT ticket_id,role,order_status FROM execution_orders
+                   WHERE order_link_id=?""",
+                (target_order_link_id,),
+            ).fetchone()
+            if not target_order:
+                raise KeyError(target_order_link_id)
+            cancel_row = connection.execute(
+                "SELECT state FROM tickets WHERE ticket_id=?", (cancel_ticket_id,)
+            ).fetchone()
+            if not cancel_row:
+                raise KeyError(cancel_ticket_id)
+            cancel_state = ExecutionState(cancel_row["state"])
+            require_transition(cancel_state, ExecutionState.CANCELLED)
+
+            # A late cancel acknowledgement must never overwrite a fill.
+            connection.execute(
+                """UPDATE execution_orders SET order_status='CANCELLED',raw_json=?,updated_at=?
+                   WHERE order_link_id=? AND UPPER(order_status)!='FILLED'""",
+                (canonical(raw or {})[0], iso(now), target_order_link_id),
+            )
+
+            target_row = connection.execute(
+                "SELECT state FROM tickets WHERE ticket_id=?", (target_order["ticket_id"],)
+            ).fetchone()
+            target_state = ExecutionState(target_row["state"])
+            if target_order["role"] == "entry":
+                if target_state not in {ExecutionState.CANCELLED, ExecutionState.FILLED}:
+                    require_transition(target_state, ExecutionState.CANCELLED)
+                    connection.execute(
+                        "UPDATE tickets SET state=?,updated_at=? WHERE ticket_id=?",
+                        (
+                            ExecutionState.CANCELLED.value,
+                            iso(now),
+                            target_order["ticket_id"],
+                        ),
+                    )
+                    self._append_event(
+                        connection,
+                        target_order["ticket_id"],
+                        target_state,
+                        ExecutionState.CANCELLED,
+                        "entry_order_cancelled_by_ticket",
+                        {
+                            "cancel_ticket_id": cancel_ticket_id,
+                            "order_link_id": target_order_link_id,
+                        },
+                        now,
+                    )
+                elif target_state is ExecutionState.FILLED:
+                    self._append_event(
+                        connection,
+                        target_order["ticket_id"],
+                        target_state,
+                        target_state,
+                        "late_entry_cancel_ignored_after_fill",
+                        {
+                            "cancel_ticket_id": cancel_ticket_id,
+                            "order_link_id": target_order_link_id,
+                        },
+                        now,
+                    )
+            else:
+                self._append_event(
+                    connection,
+                    target_order["ticket_id"],
+                    target_state,
+                    target_state,
+                    "child_order_cancelled",
+                    {
+                        "cancel_ticket_id": cancel_ticket_id,
+                        "order_link_id": target_order_link_id,
+                        "role": target_order["role"],
+                    },
+                    now,
+                )
+
+            if cancel_state is not ExecutionState.CANCELLED:
+                connection.execute(
+                    "UPDATE tickets SET state=?,updated_at=? WHERE ticket_id=?",
+                    (ExecutionState.CANCELLED.value, iso(now), cancel_ticket_id),
+                )
+                self._append_event(
+                    connection,
+                    cancel_ticket_id,
+                    cancel_state,
+                    ExecutionState.CANCELLED,
+                    "cancellation_confirmed",
+                    {"target_order_link_id": target_order_link_id},
+                    now,
+                )
