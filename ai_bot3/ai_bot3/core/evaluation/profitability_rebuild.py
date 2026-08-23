@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 from contextlib import closing
 from dataclasses import asdict, dataclass
@@ -82,6 +83,8 @@ LONG_FACTOR_GROUPS: Mapping[str, tuple[str, ...]] = {
 }
 MINIMUM_ABLATION_OOS_TRADES = 30
 MINIMUM_ABLATION_TRADED_FOLDS = 2
+ABLATION_RESEARCH_SELECTION_FRACTION = 0.02
+ABLATION_RESEARCH_TAIL_PENALTY = 0.50
 
 
 @dataclass(frozen=True)
@@ -402,6 +405,82 @@ def _signals_from_predictions(
     return signals
 
 
+def _ablation_signals_from_predictions(
+    frame: pd.DataFrame,
+    predictions: Sequence[TwoStagePrediction],
+    horizon_sec: int,
+) -> list[SignalEvent]:
+    """Create a fixed-budget OOS research portfolio without relaxing release gates.
+
+    A factor can improve ranking while every candidate still has a negative
+    deployable expectancy lower bound.  Reusing the production TRADE gate in
+    that situation makes the ablation degenerate to zero observations.  This
+    policy ranks paired BUY/SELL alternatives using predictions only, selects
+    a pre-committed fraction, and then charges the normal event-driven costs
+    and portfolio risk limits.  Its signals retain their true (possibly
+    negative) lower bound and are never eligible for release or ticketing.
+    """
+
+    if len(frame) != len(predictions):
+        raise ValueError("prediction and frame lengths differ")
+    candidates = frame.copy().reset_index(drop=True)
+    candidates["_prediction"] = list(predictions)
+    ranked: list[tuple[float, str, pd.Series, TwoStagePrediction]] = []
+    for (symbol, decision_at), group in candidates.groupby(
+        ["symbol", "decision_at"], sort=True
+    ):
+        paired: list[tuple[float, str, pd.Series, TwoStagePrediction]] = []
+        for _, row in group.iterrows():
+            prediction = row["_prediction"]
+            direction_ok = (
+                row["side"] == "BUY" and prediction.p_up >= prediction.p_down
+            ) or (
+                row["side"] == "SELL" and prediction.p_down >= prediction.p_up
+            )
+            if not direction_ok:
+                continue
+            score = float(
+                prediction.expected_net_return
+                - ABLATION_RESEARCH_TAIL_PENALTY * prediction.expected_mae
+            )
+            stable_key = f"{symbol}|{pd.Timestamp(decision_at).isoformat()}|{row['side']}"
+            paired.append((score, stable_key, row, prediction))
+        if paired:
+            ranked.append(max(paired, key=lambda item: (item[0], item[1])))
+    if not ranked:
+        return []
+    selected_count = max(
+        1,
+        int(math.ceil(len(ranked) * ABLATION_RESEARCH_SELECTION_FRACTION)),
+    )
+    selected = sorted(ranked, key=lambda item: (-item[0], item[1]))[:selected_count]
+    signals: list[SignalEvent] = []
+    for score, stable_key, row, prediction in selected:
+        token = hashlib.sha256(
+            f"ablation|{horizon_sec}|{stable_key}".encode()
+        ).hexdigest()[:20]
+        signals.append(
+            SignalEvent(
+                signal_id=f"ablation_{token}",
+                symbol=str(row["symbol"]),
+                side=str(row["side"]),
+                decision_at=pd.Timestamp(row["decision_at"]).to_pydatetime(),
+                reference_price=float(row["reference_price"]),
+                lower_bound_net_edge=float(prediction.lower_bound_net_edge),
+                take_profit_bps=float(row["take_profit_bps"]),
+                stop_loss_bps=float(row["stop_loss_bps"]),
+                max_holding_sec=horizon_sec,
+                feature_available_at=(
+                    pd.Timestamp(row["available_at"]).to_pydatetime(),
+                ),
+                max_wait_sec=max(30, min(300, horizon_sec // 2)),
+                regime=str(row["regime"]),
+                market_key=f"{row['symbol']}:{horizon_sec}",
+            )
+        )
+    return signals
+
+
 def _factor_ablation_report(
     evaluated_groups: Mapping[str, Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
@@ -432,6 +511,14 @@ def _factor_ablation_report(
     return {
         "method": "identical purged walk-forward folds; fee-adjusted event-driven net return",
         "baseline": "price_technical_only",
+        "research_selection_policy": {
+            "scope": "factor_ablation_only_not_release_eligible",
+            "ranking": "predicted_net_return_minus_fixed_tail_penalty_times_predicted_mae",
+            "selection_fraction": ABLATION_RESEARCH_SELECTION_FRACTION,
+            "tail_penalty": ABLATION_RESEARCH_TAIL_PENALTY,
+            "production_lower_bound_gate_relaxed": False,
+            "research_backtest_accepts_negative_edge_for_measurement": True,
+        },
         "all_required_groups_evaluated": all(
             item.get("oos_ablation_status") == "EVALUATED_OOS" for item in groups
         ),
@@ -548,10 +635,10 @@ def _evaluate_legacy_technical_ablation(
             )
             baseline_predictions = baseline_selection.model.predict(eligible_test)
             augmented_predictions = augmented_selection.model.predict(eligible_test)
-            baseline_signals = _signals_from_predictions(
+            baseline_signals = _ablation_signals_from_predictions(
                 eligible_test, baseline_predictions, horizon
             )
-            augmented_signals = _signals_from_predictions(
+            augmented_signals = _ablation_signals_from_predictions(
                 eligible_test, augmented_predictions, horizon
             )
             baseline_report = backtest.run(baseline_signals, market)
@@ -702,10 +789,10 @@ def _evaluate_trad_panel_ablation(
                 )
                 baseline_predictions = baseline_selection.model.predict(eligible_test)
                 augmented_predictions = augmented_selection.model.predict(eligible_test)
-                baseline_signals = _signals_from_predictions(
+                baseline_signals = _ablation_signals_from_predictions(
                     eligible_test, baseline_predictions, horizon
                 )
-                augmented_signals = _signals_from_predictions(
+                augmented_signals = _ablation_signals_from_predictions(
                     eligible_test, augmented_predictions, horizon
                 )
                 baseline_report = backtest.run(baseline_signals, market)
@@ -910,10 +997,10 @@ def _evaluate_bybit_pit_ablation(
                 )
                 baseline_predictions = baseline_selection.model.predict(eligible_test)
                 augmented_predictions = augmented_selection.model.predict(eligible_test)
-                baseline_signals = _signals_from_predictions(
+                baseline_signals = _ablation_signals_from_predictions(
                     eligible_test, baseline_predictions, horizon
                 )
-                augmented_signals = _signals_from_predictions(
+                augmented_signals = _ablation_signals_from_predictions(
                     eligible_test, augmented_predictions, horizon
                 )
                 baseline_report = backtest.run(baseline_signals, market)
@@ -1197,12 +1284,17 @@ class ProfitabilityRebuild:
         )
         selector = NestedWalkForwardSelector(candidate_configs, inner_folds=3)
         backtest = EventDrivenBacktest(BacktestConfig())
+        ablation_backtest = EventDrivenBacktest(
+            BacktestConfig(require_positive_lower_bound_edge=False)
+        )
         evaluated_factor_groups = _evaluate_legacy_technical_ablation(
-            datasets, market, selector, backtest
+            datasets, market, selector, ablation_backtest
         )
         if trad_panel_evidence is not None:
             evaluated_factor_groups.update(
-                _evaluate_trad_panel_ablation(datasets, market, selector, backtest)
+                _evaluate_trad_panel_ablation(
+                    datasets, market, selector, ablation_backtest
+                )
             )
         if bybit_pit_evidence is not None:
             evaluated_factor_groups.update(
@@ -1210,7 +1302,7 @@ class ProfitabilityRebuild:
                     datasets,
                     market,
                     selector,
-                    backtest,
+                    ablation_backtest,
                     bybit_pit_evidence,
                 )
             )

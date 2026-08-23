@@ -89,6 +89,26 @@ def test_event_driven_backtest_fails_closed_on_nonpositive_edge():
     assert report.rejected_signals["non_positive_lower_bound_edge"] == 1
 
 
+def test_research_backtest_can_measure_negative_edge_without_changing_production_default():
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    signal = SignalEvent(
+        signal_id="ablation-negative-edge",
+        symbol="BTCUSDT",
+        side="BUY",
+        decision_at=start,
+        reference_price=100.0,
+        lower_bound_net_edge=-0.001,
+        take_profit_bps=100,
+        stop_loss_bps=100,
+        max_holding_sec=180,
+    )
+    report = EventDrivenBacktest(
+        BacktestConfig(require_positive_lower_bound_edge=False)
+    ).run([signal], {"BTCUSDT": [_bar(start, 102, 99, 101)]})
+    assert len(report.trades) == 1
+    assert report.configuration["require_positive_lower_bound_edge"] is False
+
+
 def test_drawdown_uses_mark_to_market_path_not_only_realized_closes():
     start = datetime(2026, 1, 1, tzinfo=timezone.utc)
     signal = SignalEvent(
