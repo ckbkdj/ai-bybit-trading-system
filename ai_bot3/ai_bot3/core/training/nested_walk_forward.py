@@ -9,7 +9,12 @@ from typing import Mapping, Sequence
 import numpy as np
 import pandas as pd
 
-from core.models.two_stage import TwoStageAlphaModel, TwoStageConfig, TwoStagePrediction
+from core.models.two_stage import (
+    TwoStageAlphaModel,
+    TwoStageConfig,
+    TwoStagePrediction,
+    prediction_gate_diagnostics,
+)
 
 
 @dataclass(frozen=True)
@@ -121,6 +126,11 @@ class NestedWalkForwardSelector:
                 validation = data.iloc[validation_positions]
                 model = TwoStageAlphaModel(config).fit(train, feature_columns)
                 predictions = model.predict(validation)
+                gate_diagnostics = prediction_gate_diagnostics(
+                    validation,
+                    predictions,
+                    meta_threshold=config.meta_trade_probability,
+                )
                 selected = _selected_rows(validation, predictions)
                 if selected.empty:
                     net_utility = -1.0
@@ -141,6 +151,7 @@ class NestedWalkForwardSelector:
                         "train_rows": len(train_positions),
                         "inner_oos_rows": len(validation_positions),
                         "trade_count": trade_count,
+                        "prediction_gate": gate_diagnostics,
                         "net_utility": net_utility,
                         "mean_utility": mean_utility,
                         "downside_rms": downside,

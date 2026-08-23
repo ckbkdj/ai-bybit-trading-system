@@ -60,3 +60,42 @@ def test_two_stage_model_predicts_distribution_meta_label_and_never_self_promote
     )
     assert all(item.release_stage == "rejected" for item in replay)
     assert loaded.training_audit == model.training_audit
+
+
+def test_direction_model_is_side_invariant_for_paired_action_alternatives():
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    rows = []
+    for index in range(120):
+        signal = float(np.sin(index / 8.0))
+        decision_at = start + timedelta(days=index)
+        direction = "up" if signal > 0.1 else "down" if signal < -0.1 else "flat"
+        for side in ("BUY", "SELL"):
+            aligned = (side == "BUY" and direction == "up") or (
+                side == "SELL" and direction == "down"
+            )
+            rows.append(
+                {
+                    "signal": signal,
+                    "symbol": "BTCUSDT",
+                    "side": side,
+                    "net_return": 0.002 if aligned else -0.001,
+                    "mae": 0.0008,
+                    "mfe": 0.0015,
+                    "direction_label": direction,
+                    "decision_at": decision_at,
+                    "label_available_at": decision_at + timedelta(hours=1),
+                }
+            )
+    frame = pd.DataFrame(rows)
+    model = TwoStageAlphaModel(
+        TwoStageConfig(direction_iterations=80, meta_iterations=40)
+    ).fit(frame, ["signal", "symbol", "side"])
+    predictions = model.predict(frame.tail(20))
+
+    assert "side" not in model.direction_feature_columns
+    assert model.training_audit["direction_training_paired_decisions_deduplicated"] is True
+    for buy, sell in zip(predictions[::2], predictions[1::2]):
+        assert np.allclose(
+            [buy.p_down, buy.p_flat, buy.p_up],
+            [sell.p_down, sell.p_flat, sell.p_up],
+        )

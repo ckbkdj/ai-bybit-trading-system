@@ -23,7 +23,11 @@ from core.evaluation.profitability_gate import (
 from core.evaluation.ablation import compare_factor_groups
 from core.evaluation.statistical_governance import TrialLedger, TrialRecord
 from core.labels.triple_barrier import EntrySpec, MarketBar, TripleBarrierConfig, build_triple_barrier_label
-from core.models.two_stage import TwoStageConfig, TwoStagePrediction
+from core.models.two_stage import (
+    TwoStageConfig,
+    TwoStagePrediction,
+    prediction_gate_diagnostics,
+)
 from core.release.profitability_release import create_candidate_manifest
 from core.risk.capital_preservation import CapitalPreservationConfig, policy_report
 from core.training.pooled_panel import (
@@ -455,18 +459,26 @@ def _evaluate_trad_panel_ablation(
                 augmented_selection = selector.select_and_fit(
                     eligible_train, FEATURE_COLUMNS + tuple(columns)
                 )
+                baseline_predictions = baseline_selection.model.predict(eligible_test)
+                augmented_predictions = augmented_selection.model.predict(eligible_test)
                 baseline_signals = _signals_from_predictions(
-                    eligible_test,
-                    baseline_selection.model.predict(eligible_test),
-                    horizon,
+                    eligible_test, baseline_predictions, horizon
                 )
                 augmented_signals = _signals_from_predictions(
-                    eligible_test,
-                    augmented_selection.model.predict(eligible_test),
-                    horizon,
+                    eligible_test, augmented_predictions, horizon
                 )
                 baseline_report = backtest.run(baseline_signals, market)
                 augmented_report = backtest.run(augmented_signals, market)
+                baseline_gate_diagnostics = prediction_gate_diagnostics(
+                    eligible_test,
+                    baseline_predictions,
+                    meta_threshold=baseline_selection.selected_config.meta_trade_probability,
+                )
+                augmented_gate_diagnostics = prediction_gate_diagnostics(
+                    eligible_test,
+                    augmented_predictions,
+                    meta_threshold=augmented_selection.selected_config.meta_trade_probability,
+                )
                 baseline_folds.append({"net_return": baseline_report.net_return})
                 augmented_folds.append({"net_return": augmented_report.net_return})
                 fold_evidence.append(
@@ -479,9 +491,11 @@ def _evaluate_trad_panel_ablation(
                         "baseline_signals": len(baseline_signals),
                         "baseline_trades": len(baseline_report.trades),
                         "baseline_net_return": baseline_report.net_return,
+                        "baseline_prediction_gate": baseline_gate_diagnostics,
                         "augmented_signals": len(augmented_signals),
                         "augmented_trades": len(augmented_report.trades),
                         "augmented_net_return": augmented_report.net_return,
+                        "augmented_prediction_gate": augmented_gate_diagnostics,
                     }
                 )
         if len(baseline_folds) < 2:
@@ -639,6 +653,11 @@ class ProfitabilityRebuild:
                 selection = selector.select_and_fit(train, model_feature_columns)
                 predictions = selection.model.predict(test)
                 signals = _signals_from_predictions(test, predictions, horizon)
+                prediction_gate = prediction_gate_diagnostics(
+                    test,
+                    predictions,
+                    meta_threshold=selection.selected_config.meta_trade_probability,
+                )
                 development_signals.extend(signals)
                 report = backtest.run(signals, market)
                 walk_forward.append(
@@ -648,6 +667,7 @@ class ProfitabilityRebuild:
                         "train_rows": len(train),
                         "test_rows": len(test),
                         "signals": len(signals),
+                        "prediction_gate": prediction_gate,
                         "trades": len(report.trades),
                         "net_return": report.net_return,
                         "max_drawdown": report.max_drawdown,
