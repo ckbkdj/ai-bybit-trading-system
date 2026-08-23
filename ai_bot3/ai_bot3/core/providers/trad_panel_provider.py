@@ -37,6 +37,11 @@ DEFAULT_INSTRUMENTS: Dict[str, str] = {
     "uup": "UUP.US",
     "gbtc": "GBTC.US",
     "coin": "COIN.US",
+    "mstr": "MSTR.US",
+    "xlv": "XLV.US",
+    "ibb": "IBB.US",
+    "fxi": "FXI.US",
+    "kweb": "KWEB.US",
 }
 
 

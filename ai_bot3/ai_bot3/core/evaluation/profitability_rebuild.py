@@ -5,7 +5,7 @@ import json
 import sqlite3
 from contextlib import closing
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -20,6 +20,7 @@ from core.evaluation.profitability_gate import (
     evaluate_profitability_gate,
     write_profitability_report,
 )
+from core.evaluation.ablation import compare_factor_groups
 from core.evaluation.statistical_governance import TrialLedger, TrialRecord
 from core.labels.triple_barrier import EntrySpec, MarketBar, TripleBarrierConfig, build_triple_barrier_label
 from core.models.two_stage import TwoStageConfig, TwoStagePrediction
@@ -33,6 +34,10 @@ from core.training.pooled_panel import (
     dataset_manifest,
 )
 from core.training.nested_walk_forward import NestedWalkForwardSelector
+from core.training.pit_factor_panel import (
+    TRAD_PANEL_FACTOR_GROUPS,
+    TradPanelHistorySource,
+)
 
 
 SYMBOLS: tuple[str, ...] = ("BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "1000PEPEUSDT")
@@ -69,6 +74,8 @@ class ProfitabilityRebuildConfig:
     trial_ledger_path: Path
     model_output_dir: Path
     code_commit: str
+    trad_panel_root: Path | None = None
+    verify_trad_panel_sha256: bool = True
     max_bars_per_symbol: int = 200_000
     walk_forward_folds: int = 3
     lockbox_fraction: float = 0.15
@@ -239,9 +246,16 @@ def _panel_rows(frame: pd.DataFrame, horizon_sec: int, bars: Sequence[MarketBar]
         volatility_bps = max(20.0, min(300.0, float(row["volatility"]) * 10_000.0))
         stop_bps = max(25.0, volatility_bps * 1.25)
         take_profit_bps = stop_bps * 1.50
-        # Give the label builder the complete future stream.  It performs its
-        # own max-holding cutoff; a fixed two-bar slice is not a holding path.
-        path = bars[index + 1 :]
+        # Include every bar that can participate from entry timeout through the
+        # complete holding window.  The bound is time-based, never a fixed bar
+        # count, so finer event streams retain their full path without O(n^2)
+        # copies of the rest of history.
+        max_wait_sec = max(30, min(300, horizon_sec // 2))
+        path_end_time = signal_at + timedelta(seconds=max_wait_sec + horizon_sec)
+        path_end = index + 1
+        while path_end < len(bars) and bars[path_end].open_time <= path_end_time:
+            path_end += 1
+        path = bars[index + 1 : path_end]
         labels = {}
         for side in ("BUY", "SELL"):
             labels[side] = build_triple_barrier_label(
@@ -255,7 +269,7 @@ def _panel_rows(frame: pd.DataFrame, horizon_sec: int, bars: Sequence[MarketBar]
                     stop_loss_bps=stop_bps,
                     max_holding_sec=horizon_sec,
                     feature_available_at=(signal_at,),
-                    max_wait_sec=max(30, min(300, horizon_sec // 2)),
+                    max_wait_sec=max_wait_sec,
                 ),
                 path,
                 TripleBarrierConfig(),
@@ -359,10 +373,16 @@ def _signals_from_predictions(
     return signals
 
 
-def _factor_ablation_report() -> dict[str, object]:
+def _factor_ablation_report(
+    evaluated_groups: Mapping[str, Mapping[str, object]] | None = None,
+) -> dict[str, object]:
+    evaluated = dict(evaluated_groups or {})
     groups = []
     for cadence, definitions in (("short", SHORT_FACTOR_GROUPS), ("medium_long", LONG_FACTOR_GROUPS)):
         for group, factors in definitions.items():
+            if group in evaluated:
+                groups.append(dict(evaluated[group]))
+                continue
             groups.append(
                 {
                     "cadence": cadence,
@@ -379,11 +399,130 @@ def _factor_ablation_report() -> dict[str, object]:
     return {
         "method": "identical purged walk-forward folds; fee-adjusted event-driven net return",
         "baseline": "price_technical_only",
-        "all_required_groups_evaluated": False,
-        "retained_factor_groups": [],
+        "all_required_groups_evaluated": all(
+            item.get("oos_ablation_status") == "EVALUATED_OOS" for item in groups
+        ),
+        "retained_factor_groups": [
+            str(item["factor_group"]) for item in groups if bool(item.get("retained"))
+        ],
         "groups": groups,
         "blocker": "current local store has OHLCV and snapshots, but not complete PIT histories for required orderbook/trades/macro-vintage groups",
     }
+
+
+def _evaluate_trad_panel_ablation(
+    datasets: Mapping[int, object],
+    market: Mapping[str, Sequence[MarketBar]],
+    selector: NestedWalkForwardSelector,
+    backtest: EventDrivenBacktest,
+) -> dict[str, dict[str, object]]:
+    results: dict[str, dict[str, object]] = {}
+    for group, columns in TRAD_PANEL_FACTOR_GROUPS.items():
+        baseline_folds: list[dict[str, float]] = []
+        augmented_folds: list[dict[str, float]] = []
+        fold_evidence: list[dict[str, object]] = []
+        for horizon, dataset in datasets.items():
+            if horizon < 7200:
+                continue
+            for fold in dataset.folds:
+                train = dataset.development.iloc[list(fold.train_indices)]
+                test = dataset.development.iloc[list(fold.test_indices)]
+                train_mask = train[list(columns)].notna().all(axis=1)
+                test_mask = test[list(columns)].notna().all(axis=1)
+                eligible_train = train.loc[train_mask].reset_index(drop=True)
+                eligible_test = test.loc[test_mask].reset_index(drop=True)
+                if len(eligible_train) < 100 or len(eligible_test) < 30:
+                    fold_evidence.append(
+                        {
+                            "horizon_sec": horizon,
+                            "fold_id": fold.fold_id,
+                            "status": "FAILED_INSUFFICIENT_PIT_ROWS",
+                            "train_rows": len(eligible_train),
+                            "test_rows": len(eligible_test),
+                        }
+                    )
+                    continue
+                baseline_selection = selector.select_and_fit(
+                    eligible_train, FEATURE_COLUMNS
+                )
+                augmented_selection = selector.select_and_fit(
+                    eligible_train, FEATURE_COLUMNS + tuple(columns)
+                )
+                baseline_signals = _signals_from_predictions(
+                    eligible_test,
+                    baseline_selection.model.predict(eligible_test),
+                    horizon,
+                )
+                augmented_signals = _signals_from_predictions(
+                    eligible_test,
+                    augmented_selection.model.predict(eligible_test),
+                    horizon,
+                )
+                baseline_report = backtest.run(baseline_signals, market)
+                augmented_report = backtest.run(augmented_signals, market)
+                baseline_folds.append({"net_return": baseline_report.net_return})
+                augmented_folds.append({"net_return": augmented_report.net_return})
+                fold_evidence.append(
+                    {
+                        "horizon_sec": horizon,
+                        "fold_id": fold.fold_id,
+                        "status": "EVALUATED_OOS",
+                        "train_rows": len(eligible_train),
+                        "test_rows": len(eligible_test),
+                        "baseline_signals": len(baseline_signals),
+                        "baseline_trades": len(baseline_report.trades),
+                        "baseline_net_return": baseline_report.net_return,
+                        "augmented_signals": len(augmented_signals),
+                        "augmented_trades": len(augmented_report.trades),
+                        "augmented_net_return": augmented_report.net_return,
+                    }
+                )
+        if len(baseline_folds) < 2:
+            results[group] = {
+                "cadence": "medium_long",
+                "factor_group": group,
+                "factors": list(columns),
+                "oos_ablation_status": "FAILED_INSUFFICIENT_PIT_ROWS",
+                "evaluated": False,
+                "pit_observation_count": sum(
+                    int(item.get("test_rows", 0)) for item in fold_evidence
+                ),
+                "oos_fold_count": len(baseline_folds),
+                "retained": False,
+                "formal_feature_set": False,
+                "folds": fold_evidence,
+            }
+            continue
+        comparison = compare_factor_groups(
+            baseline_folds,
+            {group: augmented_folds},
+            primary_metric="net_return",
+            higher_is_better=True,
+            minimum_mean_improvement=0.0,
+            minimum_improved_fold_ratio=0.60,
+            minimum_worst_fold_improvement=-0.002,
+        )[0]
+        results[group] = {
+            "cadence": "medium_long",
+            "factor_group": group,
+            "factors": list(columns),
+            "oos_ablation_status": "EVALUATED_OOS",
+            "evaluated": True,
+            "pit_observation_count": sum(
+                int(item.get("test_rows", 0)) for item in fold_evidence
+            ),
+            "oos_fold_count": len(baseline_folds),
+            "metric": comparison.metric,
+            "baseline_mean": comparison.baseline_mean,
+            "augmented_mean": comparison.augmented_mean,
+            "mean_improvement": comparison.mean_improvement,
+            "improved_fold_ratio": comparison.improved_fold_ratio,
+            "worst_fold_improvement": comparison.worst_fold_improvement,
+            "retained": comparison.retained,
+            "formal_feature_set": comparison.retained,
+            "folds": fold_evidence,
+        }
+    return results
 
 
 class ProfitabilityRebuild:
@@ -394,6 +533,10 @@ class ProfitabilityRebuild:
         run_payload = {
             "code_commit": config.code_commit,
             "feature_store": str(config.feature_store_path.resolve()),
+            "trad_panel_root": (
+                str(config.trad_panel_root.resolve()) if config.trad_panel_root else None
+            ),
+            "verify_trad_panel_sha256": config.verify_trad_panel_sha256,
             "max_bars_per_symbol": config.max_bars_per_symbol,
             "horizons": HORIZONS_SEC,
             "symbols": SYMBOLS,
@@ -420,6 +563,19 @@ class ProfitabilityRebuild:
                     **coverage,
                 }
             panels[horizon] = pd.DataFrame(rows)
+
+        trad_panel_evidence: dict[str, object] | None = None
+        if self.config.trad_panel_root is not None:
+            trad_source = TradPanelHistorySource(
+                self.config.trad_panel_root,
+                verify_sha256=self.config.verify_trad_panel_sha256,
+            )
+            trad_history, trad_panel_evidence = trad_source.load()
+            for horizon in HORIZONS_SEC:
+                panels[horizon] = trad_source.join(
+                    panels[horizon], history=trad_history
+                )
+            source_evidence["trad_data_service"] = trad_panel_evidence
 
         splitter = PooledPanelBuilder(
             lockbox_fraction=self.config.lockbox_fraction,
@@ -452,11 +608,26 @@ class ProfitabilityRebuild:
         )
         selector = NestedWalkForwardSelector(candidate_configs, inner_folds=3)
         backtest = EventDrivenBacktest(BacktestConfig())
+        evaluated_factor_groups = (
+            _evaluate_trad_panel_ablation(datasets, market, selector, backtest)
+            if trad_panel_evidence is not None
+            else {}
+        )
+        factor_report = _factor_ablation_report(evaluated_factor_groups)
+        retained_groups = tuple(
+            str(group) for group in factor_report["retained_factor_groups"]
+        )
+        retained_factor_columns = tuple(
+            column
+            for group in retained_groups
+            for column in TRAD_PANEL_FACTOR_GROUPS.get(group, ())
+        )
+        model_feature_columns = FEATURE_COLUMNS + retained_factor_columns
         for horizon, dataset in datasets.items():
             for fold in dataset.folds:
                 train = dataset.development.iloc[list(fold.train_indices)]
                 test = dataset.development.iloc[list(fold.test_indices)]
-                selection = selector.select_and_fit(train, FEATURE_COLUMNS)
+                selection = selector.select_and_fit(train, model_feature_columns)
                 predictions = selection.model.predict(test)
                 signals = _signals_from_predictions(test, predictions, horizon)
                 development_signals.extend(signals)
@@ -477,6 +648,7 @@ class ProfitabilityRebuild:
                         "nested_selection": dict(selection.audit),
                         "inner_candidate_results": list(selection.candidate_results),
                         "outer_oos_used_for_tuning": False,
+                        "formal_feature_columns": list(model_feature_columns),
                     }
                 )
 
@@ -484,7 +656,6 @@ class ProfitabilityRebuild:
         development_stress = backtest.run(
             development_signals, market, cost_multiplier=2.0
         )
-        factor_report = _factor_ablation_report()
         execution_evidence_complete = False
         development_gate = evaluate_development_gate(
             development_report.trades,
@@ -553,7 +724,7 @@ class ProfitabilityRebuild:
                 parameter_hash=TrialLedger.parameter_hash(
                     {
                         "candidate_configs": [asdict(config) for config in candidate_configs],
-                        "features": FEATURE_COLUMNS,
+                        "features": model_feature_columns,
                         "nested_walk_forward": True,
                     }
                 ),
@@ -583,7 +754,9 @@ class ProfitabilityRebuild:
         model_paths: dict[str, str] = {}
         final_selection: dict[str, object] = {}
         for horizon, dataset in datasets.items():
-            selection = selector.select_and_fit(dataset.development, FEATURE_COLUMNS)
+            selection = selector.select_and_fit(
+                dataset.development, model_feature_columns
+            )
             path = self.config.model_output_dir / self.trial_id / f"horizon_{horizon}.json"
             selection.model.save(path)
             model_paths[str(horizon)] = str(path)
@@ -635,6 +808,8 @@ class ProfitabilityRebuild:
                 "model_family": "profitability_two_stage",
                 "release_stage": "candidate" if gate.passed else "rejected",
                 "models": model_paths,
+                "formal_feature_columns": list(model_feature_columns),
+                "retained_factor_groups": list(retained_groups),
                 "lockbox_fingerprint": lockbox_fingerprint,
             },
         )
@@ -654,7 +829,7 @@ class ProfitabilityRebuild:
             parameter_hash=TrialLedger.parameter_hash(
                 {
                     "candidate_configs": [asdict(config) for config in candidate_configs],
-                    "features": FEATURE_COLUMNS,
+                    "features": model_feature_columns,
                     "nested_walk_forward": True,
                 }
             ),

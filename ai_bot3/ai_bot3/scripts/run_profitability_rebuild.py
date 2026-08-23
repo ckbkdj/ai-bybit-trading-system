@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -50,6 +51,12 @@ def main() -> int:
         "--model-output-dir", type=Path, default=ROOT / "models" / "profitability"
     )
     parser.add_argument("--code-commit")
+    configured_trad_root = os.environ.get("TRAD_DATA_SERVICE_ROOT", "").strip()
+    parser.add_argument(
+        "--trad-panel-root",
+        type=Path,
+        default=Path(configured_trad_root) if configured_trad_root else None,
+    )
     parser.add_argument("--max-bars-per-symbol", type=int, default=200_000)
     parser.add_argument("--walk-forward-folds", type=int, default=3)
     args = parser.parse_args()
@@ -64,6 +71,7 @@ def main() -> int:
         trial_ledger_path=args.trial_ledger,
         model_output_dir=args.model_output_dir,
         code_commit=head_commit,
+        trad_panel_root=args.trad_panel_root,
         max_bars_per_symbol=args.max_bars_per_symbol,
         walk_forward_folds=args.walk_forward_folds,
     )
