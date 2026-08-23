@@ -15,8 +15,10 @@ from core.features.profitability_technical import (
     TECHNICAL_FEATURE_COLUMNS,
     engineer_profitability_features,
 )
+from core.features.registry import default_registry
 from core.models.two_stage import TwoStageAlphaModel
 from core.release.profitability_release import verify_candidate_authorization
+from core.training.bybit_pit_panel import BybitPITFeatureSource
 from core.training.pooled_panel import causal_regime_labels
 
 
@@ -136,6 +138,7 @@ def build_current_feature_rows(
     model_feature_columns: list[str],
     latest_decision_at: Any | None = None,
     external_panel_context: Mapping[str, Any] | None = None,
+    bybit_pit_store_path: Path | None = None,
 ) -> tuple[pd.DataFrame, dict[str, object]]:
     if len(frame) < 49:
         raise ValueError("at least 49 chronological bars are required for alpha inference")
@@ -152,6 +155,32 @@ def build_current_feature_rows(
     external, external_evidence = _external_values(
         external_panel_context, decision_at=decision_at
     )
+    required_bybit_features = []
+    registry = default_registry()
+    for column in model_feature_columns:
+        definition = registry.get(column)
+        if definition and definition.factor_set in {
+            "market.microstructure.v1",
+            "crypto.derivatives.v1",
+        }:
+            required_bybit_features.append(column)
+    bybit_values: dict[str, float] = {}
+    bybit_evidence: dict[str, object] = {"status": "not_required"}
+    if required_bybit_features:
+        if bybit_pit_store_path is None:
+            raise ValueError("Bybit PIT store is required by the signed feature contract")
+        source = BybitPITFeatureSource(bybit_pit_store_path, registry=registry)
+        bybit_values, bybit_evidence = source.latest(
+            symbol,
+            required_bybit_features,
+            decision_at=decision_at,
+        )
+        missing_bybit = sorted(set(required_bybit_features).difference(bybit_values))
+        if missing_bybit:
+            raise ValueError(
+                f"fresh symbol-specific Bybit PIT features unavailable: {missing_bybit}"
+            )
+        bybit_evidence["status"] = "verified"
     base: dict[str, object] = {
         "symbol": symbol.strip().upper(),
         "horizon_sec": horizon_sec,
@@ -162,6 +191,7 @@ def build_current_feature_rows(
     }
     base.update({name: float(latest[name]) for name in TECHNICAL_FEATURE_COLUMNS})
     base.update(external)
+    base.update(bybit_values)
     missing = [
         column
         for column in model_feature_columns
@@ -189,6 +219,7 @@ def build_current_feature_rows(
         "decision_at": _iso(decision_at),
         "feature_snapshot_sha256": snapshot_hash,
         "external_panel": external_evidence,
+        "bybit_public_pit": bybit_evidence,
     }
 
 
@@ -199,6 +230,7 @@ def generate_profitability_alpha_prediction(
     mode: str,
     latest_decision_at: Any | None = None,
     external_panel_context: Mapping[str, Any] | None = None,
+    bybit_pit_store_path: Path | None = None,
     model_bundle_path: Path | None = None,
     profitability_report_path: Path | None = None,
     candidate_manifest_path: Path | None = None,
@@ -238,7 +270,11 @@ def generate_profitability_alpha_prediction(
         if actual_model_sha != str(hashes.get(str(horizon)) or ""):
             raise ValueError("horizon model hash mismatch")
         model = TwoStageAlphaModel.load(model_path)
-        formal_features = [str(value) for value in bundle.get("formal_feature_columns", [])]
+        formal_contract = bundle.get("formal_feature_columns", {})
+        if isinstance(formal_contract, Mapping):
+            formal_features = [str(value) for value in formal_contract.get(str(horizon), [])]
+        else:
+            formal_features = [str(value) for value in formal_contract]
         if model.feature_columns != formal_features:
             raise ValueError("bundle and model feature contracts differ")
         rows, feature_evidence = build_current_feature_rows(
@@ -248,6 +284,14 @@ def generate_profitability_alpha_prediction(
             model_feature_columns=formal_features,
             latest_decision_at=latest_decision_at,
             external_panel_context=external_panel_context,
+            bybit_pit_store_path=(
+                bybit_pit_store_path
+                or (
+                    Path(os.environ["BYBIT_PUBLIC_PIT_STORE"])
+                    if os.environ.get("BYBIT_PUBLIC_PIT_STORE")
+                    else None
+                )
+            ),
         )
         predictions = model.predict(rows)
 

@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Deque, Mapping, Sequence
 
-from core.features.point_in_time_store import FeatureObservation, PointInTimeFeatureStore
+from core.features.point_in_time_store import PointInTimeFeatureStore
 from core.features.registry import default_registry
 
 
@@ -48,7 +48,8 @@ class BybitPublicPITStore:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.features = PointInTimeFeatureStore(self.path, default_registry())
+        self.registry = default_registry()
+        self.quality_store = PointInTimeFeatureStore(self.path, self.registry)
         with self.connect() as connection:
             connection.executescript(
                 """
@@ -78,6 +79,22 @@ class BybitPublicPITStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_bybit_raw_pit
                     ON bybit_raw_public_events(symbol, topic, received_at, sequence);
+                CREATE TABLE IF NOT EXISTS bybit_feature_observations(
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    observation_id TEXT NOT NULL UNIQUE,
+                    symbol TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    value REAL NOT NULL,
+                    unit TEXT NOT NULL,
+                    event_time TEXT NOT NULL,
+                    available_at TEXT NOT NULL,
+                    ingested_at TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    quality REAL NOT NULL,
+                    payload_sha256 TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_bybit_feature_pit
+                    ON bybit_feature_observations(symbol,name,available_at,sequence);
                 """
             )
 
@@ -178,6 +195,7 @@ class BybitPublicPITStore:
         self,
         *,
         event_id: str,
+        symbol: str,
         name: str,
         value: float,
         unit: str,
@@ -189,32 +207,89 @@ class BybitPublicPITStore:
         event_time = _utc(event_time)
         received_at = _utc(received_at)
         if event_time > received_at:
-            self.features.source_event(
+            self.quality_store.source_event(
                 source,
                 "degraded",
                 "exchange_timestamp_after_local_receive_clock",
                 received_at,
             )
             return False
-        token = hashlib.sha256(f"{event_id}|{name}".encode()).hexdigest()[:48]
-        return self.features.append(
-            FeatureObservation(
-                observation_id=f"bp_{token}",
-                name=name,
-                value=float(value),
-                unit=unit,
-                event_time=event_time,
-                published_at=event_time,
-                available_at=received_at,
-                ingested_at=received_at,
-                source=source,
-                source_tier="A",
-                quality=quality,
-                source_reliability=0.98,
-                label_revision_risk=0.0,
-                confirmation_count=1,
+        definition = self.registry.require(name)
+        if definition.unit != unit:
+            raise ValueError(f"unit mismatch for {name}: {unit} != {definition.unit}")
+        normalized_symbol = symbol.strip().upper()
+        token = hashlib.sha256(
+            f"{event_id}|{normalized_symbol}|{name}".encode()
+        ).hexdigest()[:48]
+        observation_id = f"bp_{token}"
+        payload = {
+            "observation_id": observation_id,
+            "symbol": normalized_symbol,
+            "name": name,
+            "value": float(value),
+            "unit": unit,
+            "event_time": _iso(event_time),
+            "available_at": _iso(received_at),
+            "ingested_at": _iso(received_at),
+            "source": source,
+            "quality": quality,
+        }
+        digest = hashlib.sha256(_canonical(payload).encode()).hexdigest()
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT payload_sha256 FROM bybit_feature_observations WHERE observation_id=?",
+                (observation_id,),
+            ).fetchone()
+            if row:
+                if row["payload_sha256"] != digest:
+                    raise CaptureConflict(
+                        "feature observation_id already exists with different content"
+                    )
+                return False
+            connection.execute(
+                """INSERT INTO bybit_feature_observations(
+                       observation_id,symbol,name,value,unit,event_time,available_at,
+                       ingested_at,source,quality,payload_sha256
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    observation_id,
+                    normalized_symbol,
+                    name,
+                    float(value),
+                    unit,
+                    _iso(event_time),
+                    _iso(received_at),
+                    _iso(received_at),
+                    source,
+                    quality,
+                    digest,
+                ),
             )
-        )
+            connection.commit()
+        return True
+
+    def latest_features(
+        self,
+        symbol: str,
+        names: Sequence[str],
+        *,
+        simulated_time: datetime,
+    ) -> dict[str, dict[str, object]]:
+        """Return the latest feature per name that was available at the cutoff."""
+
+        cutoff = _iso(simulated_time)
+        output: dict[str, dict[str, object]] = {}
+        with closing(self.connect()) as connection:
+            for name in names:
+                row = connection.execute(
+                    """SELECT * FROM bybit_feature_observations
+                         WHERE symbol=? AND name=? AND available_at<=?
+                         ORDER BY available_at DESC,sequence DESC LIMIT 1""",
+                    (symbol.strip().upper(), name, cutoff),
+                ).fetchone()
+                if row:
+                    output[name] = dict(row)
+        return output
 
 
 @dataclass
@@ -248,7 +323,7 @@ class BybitPublicPITIngestor:
     def invalidate_books(self, reason: str, received_at: datetime) -> None:
         for book in self.books.values():
             book.valid = False
-        self.store.features.source_event(
+        self.store.quality_store.source_event(
             "bybit.public.orderbook", "outage", reason, _utc(received_at)
         )
 
@@ -269,6 +344,7 @@ class BybitPublicPITIngestor:
     def _feature(
         self,
         event_id: str,
+        symbol: str,
         name: str,
         value: float,
         unit: str,
@@ -279,6 +355,7 @@ class BybitPublicPITIngestor:
     ) -> None:
         self.store.append_feature(
             event_id=event_id,
+            symbol=symbol,
             name=name,
             value=value,
             unit=unit,
@@ -340,7 +417,7 @@ class BybitPublicPITIngestor:
             return {"status": "duplicate", "event_id": event_id}
         if sequence_regressed and not is_snapshot:
             book.valid = False
-            self.store.features.source_event(
+            self.store.quality_store.source_event(
                 "bybit.public.orderbook",
                 "degraded",
                 "cross_sequence_regressed_waiting_for_snapshot",
@@ -351,7 +428,7 @@ class BybitPublicPITIngestor:
             book.bids.clear()
             book.asks.clear()
             book.valid = True
-            self.store.features.source_event(
+            self.store.quality_store.source_event(
                 "bybit.public.orderbook", "ok", "snapshot_recovered", received_at
             )
         elif not book.valid:
@@ -416,6 +493,7 @@ class BybitPublicPITIngestor:
         for name, (value, unit) in factors.items():
             self._feature(
                 event_id,
+                symbol,
                 name,
                 value,
                 unit,
@@ -473,6 +551,7 @@ class BybitPublicPITIngestor:
         for name, (value, unit) in factors.items():
             self._feature(
                 latest_id,
+                symbol,
                 name,
                 value,
                 unit,
@@ -525,6 +604,7 @@ class BybitPublicPITIngestor:
         imbalance = (short_value - long_value) / total if total else 0.0
         self._feature(
             latest_id,
+            symbol,
             "liquidation_imbalance_5m",
             imbalance,
             "ratio",
@@ -576,6 +656,7 @@ class BybitPublicPITIngestor:
         for name, (value, unit) in factors.items():
             self._feature(
                 event_id,
+                symbol,
                 name,
                 value,
                 unit,

@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT))
 from core.features.profitability_technical import TECHNICAL_FEATURE_COLUMNS
 from core.models.profitability_runtime import generate_profitability_alpha_prediction
 from core.models.two_stage import TwoStageAlphaModel, TwoStageConfig
+from core.providers.bybit_public_pit import BybitPublicPITStore
 
 
 FEATURES = (
@@ -80,14 +81,18 @@ def _market_frame() -> pd.DataFrame:
     )
 
 
-def _bundle(tmp_path: Path) -> Path:
+def _bundle(tmp_path: Path, extra_features: tuple[str, ...] = ()) -> Path:
+    training = _training_frame()
+    for position, name in enumerate(extra_features, start=1):
+        training[name] = np.sin(np.arange(len(training)) / (position + 3.0))
+    formal_features = FEATURES + extra_features
     model = TwoStageAlphaModel(
         TwoStageConfig(
             direction_iterations=30,
             meta_iterations=30,
             minimum_expectancy_clusters=5,
         )
-    ).fit(_training_frame(), FEATURES)
+    ).fit(training, formal_features)
     model_path = tmp_path / "horizon_180.json"
     model.save(model_path)
     model_sha = hashlib.sha256(model_path.read_bytes()).hexdigest()
@@ -102,7 +107,7 @@ def _bundle(tmp_path: Path) -> Path:
                 "profitability_gate": "FAILED",
                 "models": {"180": model_path.name},
                 "model_sha256": {"180": model_sha},
-                "formal_feature_columns": list(FEATURES),
+                "formal_feature_columns": list(formal_features),
                 "retained_factor_groups": [],
                 "lockbox_fingerprint": None,
                 "lockbox_consumed": False,
@@ -148,3 +153,56 @@ def test_runtime_fails_closed_when_horizon_model_is_modified(tmp_path):
     assert alpha["release_stage"] == "rejected"
     assert alpha["actionable"] is False
     assert "hash mismatch" in alpha["reason"]
+
+
+def test_runtime_uses_fresh_symbol_specific_bybit_pit_features(tmp_path):
+    bundle = _bundle(tmp_path, ("orderbook_spread_bps",))
+    market = _market_frame()
+    decision_at = market.index[-1].to_pydatetime()
+
+    without_store = generate_profitability_alpha_prediction(
+        market,
+        symbol="BTCUSDT",
+        mode="scalping",
+        model_bundle_path=bundle,
+    )
+    assert without_store["status"] == "blocked"
+    assert "PIT store is required" in without_store["reason"]
+
+    database = tmp_path / "bybit.sqlite3"
+    store = BybitPublicPITStore(database)
+    received_at = decision_at - timedelta(seconds=1)
+    store.append_feature(
+        event_id="runtime-book",
+        symbol="BTCUSDT",
+        name="orderbook_spread_bps",
+        value=2.5,
+        unit="bps",
+        event_time=received_at - timedelta(milliseconds=100),
+        received_at=received_at,
+        source="bybit.ws.orderbook.50",
+        quality=1.0,
+    )
+    alpha = generate_profitability_alpha_prediction(
+        market,
+        symbol="BTCUSDT",
+        mode="scalping",
+        model_bundle_path=bundle,
+        bybit_pit_store_path=database,
+    )
+
+    assert alpha["status"] == "ok"
+    evidence = alpha["feature_evidence"]["bybit_public_pit"]
+    assert evidence["status"] == "verified"
+    assert evidence["symbol"] == "BTCUSDT"
+    assert evidence["available_features"] == ["orderbook_spread_bps"]
+
+    wrong_symbol = generate_profitability_alpha_prediction(
+        market,
+        symbol="ETHUSDT",
+        mode="scalping",
+        model_bundle_path=bundle,
+        bybit_pit_store_path=database,
+    )
+    assert wrong_symbol["status"] == "blocked"
+    assert "fresh symbol-specific" in wrong_symbol["reason"]

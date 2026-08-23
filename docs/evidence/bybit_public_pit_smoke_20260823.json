@@ -1,7 +1,7 @@
 {
   "schema_version": "bybit-public-pit-smoke.v1",
-  "captured_at": "2026-08-23T15:38:54.757380Z",
-  "ended_at": "2026-08-23T15:39:10.085103Z",
+  "captured_at": "2026-08-23T15:44:32.358953Z",
+  "ended_at": "2026-08-23T15:44:43.222634Z",
   "endpoint": "wss://stream.bybit.com/v5/public/linear",
   "mode": "public_market_data_capture_only",
   "authentication_used": false,
@@ -11,28 +11,51 @@
     "ETHUSDT"
   ],
   "session_status": "completed",
+  "symbol_partition_key": [
+    "symbol",
+    "name",
+    "available_at"
+  ],
   "raw_event_counts": {
-    "orderbook.50.BTCUSDT": 208,
-    "orderbook.50.ETHUSDT": 302,
-    "publicTrade.BTCUSDT": 134,
-    "publicTrade.ETHUSDT": 262,
+    "orderbook.50.BTCUSDT": 198,
+    "orderbook.50.ETHUSDT": 222,
+    "publicTrade.BTCUSDT": 80,
+    "publicTrade.ETHUSDT": 194,
     "tickers.BTCUSDT": 56,
-    "tickers.ETHUSDT": 70
+    "tickers.ETHUSDT": 53
   },
-  "feature_observation_counts": {
-    "orderbook_spread_bps": 510,
-    "bybit_orderbook_delta_l5": 510,
-    "orderbook_imbalance_l5": 510,
-    "orderbook_depth_usdt_l5": 510,
-    "microprice_deviation_bps": 510,
-    "fill_probability": 510,
-    "expected_slippage_bps": 510,
-    "public_trade_imbalance_1m": 112,
-    "ofi_1m": 112,
-    "aggressive_cvd_1m": 112,
-    "perpetual_basis_bps": 10,
-    "funding_rate": 2
+  "feature_observation_counts_by_symbol": {
+    "BTCUSDT": {
+      "orderbook_spread_bps": 198,
+      "bybit_orderbook_delta_l5": 198,
+      "orderbook_imbalance_l5": 198,
+      "orderbook_depth_usdt_l5": 198,
+      "microprice_deviation_bps": 198,
+      "fill_probability": 198,
+      "expected_slippage_bps": 198,
+      "public_trade_imbalance_1m": 20,
+      "ofi_1m": 20,
+      "aggressive_cvd_1m": 20,
+      "perpetual_basis_bps": 4,
+      "funding_rate": 1
+    },
+    "ETHUSDT": {
+      "orderbook_spread_bps": 222,
+      "bybit_orderbook_delta_l5": 222,
+      "orderbook_imbalance_l5": 222,
+      "orderbook_depth_usdt_l5": 222,
+      "microprice_deviation_bps": 222,
+      "fill_probability": 222,
+      "expected_slippage_bps": 222,
+      "public_trade_imbalance_1m": 45,
+      "ofi_1m": 45,
+      "aggressive_cvd_1m": 45,
+      "perpetual_basis_bps": 5,
+      "funding_rate": 1
+    }
   },
+  "total_feature_observations": 3146,
+  "pit_chronology_violations": 0,
   "missing_in_short_smoke": {
     "liquidation_imbalance_5m": "no liquidation event arrived during the 15-second capture",
     "open_interest_change_1h": "one hour of observation history is required"

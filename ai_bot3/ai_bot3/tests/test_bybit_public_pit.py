@@ -37,7 +37,8 @@ def test_orderbook_snapshot_delta_and_disconnect_are_pit_and_fail_closed(tmp_pat
     }
     accepted = ingestor.ingest(snapshot, received_at=received)
     assert accepted["status"] == "accepted"
-    point = store.features.snapshot(
+    point = store.latest_features(
+        "BTCUSDT",
         [
             "orderbook_spread_bps",
             "bybit_orderbook_delta_l5",
@@ -46,12 +47,22 @@ def test_orderbook_snapshot_delta_and_disconnect_are_pit_and_fail_closed(tmp_pat
             "fill_probability",
             "expected_slippage_bps",
         ],
-        received,
+        simulated_time=received,
     )
-    assert point.status == "ok"
-    assert point.values["orderbook_depth_usdt_l5"].value > 0
-    assert 0.8 < point.values["fill_probability"].value <= 1.0
-    assert point.values["orderbook_spread_bps"].available_at == received
+    assert set(point) == {
+        "orderbook_spread_bps",
+        "bybit_orderbook_delta_l5",
+        "orderbook_depth_usdt_l5",
+        "microprice_deviation_bps",
+        "fill_probability",
+        "expected_slippage_bps",
+    }
+    assert point["orderbook_depth_usdt_l5"]["value"] > 0
+    assert 0.8 < point["fill_probability"]["value"] <= 1.0
+    assert point["orderbook_spread_bps"]["available_at"].endswith(".250000Z")
+    assert store.latest_features(
+        "ETHUSDT", ["orderbook_spread_bps"], simulated_time=received
+    ) == {}
 
     delta_time = event_time + timedelta(seconds=1)
     delta = {
@@ -84,7 +95,7 @@ def test_orderbook_snapshot_delta_and_disconnect_are_pit_and_fail_closed(tmp_pat
 
     with sqlite3.connect(path) as connection:
         feature_time = connection.execute(
-            """SELECT event_time,available_at FROM raw_observations
+            """SELECT event_time,available_at FROM bybit_feature_observations
                  WHERE name='orderbook_spread_bps' ORDER BY sequence DESC LIMIT 1"""
         ).fetchone()
         parsed = [datetime.fromisoformat(value.replace("Z", "+00:00")) for value in feature_time]
@@ -149,7 +160,8 @@ def test_public_trades_liquidations_and_ticker_create_direct_observations(tmp_pa
     result = ingestor.ingest(ticker_1, received_at=hour + timedelta(milliseconds=100))
     assert result["features"]["open_interest_change_1h"][0] == 0.1
 
-    point = store.features.snapshot(
+    point = store.latest_features(
+        "BTCUSDT",
         [
             "public_trade_imbalance_1m",
             "ofi_1m",
@@ -159,8 +171,7 @@ def test_public_trades_liquidations_and_ticker_create_direct_observations(tmp_pa
             "funding_rate",
             "open_interest_change_1h",
         ],
-        hour + timedelta(milliseconds=100),
-        minimum_coverage=1.0,
+        simulated_time=hour + timedelta(milliseconds=100),
     )
-    assert point.values["open_interest_change_1h"].value == 0.1
-    assert point.values["funding_rate"].value == 0.0002
+    assert point["open_interest_change_1h"]["value"] == 0.1
+    assert point["funding_rate"]["value"] == 0.0002
