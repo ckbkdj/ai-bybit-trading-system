@@ -170,14 +170,17 @@ def main() -> int:
         port = free_port()
         base_url = f"http://127.0.0.1:{port}"
         environment = dict(os.environ)
+        existing_pythonpath = environment.get("PYTHONPATH", "")
         environment.update(
             {
                 "CONTROL_PLANE_DB": str(control_db),
                 "RESEARCH_JOB_DB": str(temp / "research.sqlite3"),
-                "PYTHONPATH": str(AI_ROOT),
                 "BYBIT_TRADING_MODE": "shadow",
                 "BYBIT_ENABLE_LIVE": "false",
             }
+        )
+        environment["PYTHONPATH"] = str(AI_ROOT) + (
+            os.pathsep + existing_pythonpath if existing_pythonpath else ""
         )
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         server = subprocess.Popen(
