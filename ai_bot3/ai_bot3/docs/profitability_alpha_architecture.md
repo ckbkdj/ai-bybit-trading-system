@@ -1,0 +1,202 @@
+# Profitability-First Alpha v2：真实架构与边界
+
+> 状态：shadow 工程候选，尚未达到 candidate/live 盈利门禁。当前 Brain 模型只保留为 baseline；Bybit 主网交易开关未启用。
+
+## 1. 目标和成功定义
+
+这套重构不以测试数量或分类准确率为成功标准。成功必须同时具备：
+
+- 完全未参与调参的 lockbox 在手续费、点差、滑点、资金费后净收益为正；
+- Profit Factor、bootstrap 收益下界、walk-forward 稳定性和真实盘中回撤全部过门禁；
+- 收益不集中于单币种、单月份或单一行情；
+- 通过持续 shadow、测试网、回撤演练和人工批准；
+- 任一证据不足时失败关闭，不产生 `candidate_release_manifest.json` 或 OperationTicket。
+
+任何历史结果都不能保证未来保本或必然盈利。
+
+## 2. 总体架构图
+
+```mermaid
+flowchart TD
+    A[旧线上 K 线与 Brain 逻辑<br/>只读复用] --> B[因果技术特征]
+    C[Bybit 公共 WS / 官方 archive / 官方 REST] --> D[Bybit PIT SQLite<br/>event / available / ingested / hash]
+    E[参考 data_service canonical panel<br/>PASS SHA + 显式资产白名单 + 30h lag] --> F[跨资产 PIT returns]
+    G[FRED / ALFRED 官方 API<br/>output 4 初值 + output 3 修订] --> H[宏观 vintage PIT SQLite<br/>原始响应哈希]
+
+    B --> I[Triple Barrier 全持仓路径标签]
+    D --> J[按 symbol + available_at as-of join]
+    F --> K[全局 available_at as-of join]
+    H --> K
+    I --> L[跨币种 pooled panel<br/>180 / 900 / 7200 / 14400 / 86400]
+    J --> L
+    K --> L
+
+    L --> M[旧 lockbox 永久封存]
+    L --> N[development-only<br/>purge + embargo]
+    N --> O[inner walk-forward 选参]
+    O --> P[一级模型 OOF<br/>方向 / 净收益 / MAE / MFE / 不确定性]
+    P --> Q[二级 OOF meta-label<br/>TRADE / NO_TRADE]
+    Q --> R[逐组 OOS 因子消融]
+    R --> S[事件驱动回测<br/>逐时间点 MTM]
+    S --> T{development 盈利门禁}
+
+    T -- 失败 --> U[stage=rejected<br/>candidate=0 / live=0]
+    T -- 通过 --> V[申请一次新 lockbox]
+    V --> W{lockbox 全成本门禁}
+    W -- 失败 --> U
+    W -- 通过 --> X[candidate manifest]
+    X --> Y[持续 shadow]
+    Y --> Z[Bybit 测试网 + 回撤演练]
+    Z --> AA[人工批准]
+    AA --> AB[live 发布状态机]
+```
+
+## 3. 模块职责
+
+| 层 | 主要模块 | 只负责什么 | 不允许做什么 |
+|---|---|---|---|
+| 原始数据 | `core/providers/*` | 抓取、解析、哈希、PIT 时间和 append-only 证据 | 训练、调参、生成交易信号 |
+| PIT 接入 | `core/training/bybit_pit_panel.py`、`macro_pit_panel.py`、`pit_factor_panel.py` | 冻结 sequence/SHA，按决策时间 as-of join，执行 staleness 和来源契约 | 广播当前值到历史、填造缺失因子 |
+| 标签 | `core/labels/triple_barrier.py` | entry fill、TP/SL、max holding、费用、MAE/MFE、partial fill、exit reason | close-to-close 冒充成交结果 |
+| 数据集 | `core/training/pooled_panel.py` | pooled panel、因果 regime、purge、embargo、sealed lockbox | 使用全样本定义 regime、物化封存 lockbox 标签 |
+| 选模 | `core/training/nested_walk_forward.py` | inner OOS 选参，outer OOS 只评分一次 | 用 outer OOS 调参 |
+| 模型 | `core/models/two_stage.py` | 一级 OOF 预测、二级 meta-label、OOF conformal/分位数校准 | 用训练内残差训练二级或声称校准 |
+| 回测 | `core/backtest/event_driven.py` | 手续费、点差、动态滑点、funding、partial fill、timeout、latency、路径、MTM | 省略成本、只算收盘收益 |
+| 门禁 | `core/evaluation/profitability_gate.py` | development/lockbox 盈利、回撤、稳定性、集中度和压力测试 | 降低门槛迁就模型 |
+| 发布 | `core/release/*` | 绑定模型、报告、commit、lockbox fingerprint | 未过门禁生成 candidate/live |
+| 生产推理 | `core/models/profitability_runtime.py`、`core/result_manager.py` | 验证 release manifest 后产生并消费 `alpha_prediction` | Brain baseline 独立出票 |
+| 交易安全 | 原 hardening 交易模块 | cancel/REPLACE、hedge、kill switch、双开关 | 被研究代码绕过 |
+
+## 4. 固定周期契约
+
+周期定义只有以下一套：
+
+| 名称 | 秒 | K 线 |
+|---|---:|---|
+| scalping | 180 | 3m |
+| mid_short | 900 | 15m |
+| trend | 7200 | 2h |
+| trend_swing | 14400 | 4h |
+| swing | 86400 | 1d |
+
+标签、训练、模型 artifact、runtime 和 `ResultManager` 都必须使用同一秒数；不允许用旧名称偷偷映射到别的周期。
+
+## 5. 当前真实因子来源
+
+### 5.1 旧线上经验的复用
+
+- 价格、成交量和 Brain 技术逻辑仍作为 `legacy_brain_technical` baseline。
+- 旧模型、数据库和策略均保留，当前状态为 rejected/baseline，不独立出票。
+- 因果技术特征只使用决策点之前的 K 线；regime 在每个训练窗口内因果计算。
+
+### 5.2 Bybit 短周期
+
+| 因子组 | 原始来源 | 证据语义 |
+|---|---|---|
+| orderbook | Bybit public orderbook WS、官方历史 archive | L5 delta、spread、depth、microprice；archive 是 exchange-event replay，不冒充 live capture |
+| public trades | Bybit public trades WS、官方历史 archive | trade imbalance、OFI/CVD；保留 event/available/ingested 时间 |
+| derivatives | Bybit 官方 funding、OI、mark/index kline REST | basis、settled funding、OI change；每个响应保留哈希和请求 manifest |
+| liquidations | `allLiquidation` public WS | 按 Bybit 语义 `S=Buy => long position liquidated`；v1 永久失效，v2 生效 |
+| execution quality | 真实盘口状态派生 | fill probability、expected slippage；没有盘口证据时不得用 OHLCV 猜测代替 |
+
+### 5.3 中长周期跨资产
+
+参考服务仅接纳 canonical panel 中显式白名单的基础价格，并核验最近一次 PASS SHA：
+
+- SPY、QQQ；
+- TLT、UUP；
+- GLD、USO；
+- XLV、IBB；
+- FXI、KWEB；
+- COIN、MSTR。
+
+日频值使用 30 小时保守可用延迟。当前值、公式衍生列、无 PIT 的 MCP 列不得回填历史。
+
+### 5.4 FRED / ALFRED vintage
+
+| 因子 | 官方 series / output | 说明 |
+|---|---|---|
+| VIX | VIXCLS / output 4 | 初次发布值；节假日 carry 行使用更保守的 observation/vintage 最大日期 |
+| 10Y 实际利率 | DFII10 / output 4 | 真实 TIPS real yield，不再用名义利率减 CPI 的代理冒充 |
+| CPI 初值同比 | CPIAUCSL / output 4 | 只使用各月 first release |
+| 非农初值变化 | PAYEMS / output 4 | 相邻月份 first-release level 差 |
+| 失业率初值 | UNRATE / output 4 | first release |
+| CPI/非农修订 | CPIAUCSL、PAYEMS / output 3 | 按 vintage 的实际修订 delta |
+| Tier-A 状态 | CPI/非农 release vintage | 发布后 24 小时为 1，随后显式复位为 0 |
+
+所有宏观响应都保存原始内容 SHA-256；API key 不写入 URL descriptor、数据库、报告或异常。
+
+### 5.5 尚未合格的 flow
+
+- DefiLlama stablecoin 历史是当前抓取时得到的重建 stock history，只能以 fetch-time 为可用时间；不能冒充历史 exchange netflow。
+- CoinShares 当前公开页只能从首次本地观察日起向前积累；不是历史 vintage archive，也不是 issuer-level ETF cash flow。
+- 因此 flow 组当前必须 `FAILED_DATA_UNAVAILABLE` 或 forward-only collecting，不能进入正式 feature set。
+
+## 6. 防泄漏与过拟合控制
+
+1. `available_at <= decision_at`；标签只在完整退出路径结束后可用。
+2. 同一决策时间的 BUY/SELL 是配对备选，不当成两个独立交易。
+3. 持仓窗口不重叠采样；外层 purge 至少覆盖 horizon，另加 embargo。
+4. 一级模型的 OOF 预测训练二级模型；分位数和 conformal 下界来自 OOF 校准。
+5. inner walk-forward 可选参数；outer OOS 永不选参。
+6. development 未通过前不打开新 lockbox；旧 lockbox 永久封存。
+7. 所有实验进入 trial ledger，失败实验也保留。
+8. 因子只有在完整组、足量真实 OOS trades、费用后稳定改善时才能 retained。
+
+## 7. 事件回测和回撤
+
+回测以订单和市场事件为单位，而不是把预测行乘未来 close return：
+
+- maker/taker fee、spread、动态 slippage、funding；
+- fill probability、partial fill、order timeout；
+- latency、cancel/fill race；
+- stop/take-profit 的盘中路径和 max holding；
+- 单仓、总仓和杠杆约束；
+- 每个市场观测点对所有持仓 mark-to-market，计算真实盘中组合 drawdown。
+
+没有真实盘口/成交的 shadow 证据时，`execution_evidence_complete=false`，即便回测盈利也不能晋升。
+
+## 8. 发布状态机
+
+```mermaid
+stateDiagram-v2
+    [*] --> Rejected
+    Rejected --> Development: 新 trial，锁定数据/代码/参数
+    Development --> Rejected: 任一 development gate 失败
+    Development --> LockboxRequested: development 全通过
+    LockboxRequested --> LockboxScored: 一次性人工授权
+    LockboxScored --> Rejected: 任一 lockbox gate 失败
+    LockboxScored --> Candidate: 全成本和稳定性门禁通过
+    Candidate --> Shadow
+    Shadow --> Rejected: drift/执行/回撤失败
+    Shadow --> Testnet: 足量 shadow 成交证据
+    Testnet --> Rejected: 测试网或 kill-switch 演练失败
+    Testnet --> LiveApproved: 人工批准
+    LiveApproved --> Live: 主网双开关另行授权
+```
+
+当前分支不得进入 `LiveApproved` 或 `Live`。
+
+## 9. 当前耦合性判断
+
+已经拆开的边界：
+
+- provider 不认识模型；
+- PIT loader 不认识交易模块；
+- model 不直接写订单；
+- release manifest 是研究与生产推理之间的版本化接口；
+- `ResultManager` 只消费通过 manifest 校验的 `alpha_prediction`。
+
+仍需继续降低的耦合：
+
+- `core/evaluation/profitability_rebuild.py` 目前同时编排标签、因子消融、训练、回测和报告，是主要 orchestration hotspot；行为稳定后应拆成 dataset、ablation、development、lockbox 四个 runner。
+- SQLite 同库同时承担 live capture 和大规模 archive replay 会放大 WAL/锁竞争；产品化应采用采集库与研究快照库分离，再用只读 snapshot/backup 交接。
+- 外部参考 panel 的 2GB 级 SHA 全量校验成本较高；应保留 SHA 门禁，同时增加已验证 artifact receipt/cache，不降低校验标准。
+
+## 10. 现阶段明确不成立的结论
+
+- 测试通过不等于策略盈利；
+- 数据接口存在不等于因子有效；
+- 0 trades / 0 drawdown 不是合格结果；
+- 回测历史正收益不能保证未来盈利；
+- 当前仍没有可诚实宣称可放真钱的 release。

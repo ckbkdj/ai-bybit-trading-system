@@ -1,0 +1,261 @@
+# Profitability-First Alpha v2：运行与恢复手册
+
+> 本手册默认只运行研究、shadow 和 public market-data capture。不要启用 Bybit live，不要修改主网双开关。
+
+## 1. 目录和环境
+
+当前开发工作区：
+
+```text
+D:\Money
+```
+
+参考数据服务只读根目录：
+
+```text
+D:\lh\trad_data_service_20260821\data_service
+```
+
+进入项目目录：
+
+```powershell
+Set-Location D:\Money\ai_bot3\ai_bot3
+```
+
+使用项目锁定依赖；生产部署应换成正式 venv，但版本必须与锁文件一致：
+
+```powershell
+$env:PYTHONPATH='D:\Money\.test-deps312'
+```
+
+API key 只放进环境变量或机器本地 `.env.local`。报告、命令行输出、Git 和 trial ledger 都不能出现 key。
+
+## 2. 运行前安全检查
+
+必须确认：
+
+1. 当前 Git 分支为 `codex/complete-profitability-alpha-v2`；
+2. PR #4 仍是 Draft；
+3. Bybit live 未启用，主网双开关未修改；
+4. 旧 lockbox 没有被重新使用；
+5. D 盘有足够空间；
+6. 没有多个 archive backfill 同时写同一 SQLite；
+7. 实验使用的 Bybit/macro observation sequence 已冻结；
+8. 运行 commit 与 `--code-commit` 一致。
+
+测试：
+
+```powershell
+python -m pytest -q
+```
+
+测试通过只说明程序回归通过，不说明盈利门禁通过。
+
+## 3. FRED / ALFRED PIT 回填
+
+只读调用官方 API，保存脱敏 descriptor、原始响应和 SHA-256：
+
+```powershell
+python scripts/backfill_fred_alfred_pit.py `
+  --start 2018-01-01 `
+  --end 2026-08-20 `
+  --database data/macro_pit.sqlite3 `
+  --cache-dir data/fred_alfred_cache `
+  --env-file D:\lh\trad_data_service_20260821\data_service\.env.local `
+  --report model_results/evaluation/fred_alfred_backfill_report.json
+```
+
+合格审计至少包括：
+
+- 所有 HTTP status 为 200；
+- raw file 长度和 SHA 与 response evidence 一致；
+- request descriptor 不含 `api_key`；
+- `event_time <= available_at <= ingested_at` 违规为 0；
+- `current_snapshot_substitution=false`；
+- output 4 和 output 3 分别保留初值与修订；
+- VIXCLS/DFII10 超过官方 2000 vintage 上限时按 realtime window 分片。
+
+## 4. Bybit public-only 实时采集
+
+启动命令只允许公开线性行情 endpoint，不含认证或交易参数：
+
+```powershell
+python scripts/run_bybit_public_pit_collector.py `
+  --database data/bybit_public_pit.sqlite3
+```
+
+启动输出必须显示：
+
+```json
+{
+  "mode": "public_market_data_capture_only",
+  "authentication": false,
+  "trading": false
+}
+```
+
+数据库中最新 `bybit_capture_sessions` 必须为：
+
+- endpoint：`wss://stream.bybit.com/v5/public/linear`；
+- status：`running`；
+- error：`null`；
+- sequence 持续增加。
+
+如果进程存在但 session 不更新，先看 stderr 重连日志。不要把“PID 活着”当作采集成功。
+
+## 5. Bybit 官方历史 archive 回填
+
+archive replay 与实时采集共用数据库时只能单进程运行。更推荐先停 public collector，完成一批 archive、checkpoint 后再恢复 collector。
+
+```powershell
+python scripts/backfill_bybit_historical_archive.py `
+  --start 2026-07-15 `
+  --end 2026-08-20 `
+  --symbols BTCUSDT ETHUSDT XRPUSDT SOLUSDT 1000PEPEUSDT `
+  --kinds orderbook trades `
+  --database data/bybit_public_pit.sqlite3 `
+  --cache-dir data/bybit_archive_cache `
+  --emit-interval-sec 15 `
+  --assumed-feed-latency-ms 1000 `
+  --report model_results/evaluation/bybit_archive_backfill_report.json
+```
+
+脚本会跳过 `status=completed` 的 append-only manifest；失败项必须保留并在单进程重试，不能把 failed 改成 completed。
+
+合格条件：
+
+- 日期数 × 5 symbols × 2 kinds 全部 completed；
+- failed=0；
+- 每个 archive 的 source URL、content length、SHA、member、首末 event time、rows 和 feature count 完整；
+- orderbook/trades 事件都属于对应 UTC trading date；
+- archive replay 明确不是 live capture；
+- 不使用 OHLCV 推测盘口。
+
+## 6. Bybit 官方衍生品历史
+
+使用官方 funding history、open-interest history、mark/index kline，保留每个请求响应哈希和 batch manifest。运行前后检查：
+
+- funding 是已结算费率，不是未来预告；
+- OI change 只用决策时已发布观测；
+- basis 使用同时间的 mark/index；
+- 任何 ret_code、HTTP、分页或 chronology 失败都会使 batch failed；
+- liquidation 不从 OHLCV/REST 伪造。
+
+## 7. SQLite WAL 安全恢复
+
+### 7.1 何时处理
+
+出现以下任一情况先停止大规模 archive writers：
+
+- 多个 backfill 重叠；
+- `database is locked` 持续增加；
+- WAL 快速增长；
+- 剩余空间不足以完成本批次。
+
+### 7.2 原则
+
+- 不手工删除有效 `-wal`；
+- 先停止 archive writers；
+- 必要时短暂停止 public-only collector；
+- 使用 SQLite 自己执行 checkpoint；
+- 验证已 checkpoint frame 数等于总 frame 数；
+- 关闭最后连接后确认旧 WAL 由 SQLite 自动移除；
+- 再恢复 collector，并验证新 running session 和 sequence 增长。
+
+示例：
+
+```powershell
+python -c "import sqlite3; c=sqlite3.connect(r'data/bybit_public_pit.sqlite3', timeout=300); print(c.execute('pragma wal_checkpoint(PASSIVE)').fetchone()); c.close()"
+```
+
+不要在磁盘不足时运行会产生大型临时结构的全库 `quick_check`。优先使用 checkpoint 计数、关键表计数、随机范围读取、来源哈希和小批次验证；需要完整 integrity check 时先准备足够临时空间或复制到独立研究盘。
+
+## 8. Development-only 盈利实验
+
+在 development 阶段接入真实跨资产和 macro PIT；Bybit 历史未完整前可先省略 `--bybit-pit-store` 做中长周期研究，但短周期因子组会失败关闭：
+
+```powershell
+python scripts/run_profitability_rebuild.py `
+  --trad-panel-root D:\lh\trad_data_service_20260821\data_service `
+  --macro-pit-store D:\Money\ai_bot3\ai_bot3\data\macro_pit.sqlite3 `
+  --bybit-pit-store D:\Money\ai_bot3\ai_bot3\data\bybit_public_pit.sqlite3 `
+  --max-bars-per-symbol 200000 `
+  --walk-forward-folds 3
+```
+
+退出码：
+
+| 退出码 | 含义 |
+|---:|---|
+| 0 | 当前作用域全部门禁通过；仍需核对是否只是 development，不能直接 live |
+| 1 | pipeline 异常，已写失败输出和 ledger |
+| 2 | pipeline 完成但盈利/证据门禁失败，正确状态是 rejected |
+
+每个 trial 必须在 `data/research_trials.sqlite3` 中保留 running、阶段事件和最终 rejected/candidate 记录。不要删除失败 trial。
+
+## 9. 报告阅读顺序
+
+按以下顺序审阅：
+
+1. `factor_ablation_report.json`：真实数据、完整组、足量 trades、fold 改善；
+2. `walk_forward_report.json`：outer OOS 是否从未参与调参；
+3. `execution_cost_report.json`：费率、滑点、partial fill、latency、MTM；
+4. `capital_preservation_report.json`：单笔、日/周损失、回撤、杠杆和止损；
+5. `profitability_report.json`：development/lockbox 门禁总结果；
+6. `lockbox_report.json`：未获授权时必须保持 sealed/unlabeled；
+7. `candidate_release_manifest.json`：只有全部门禁通过时才允许存在。
+
+失败时应明确看到：
+
+```text
+profitability_gate=FAILED
+candidate_count=0
+live_count=0
+```
+
+0 signals、0 trades、净收益 0、回撤 0 不是完成证据。
+
+## 10. 因子消融验收
+
+每个 baseline/augmented arm 至少满足代码中预先锁定的 OOS trade/fold 下限。只有以下条件同时满足才 retained：
+
+- 完整因子组没有 missing required factor；
+- 相同 purged outer folds；
+- 相同成本、风险和事件回测；
+- baseline 和 augmented 都有足量真实交易；
+- 费用后平均改善、正改善 fold 比例和最差 fold 退化都过门槛。
+
+研究用固定 2% OOS ranking 只用于测量因子增益。它可以让负 edge 信号进入“研究回测”，但不会改写真实 lower-bound edge，也不会放松生产 TRADE gate。
+
+## 11. Lockbox 操作
+
+当前禁止打开新 lockbox。只有 development 报告全部通过后：
+
+1. 固化 code commit、数据 SHA、sequence、参数和 trial ID；
+2. 人工审批一次新 lockbox；
+3. 只评分一次，不调参；
+4. 结果无论好坏立即登记为 consumed；
+5. 失败后回 development，但不能再次使用该 lockbox；
+6. 通过后最多生成 candidate，仍不能 live。
+
+## 12. Shadow、测试网和人工批准
+
+candidate 后仍需：
+
+- 长时间 shadow soak；
+- 足量实际信号、订单意图、取消、partial fill 和结算证据；
+- 2× 成本和延迟压力；
+- 数据源中断、模型缺失、manifest 不一致、kill switch 演练；
+- Bybit 测试网；
+- 独立人工批准。
+
+主网双开关不属于本研究 runner 的权限范围。
+
+## 13. Git 和发布纪律
+
+- 只在 `codex/complete-profitability-alpha-v2` 推送；
+- PR #4 始终 Draft，未达到全部指标前不得合并；
+- runtime 报告和本地数据库不提交；
+- 源码、测试、文档分别使用精确文件列表暂存，避免带入用户运行产物；
+- 每个重要证据提交后在 PR Conversation 留审计说明；
+- 不删除旧模型、数据库、策略或失败记录。
