@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
@@ -16,6 +17,8 @@ from core.providers.bybit_public_pit import (
     BybitPublicPITStore,
     StalePublicEvent,
 )
+from core.training.bybit_pit_panel import BybitPITFeatureSource
+from scripts.rebuild_bybit_liquidation_semantics import main as rebuild_liquidations
 
 
 def _ms(value: datetime) -> int:
@@ -176,7 +179,7 @@ def test_public_trades_liquidations_and_ticker_create_direct_observations(tmp_pa
     result = ingestor.ingest(
         liquidations, received_at=event_time + timedelta(seconds=1, milliseconds=100)
     )
-    assert result["imbalance"] == 1 / 3
+    assert result["imbalance"] == -1 / 3
 
     ticker_0 = {
         "topic": "tickers.BTCUSDT",
@@ -219,6 +222,102 @@ def test_public_trades_liquidations_and_ticker_create_direct_observations(tmp_pa
     )
     assert point["open_interest_change_1h"]["value"] == 0.1
     assert point["funding_rate"]["value"] == 0.0002
+    assert point["liquidation_imbalance_5m"]["value"] == -1 / 3
+    assert point["liquidation_imbalance_5m"]["source"] == "bybit.public.liquidations.v2"
+
+
+def test_inverted_liquidation_v1_is_preserved_but_invalidated(tmp_path):
+    path = tmp_path / "bybit.sqlite3"
+    event_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    store = BybitPublicPITStore(path)
+    assert store.append_feature(
+        event_id="old-side-contract",
+        symbol="BTCUSDT",
+        name="liquidation_imbalance_5m",
+        value=0.5,
+        unit="ratio",
+        event_time=event_time,
+        received_at=event_time + timedelta(milliseconds=100),
+        source="bybit.public.liquidations",
+        quality=1.0,
+    )
+    store.close()
+
+    migrated = BybitPublicPITStore(path)
+    migrated.close()
+    history, evidence = BybitPITFeatureSource(path).load(
+        ["liquidation_imbalance_5m"]
+    )
+    assert history.empty
+    assert evidence["invalidated_observation_count"] == 1
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM bybit_feature_observations"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM bybit_feature_invalidations"
+        ).fetchone()[0] == 1
+
+
+def test_liquidation_v2_rebuild_uses_retained_raw_events(tmp_path, monkeypatch):
+    path = tmp_path / "bybit.sqlite3"
+    report = tmp_path / "rebuild.json"
+    event_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    received_at = event_time + timedelta(milliseconds=100)
+    payload = {
+        "T": _ms(event_time),
+        "s": "BTCUSDT",
+        "S": "Buy",
+        "v": "2",
+        "p": "100",
+    }
+    store = BybitPublicPITStore(path)
+    assert store.append_raw(
+        event_id="liq:BTCUSDT:retained",
+        session_id="legacy-session",
+        topic="allLiquidation.BTCUSDT",
+        symbol="BTCUSDT",
+        event_type="liquidation",
+        exchange_time=event_time,
+        received_at=received_at,
+        payload=payload,
+    )
+    assert store.append_feature(
+        event_id="liq:BTCUSDT:retained",
+        symbol="BTCUSDT",
+        name="liquidation_imbalance_5m",
+        value=1.0,
+        unit="ratio",
+        event_time=event_time,
+        received_at=received_at,
+        source="bybit.public.liquidations",
+        quality=1.0,
+    )
+    store.close()
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "rebuild_bybit_liquidation_semantics.py",
+            "--database",
+            str(path),
+            "--report",
+            str(report),
+        ],
+    )
+    assert rebuild_liquidations() == 0
+    output = json.loads(report.read_text(encoding="utf-8"))
+    assert output["old_observations_deleted"] is False
+    assert output["invalidated_v1_observations"] == 1
+    assert output["v2_observations_inserted"] == 1
+
+    history, evidence = BybitPITFeatureSource(path).load(
+        ["liquidation_imbalance_5m"]
+    )
+    assert history["value"].tolist() == [-1.0]
+    assert history["source"].tolist() == ["bybit.public.liquidations.v2"]
+    assert evidence["invalidated_observation_count"] == 1
 
 
 def test_collector_cadence_samples_raw_book_evidence_and_bounds_feature_amplification(

@@ -26,7 +26,7 @@ BYBIT_FEATURE_SOURCE_CONTRACTS: Mapping[str, str] = {
     "perpetual_basis_bps": "bybit.public.ticker",
     "funding_rate": "bybit.public.ticker",
     "open_interest_change_1h": "bybit.public.ticker",
-    "liquidation_imbalance_5m": "bybit.public.liquidations",
+    "liquidation_imbalance_5m": "bybit.public.liquidations.v2",
 }
 
 BYBIT_FEATURE_ALLOWED_SOURCES: Mapping[str, tuple[str, ...]] = {
@@ -160,13 +160,37 @@ class BybitPITFeatureSource:
                 if "api_batch_id" in feature_columns
                 else "NULL AS api_batch_id"
             )
+            invalidation_table = connection.execute(
+                """SELECT 1 FROM sqlite_master
+                     WHERE type='table' AND name='bybit_feature_invalidations'"""
+            ).fetchone()
+            invalidation_clause = (
+                "AND observation_id NOT IN (SELECT observation_id FROM bybit_feature_invalidations)"
+                if invalidation_table
+                else ""
+            )
+            invalidated_observation_count = (
+                int(
+                    connection.execute(
+                        f"""SELECT COUNT(*)
+                               FROM bybit_feature_invalidations i
+                               JOIN bybit_feature_observations o
+                                 ON o.observation_id=i.observation_id
+                              WHERE o.name IN ({placeholders}) AND o.sequence<=?""",
+                        requested + (frozen_sequence,),
+                    ).fetchone()[0]
+                )
+                if invalidation_table
+                else 0
+            )
             rows = connection.execute(
                 f"""SELECT sequence,observation_id,symbol,name,value,unit,event_time,
                             available_at,ingested_at,source,quality,
                             {provenance_expression},{archive_expression},
                             {api_batch_expression}
                        FROM bybit_feature_observations
-                      WHERE name IN ({placeholders}) AND sequence<=?
+                       WHERE name IN ({placeholders}) AND sequence<=?
+                             {invalidation_clause}
                       ORDER BY symbol,name,available_at,sequence""",
                 requested + (frozen_sequence,),
             ).fetchall()
@@ -181,6 +205,7 @@ class BybitPITFeatureSource:
                 "feature_coverage": {},
                 "snapshot_maximum_sequence": frozen_sequence,
                 "snapshot_sha256": hashlib.sha256(b"").hexdigest(),
+                "invalidated_observation_count": invalidated_observation_count,
             }
         accepted_source = frame.apply(
             lambda row: str(row["source"])
@@ -200,6 +225,7 @@ class BybitPITFeatureSource:
                 "rejected_source_contract_count": rejected_source_contract_count,
                 "snapshot_maximum_sequence": frozen_sequence,
                 "snapshot_sha256": hashlib.sha256(b"").hexdigest(),
+                "invalidated_observation_count": invalidated_observation_count,
             }
         for column in ("event_time", "available_at", "ingested_at"):
             frame[column] = pd.to_datetime(
@@ -355,6 +381,7 @@ class BybitPITFeatureSource:
             "feature_coverage": coverage,
             "rejected_low_quality_count": rejected_low_quality_count,
             "rejected_source_contract_count": rejected_source_contract_count,
+            "invalidated_observation_count": invalidated_observation_count,
             "feature_source_contracts": {
                 name: list(BYBIT_FEATURE_ALLOWED_SOURCES[name]) for name in requested
             },
@@ -445,6 +472,15 @@ class BybitPITFeatureSource:
         values: dict[str, float] = {}
         available: dict[str, str] = {}
         with closing(self._connect()) as connection:
+            invalidation_table = connection.execute(
+                """SELECT 1 FROM sqlite_master
+                     WHERE type='table' AND name='bybit_feature_invalidations'"""
+            ).fetchone()
+            invalidation_clause = (
+                "AND observation_id NOT IN (SELECT observation_id FROM bybit_feature_invalidations)"
+                if invalidation_table
+                else ""
+            )
             for name in names:
                 definition = self.registry.require(name)
                 expected_sources = BYBIT_FEATURE_ALLOWED_SOURCES.get(name)
@@ -457,6 +493,7 @@ class BybitPITFeatureSource:
                          FROM bybit_feature_observations
                          WHERE symbol=? AND name=? AND source IN ({source_placeholders})
                            AND available_at<=? AND quality>=?
+                           {invalidation_clause}
                          ORDER BY available_at DESC,sequence DESC LIMIT 1""",
                     (
                         normalized_symbol,

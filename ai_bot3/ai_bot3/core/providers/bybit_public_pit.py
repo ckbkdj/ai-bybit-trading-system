@@ -115,6 +115,12 @@ class BybitPublicPITStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_bybit_feature_pit
                     ON bybit_feature_observations(symbol,name,available_at,sequence);
+                CREATE TABLE IF NOT EXISTS bybit_feature_invalidations(
+                    observation_id TEXT PRIMARY KEY,
+                    invalidated_at TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    correction_version TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS bybit_historical_archive_files(
                     archive_id TEXT PRIMARY KEY,
                     data_kind TEXT NOT NULL,
@@ -196,6 +202,21 @@ class BybitPublicPITStore:
                     """ALTER TABLE bybit_feature_observations
                        ADD COLUMN api_batch_id TEXT"""
                 )
+            # The original liquidation-side interpretation was the inverse of
+            # Bybit's documented position-side contract. Preserve those rows for
+            # audit, but make them ineligible everywhere before v2 is rebuilt.
+            connection.execute(
+                """INSERT OR IGNORE INTO bybit_feature_invalidations(
+                       observation_id,invalidated_at,reason,correction_version
+                   )
+                   SELECT observation_id,?,
+                          'Bybit allLiquidation S=Buy means a long position was liquidated; v1 inverted the side',
+                          'bybit-liquidation-side-v2'
+                     FROM bybit_feature_observations
+                    WHERE name='liquidation_imbalance_5m'
+                      AND source='bybit.public.liquidations'""",
+                (_iso(datetime.now(timezone.utc)),),
+            )
         if self.batch_writes:
             self._batch_connection = self.connect()
 
@@ -684,6 +705,9 @@ class BybitPublicPITStore:
                 row = connection.execute(
                     """SELECT * FROM bybit_feature_observations
                          WHERE symbol=? AND name=? AND available_at<=?
+                           AND observation_id NOT IN (
+                               SELECT observation_id FROM bybit_feature_invalidations
+                           )
                          ORDER BY available_at DESC,sequence DESC LIMIT 1""",
                     (symbol.strip().upper(), name, cutoff),
                 ).fetchone()
@@ -1159,8 +1183,9 @@ class BybitPublicPITIngestor:
             latest_event = max(latest_event or event_time, event_time)
             latest_id = event_id
             notional = float(row["p"]) * float(row["v"])
-            # Bybit S=Buy closes a liquidated short; S=Sell closes a long.
-            position = "short" if str(row["S"]).lower() == "buy" else "long"
+            # Bybit's allLiquidation contract is position-side, not taker-side:
+            # S=Buy means a long was liquidated; S=Sell means a short.
+            position = "long" if str(row["S"]).lower() == "buy" else "short"
             self.liquidations[symbol].append((received_at, notional, position))
         cutoff = received_at - timedelta(minutes=5)
         while self.liquidations[symbol] and self.liquidations[symbol][0][0] < cutoff:
@@ -1172,14 +1197,14 @@ class BybitPublicPITIngestor:
         total = long_value + short_value
         imbalance = (short_value - long_value) / total if total else 0.0
         self._feature(
-            latest_id,
+            f"{latest_id}:bybit-liquidation-side-v2",
             symbol,
             "liquidation_imbalance_5m",
             imbalance,
             "ratio",
             latest_event,
             received_at,
-            "bybit.public.liquidations",
+            "bybit.public.liquidations.v2",
         )
         return {"status": "accepted", "accepted": accepted, "imbalance": imbalance}
 

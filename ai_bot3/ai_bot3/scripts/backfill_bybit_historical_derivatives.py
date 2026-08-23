@@ -173,7 +173,20 @@ def main() -> int:
     }
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps(report, ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            {
+                "status": "PASS" if failed == 0 else "FAILED_PARTIAL",
+                "attempted_batches": attempted,
+                "completed_batches": completed,
+                "skipped_completed_batches": skipped,
+                "failed_batches": failed,
+                "report": str(args.report.resolve()),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
     return 1 if failed else 0
 
 

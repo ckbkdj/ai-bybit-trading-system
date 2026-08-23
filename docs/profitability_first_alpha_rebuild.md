@@ -134,6 +134,18 @@ python ai_bot3\ai_bot3\scripts\backfill_bybit_historical_derivatives.py `
 
 它逐日读取实际结算 funding、5 分钟 OI 以及 1 分钟 mark/index kline，并从严格向后的 1 小时 OI 和同时刻 mark/index 计算 `open_interest_change_1h` 与 `perpetual_basis_bps`。每个请求的 URL、响应 SHA-256、行数和时间都会绑定到原子提交的日批次。2026-08-01 的 1000PEPEUSDT 真实隔离烟测得到 funding 3 条、OI 变化 288 条、basis 1,440 条，共 1,731 条，7 个官方 REST 响应，PIT 时间违规为 0。该接口没有历史 liquidation，因此 liquidation 只允许从已经按事件时间持续采集的官方实时流或有审计合同的历史源补齐。
 
+### Liquidation side v2 修正
+
+查错时确认旧 collector 对 Bybit `allLiquidation` 的 `S` 字段解释反了。官方契约是 `Buy=多仓被强平`、`Sell=空仓被强平`；旧实现误写成相反方向，使 `liquidation_imbalance_5m` 符号倒置。修复后新来源固定为 `bybit.public.liquidations.v2`，正值表示 5 分钟窗口内空仓强平名义金额更多，负值表示多仓强平更多。
+
+旧观测不会删除：数据库追加 `bybit_feature_invalidations` 记录，使 v1 行在训练和运行时读取中失效，同时保留审计原文。因为 collector 已逐条保留原始 liquidation 事件，可以运行下列命令重建 v2；它只追加更正观测，并输出失效/重建计数：
+
+```powershell
+python ai_bot3\ai_bot3\scripts\rebuild_bybit_liquidation_semantics.py `
+  --database ai_bot3\ai_bot3\data\bybit_public_pit.sqlite3 `
+  --report ai_bot3\ai_bot3\model_results\evaluation\bybit_liquidation_semantics_rebuild_report.json
+```
+
 ## 盈利门禁
 
 以下条件必须同时成立：
@@ -190,7 +202,7 @@ python scripts/run_profitability_rebuild.py `
 
 历史正式真实库评估使用 5 个 horizon、15 个 walk-forward fold；development/lockbox 行数分别为 25,058/4,422、25,060/4,420、25,060/4,420、25,060/4,420、17,330/3,740。旧运行在保守的费用后下界门禁下没有产生信号或交易，因此净收益、回撤和成本压力显示为 0；这不是“低回撤盈利”，而是“没有可交易 Alpha”。现在零交易消融会明确标记 `FAILED_INSUFFICIENT_OOS_TRADES`，不得再算作已评估或进入正式特征集。
 
-截至 2026-08-24，预测侧回归 182 项通过，交易侧 hardening、HTTP→shadow→receipt 和依赖漏洞审计继续通过；真实 Bybit 官方 orderbook/trades 归档与 funding/OI/basis REST 一日回放也已通过隔离库验算。但 37 天五币种覆盖、liquidation、真实成交回执、全部因子 OOS 消融以及未消费的新 development 证据仍未完成，所以当前状态仍是 FAILED / SHADOW_ONLY，而不是可部署 candidate。
+截至 2026-08-24，预测侧回归 184 项通过，交易侧 hardening、HTTP→shadow→receipt 和依赖漏洞审计继续通过；真实 Bybit 官方 orderbook/trades 归档与 funding/OI/basis REST 一日回放也已通过隔离库验算，liquidation side v1 失效与 v2 重建测试通过。但 37 天五币种覆盖、足量 liquidation、真实成交回执、全部因子 OOS 消融以及未消费的新 development 证据仍未完成，所以当前状态仍是 FAILED / SHADOW_ONLY，而不是可部署 candidate。
 
 本次 lockbox 指纹是 `893488f8cee82c568316cd54c6ec0017bf39d685ea17dc1aab95ed4a9a299741`，已在 trial ledger 中一次性登记，不会再次用于调参或评估。运行后核对发现命令行声明的完整 commit 字符串存在人工抄写错误；实际运行代码是提交 `7579fb63f93f0e77cf311ec73777de0291b361f8`。本次没有重跑 lockbox，而是以 append-only correction 记录声明值和实际值，计算结果不变；运行器也已增加 HEAD 强校验，防止再次发生。
 

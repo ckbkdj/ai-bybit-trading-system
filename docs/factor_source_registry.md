@@ -28,6 +28,7 @@
 | Bybit 订单簿 | spread、L5 delta/imbalance/depth、microprice、滚动 OFI、top-5 扫单完成比例与 VWAP slippage | Bybit 官方历史归档 + V5 public orderbook snapshot/delta，校验 `u/seq` 并重建每次 L2 状态 | 归档回放和实时 collector 已实现；一日真实文件验算通过，正式多币种覆盖、消融和成交回执仍未完成，不进入真钱模型 |
 | Bybit 主动成交 | aggressive buy/sell、滚动 CVD、成交笔数和名义 | Bybit 官方历史归档 + V5 public trade | 归档回放和实时 collector 已实现；一日真实文件验算通过，正式覆盖和消融未完成 |
 | Bybit funding/OI/basis | 实际结算 funding、严格向后 1 小时 OI 变化、1 分钟 mark/index basis | Bybit V5 funding history、open-interest、mark/index price kline | 官方 REST 日批次回放已实现；一日真实响应验算为 3/288/1,440 条，正式多币种覆盖与消融未完成 |
+| Bybit liquidation | 5 分钟多/空强平名义不平衡 | Bybit V5 `allLiquidation.{symbol}` 实时流；`S=Buy` 是多仓被强平，`S=Sell` 是空仓被强平 | 已修复旧实现的方向反转；v1 只追加失效标记不删除，原始事件可重建为 `bybit.public.liquidations.v2`；官方无历史 REST，覆盖仍不足 |
 | 链上交易所流 | stablecoin/coin exchange netflow、确认数、标签修订风险 | 经批准的专业链上数据供应商或自建节点+版本化标签 | 数据结构已实现；无已批准 provider |
 | 美元流动性/宏观 | Fed balance sheet、RRP、TGA、实际利率、DXY、信用、增长/通胀 surprise | FRED/ALFRED vintage；美国财政部/纽约联储；EIA 等官方源 | PIT/vintage 存储和状态聚合已实现；未配置数据流 |
 | 监管/公司事件 | 申报、监管公告、重要公司文件 | SEC EDGAR API 和各监管机构第一方发布 | 研究任务/source tier 已实现；未配置数据流 |
@@ -38,6 +39,8 @@
 Bybit 历史归档适配器会登记原始 URL、文件 SHA-256、事件范围、读取行数、派生特征数和 `historical_archive_replay` 来源，并强制 `event_time <= available_at <= ingested_at`。2026-08-01 的 1000PEPEUSDT 官方文件隔离验算读取 528,558 条订单簿事件和 118,194 条成交，PIT 时间违规为 0。这个结果只证明真实来源和回放正确性，不等于足量 OOS 数据或 execution evidence：top-5 深度扫单完成比例不是 maker 排队成交概率，真实 fill/partial fill 仍必须来自 shadow/testnet ExecutionReceipt。
 
 衍生品 REST 历史回放使用独立的 `historical_api_replay` 来源。每个日批次保留请求 URL、响应体 SHA-256、行数、请求/接收时间和请求清单哈希；basis 的一分钟收盘值只在 K 线结束并增加保守延迟后可用，OI 变化只引用一小时前已存在的观测。2026-08-01 的 1000PEPEUSDT 实测合计 1,731 个特征、7 个官方响应、PIT 时间违规为 0。Bybit 官方公开接口仍未提供可追溯的历史 liquidation REST 数据，所以不得用 OHLCV、普通成交或 OI 变化伪造爆仓流。
+
+Liquidation 另有一项已确认的语义修复：旧代码把 `S=Buy` 当作空仓被强平，与 Bybit 官方字段说明相反。v1 特征行会保留原样供审计，但通过追加失效表从所有 PIT 读取中排除；新 collector 和原始事件重建只写 v2 来源。这个修复不会把数小时实时采集扩张成历史覆盖，正式因子组仍需足量持续采集或经授权的可审计历史源。
 
 权威接口：
 
