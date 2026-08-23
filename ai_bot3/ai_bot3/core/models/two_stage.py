@@ -213,12 +213,14 @@ class TwoStageAlphaModel:
     """
 
     REQUIRED_LABELS = ("net_return", "mae", "mfe")
+    ACTION_INTERACTION_PREFIX = "__side_x__"
 
     def __init__(self, config: TwoStageConfig | None = None) -> None:
         self.config = config or TwoStageConfig()
         self.encoder = _Encoder()
         self.direction_encoder = _Encoder()
         self.feature_columns: list[str] = []
+        self.action_interaction_columns: list[str] = []
         self.direction_feature_columns: list[str] = []
         self.direction_weights: np.ndarray | None = None
         self.net_weights: np.ndarray | None = None
@@ -234,6 +236,29 @@ class TwoStageAlphaModel:
         self.training_audit: dict[str, object] = {}
         self.fitted = False
         self.release_stage = "rejected"
+
+    def _action_frame(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """Add signed numeric interactions for action-conditional outcomes.
+
+        Direction is a property of the market state and remains side-free. Net
+        return, MAE and MFE are properties of a proposed BUY/SELL action, so a
+        mere side intercept cannot represent an edge whose sign reverses with
+        the action.
+        """
+
+        if not self.action_interaction_columns:
+            return frame
+        if "side" not in frame:
+            raise ValueError("side is required by the action interaction contract")
+        output = frame.copy()
+        side = frame["side"].astype(str).str.upper()
+        if not side.isin({"BUY", "SELL"}).all():
+            raise ValueError("side must be BUY or SELL")
+        sign = side.map({"BUY": 1.0, "SELL": -1.0}).to_numpy(float)
+        for column in self.action_interaction_columns:
+            values = pd.to_numeric(frame[column], errors="coerce").to_numpy(float)
+            output[f"{self.ACTION_INTERACTION_PREFIX}{column}"] = values * sign
+        return output
 
     @staticmethod
     def _labels(frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -259,7 +284,20 @@ class TwoStageAlphaModel:
         feature_columns: Sequence[str],
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         self.feature_columns = list(feature_columns)
-        x = self.encoder.fit(frame, self.feature_columns)
+        self.action_interaction_columns = (
+            [
+                column
+                for column in self.feature_columns
+                if column != "side" and pd.api.types.is_numeric_dtype(frame[column])
+            ]
+            if "side" in self.feature_columns
+            else []
+        )
+        action_columns = self.feature_columns + [
+            f"{self.ACTION_INTERACTION_PREFIX}{column}"
+            for column in self.action_interaction_columns
+        ]
+        x = self.encoder.fit(self._action_frame(frame), action_columns)
         net, mae, mfe, _ = self._labels(frame)
 
         # Direction is a property of the market decision, not of the proposed
@@ -334,7 +372,9 @@ class TwoStageAlphaModel:
                 continue
             local = TwoStageAlphaModel(self.config)
             local._fit_level_one_only(frame.iloc[train_positions], feature_columns)
-            validation_x = local.encoder.transform(frame.iloc[validation_positions])
+            validation_x = local.encoder.transform(
+                local._action_frame(frame.iloc[validation_positions])
+            )
             validation_direction_x = local.direction_encoder.transform(
                 frame.iloc[validation_positions]
             )
@@ -439,6 +479,15 @@ class TwoStageAlphaModel:
         if len(frame) < 50:
             raise ValueError("at least 50 pooled observations are required")
         data = frame.copy().reset_index(drop=True)
+        self.action_interaction_columns = (
+            [
+                column
+                for column in feature_columns
+                if column != "side" and pd.api.types.is_numeric_dtype(data[column])
+            ]
+            if "side" in feature_columns
+            else []
+        )
         net, mae, _, _ = self._labels(data)
         (
             oof_probabilities,
@@ -480,6 +529,9 @@ class TwoStageAlphaModel:
             "calibration_method": "oof_residual_quantiles_conformal_and_clustered_expectancy_lcb",
             "direction_training_side_feature": False,
             "direction_training_paired_decisions_deduplicated": True,
+            "action_outcome_side_interactions": list(
+                self.action_interaction_columns
+            ),
             "expected_net_target": "after_cost_net_return",
             "lower_bound_edge_method": "oof_predicted_net_bins_with_utc_day_clustered_95pct_lcb",
             "expectancy_calibration": self.expectancy_calibration,
@@ -521,7 +573,7 @@ class TwoStageAlphaModel:
     def predict(self, frame: pd.DataFrame) -> list[TwoStagePrediction]:
         if not self.fitted or self.meta_weights is None:
             raise RuntimeError("model is not fitted")
-        x = self.encoder.transform(frame)
+        x = self.encoder.transform(self._action_frame(frame))
         direction_x = self.direction_encoder.transform(frame)
         probabilities, expected_net, mae, mfe = self._level_one(x, direction_x)
         meta_x = self._meta_features(x, direction_x)
@@ -567,6 +619,7 @@ class TwoStageAlphaModel:
             "release_stage": "rejected",
             "config": asdict(self.config),
             "feature_columns": self.feature_columns,
+            "action_interaction_columns": self.action_interaction_columns,
             "encoder": self.encoder.state(),
             "direction_feature_columns": self.direction_feature_columns,
             "direction_encoder": self.direction_encoder.state(),
@@ -593,6 +646,9 @@ class TwoStageAlphaModel:
         payload = json.loads(path.read_text(encoding="utf-8"))
         model = cls(TwoStageConfig(**payload["config"]))
         model.feature_columns = [str(value) for value in payload["feature_columns"]]
+        model.action_interaction_columns = [
+            str(value) for value in payload.get("action_interaction_columns", [])
+        ]
         model.encoder = _Encoder.from_state(payload["encoder"])
         model.direction_feature_columns = [
             str(value)

@@ -94,8 +94,23 @@ def test_direction_model_is_side_invariant_for_paired_action_alternatives():
 
     assert "side" not in model.direction_feature_columns
     assert model.training_audit["direction_training_paired_decisions_deduplicated"] is True
+    assert model.training_audit["action_outcome_side_interactions"] == ["signal"]
     for buy, sell in zip(predictions[::2], predictions[1::2]):
         assert np.allclose(
             [buy.p_down, buy.p_flat, buy.p_up],
             [sell.p_down, sell.p_flat, sell.p_up],
         )
+        assert buy.expected_net_return != sell.expected_net_return
+
+    positive = pd.DataFrame(
+        [
+            {
+                "signal": 1.0,
+                "symbol": "BTCUSDT",
+                "side": side,
+            }
+            for side in ("BUY", "SELL")
+        ]
+    )
+    positive_predictions = model.predict(positive)
+    assert positive_predictions[0].expected_net_return > positive_predictions[1].expected_net_return
