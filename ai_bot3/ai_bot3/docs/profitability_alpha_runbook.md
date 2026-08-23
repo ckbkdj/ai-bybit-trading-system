@@ -243,6 +243,11 @@ live_count=0
 
 0 signals、0 trades、净收益 0、回撤 0 不是完成证据。
 
+`profitability_report.json` 中还必须看到 `independent_return_clusters` 和
+`bootstrap_expectancy_unit=utc_calendar_day_portfolio_net_return`。同日相关交易先聚合，
+首末成交日之间的无交易日按零收益计入；不足 20 个日簇、缺少 UTC 退出时间，或
+moving-block bootstrap 的 95% 下界不大于零，都不得通过。
+
 ## 10. 因子消融验收
 
 每个 baseline/augmented arm 至少满足代码中预先锁定的 OOS trade/fold 下限。只有以下条件同时满足才 retained：

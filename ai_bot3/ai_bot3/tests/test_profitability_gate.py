@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,7 @@ def _profitable_trades() -> list[dict[str, object]]:
     symbols = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
     months = ("2026-01", "2026-02", "2026-03")
     regimes = ("normal", "high_volatility", "risk_off")
+    started_at = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
     output = []
     for index in range(60):
         value = -0.001 if index % 5 == 0 else 0.002
@@ -34,6 +36,7 @@ def _profitable_trades() -> list[dict[str, object]]:
                 "symbol": symbols[index % 3],
                 "month": months[(index // 3) % 3],
                 "regime": regimes[(index // 9) % 3],
+                "exit_at": started_at + timedelta(days=index),
             }
         )
     return output
@@ -51,6 +54,47 @@ def test_profitability_gate_passes_only_complete_stable_evidence():
     assert gate.profitability_gate == "PASSED"
     assert gate.stage == "candidate"
     assert gate.candidate_count == 1 and gate.live_count == 0
+    assert gate.checks["independent_return_clusters"]["actual"] == 60
+    assert gate.checks["bootstrap_lower_expectancy"]["unit"] == (
+        "utc_calendar_day_portfolio_net_return"
+    )
+
+
+def test_profitability_gate_does_not_treat_correlated_trades_as_independent():
+    trades = _profitable_trades()
+    same_day = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
+    for trade in trades:
+        trade["exit_at"] = same_day
+    gate = evaluate_profitability_gate(
+        trades,
+        [{"net_return": 0.01}] * 5,
+        initial_equity_usdt=100_000,
+        two_x_cost_net_return=0.01,
+        mark_to_market_max_drawdown=0.02,
+        mark_to_market_evidence_complete=True,
+    )
+    assert gate.profitability_gate == "FAILED"
+    assert "independent_return_clusters" in gate.blockers
+    assert "bootstrap_lower_expectancy" in gate.blockers
+    assert gate.checks["independent_return_clusters"]["actual"] == 1
+
+
+def test_profitability_gate_fails_closed_without_utc_trade_timestamps():
+    trades = _profitable_trades()
+    for trade in trades:
+        trade.pop("exit_at")
+    gate = evaluate_profitability_gate(
+        trades,
+        [{"net_return": 0.01}] * 5,
+        initial_equity_usdt=100_000,
+        two_x_cost_net_return=0.01,
+        mark_to_market_max_drawdown=0.02,
+        mark_to_market_evidence_complete=True,
+    )
+    assert gate.profitability_gate == "FAILED"
+    assert gate.checks["independent_return_clusters"]["evidence"]["reason"] == (
+        "missing_or_non_utc_trade_timestamps"
+    )
 
 
 def test_failed_gate_has_zero_candidates_and_cannot_create_manifest(tmp_path):

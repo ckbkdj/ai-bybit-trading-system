@@ -146,6 +146,7 @@ flowchart TD
 6. development 未通过前不打开新 lockbox；旧 lockbox 永久封存。
 7. 所有实验进入 trial ledger，失败实验也保留。
 8. 因子只有在完整组、足量真实 OOS trades、费用后稳定改善时才能 retained。
+9. 盈利门禁不按单笔交易做独立同分布 bootstrap；先按 UTC 日聚合组合净 PnL、补齐无交易日，再对日簇做 moving-block bootstrap。少于 20 个日簇或任一交易缺少 UTC 时间戳时失败关闭。
 
 ## 7. 事件回测和回撤
 
@@ -157,6 +158,7 @@ flowchart TD
 - stop/take-profit 的盘中路径和 max holding；
 - 单仓、总仓和杠杆约束；
 - 每个市场观测点对所有持仓 mark-to-market，计算真实盘中组合 drawdown。
+- 同日跨币种和重叠持仓在统计门禁中属于同一组合收益簇，不能重复增加有效样本数。
 
 没有真实盘口/成交的 shadow 证据时，`execution_evidence_complete=false`，即便回测盈利也不能晋升。
 

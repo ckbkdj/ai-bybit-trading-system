@@ -4,6 +4,7 @@ import json
 import math
 from collections import defaultdict
 from dataclasses import asdict, dataclass
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
@@ -20,6 +21,7 @@ class ProfitabilityThresholds:
     minimum_positive_fold_ratio: float = 0.60
     maximum_concentration_share: float = 0.50
     minimum_trades: int = 30
+    minimum_independent_return_clusters: int = 20
     bootstrap_samples: int = 2000
     bootstrap_seed: int = 20260823
 
@@ -80,6 +82,85 @@ def _bootstrap_lower_expectancy(
     return float(np.quantile(means, 0.05))
 
 
+def _utc_day(value: object) -> date | None:
+    if isinstance(value, datetime):
+        observed_at = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            observed_at = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if observed_at.tzinfo is None:
+        return None
+    return observed_at.astimezone(timezone.utc).date()
+
+
+def _daily_portfolio_returns(
+    trades: Sequence[object],
+    *,
+    initial_equity_usdt: float,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Collapse correlated/overlapping trades into UTC portfolio-day clusters.
+
+    A trade-level bootstrap would overstate the effective sample size when
+    several symbols are entered together or their holding paths overlap.  The
+    daily series aggregates realized net PnL and inserts zero-return calendar
+    days, then the existing moving-block bootstrap preserves short-range serial
+    dependence between those clusters.
+    """
+
+    if initial_equity_usdt <= 0:
+        return np.asarray([], dtype=float), {
+            "complete": False,
+            "reason": "non_positive_initial_equity",
+            "cluster_count": 0,
+        }
+    pnl_by_day: dict[date, float] = defaultdict(float)
+    missing_timestamp_count = 0
+    for trade in trades:
+        observed_day = _utc_day(
+            _value(trade, "exit_at", _value(trade, "decision_at"))
+        )
+        if observed_day is None:
+            missing_timestamp_count += 1
+            continue
+        pnl_by_day[observed_day] += float(_value(trade, "net_pnl", 0.0))
+    if missing_timestamp_count or not pnl_by_day:
+        return np.asarray([], dtype=float), {
+            "complete": False,
+            "reason": (
+                "missing_or_non_utc_trade_timestamps"
+                if missing_timestamp_count
+                else "no_dated_trades"
+            ),
+            "cluster_count": 0,
+            "missing_timestamp_count": missing_timestamp_count,
+        }
+    first_day = min(pnl_by_day)
+    last_day = max(pnl_by_day)
+    cluster_count = (last_day - first_day).days + 1
+    returns = np.asarray(
+        [
+            pnl_by_day.get(first_day + timedelta(days=offset), 0.0)
+            / initial_equity_usdt
+            for offset in range(cluster_count)
+        ],
+        dtype=float,
+    )
+    return returns, {
+        "complete": True,
+        "method": "utc_calendar_day_portfolio_net_return_moving_block_bootstrap",
+        "cluster_count": cluster_count,
+        "active_cluster_count": len(pnl_by_day),
+        "first_cluster": first_day.isoformat(),
+        "last_cluster": last_day.isoformat(),
+        "zero_return_clusters_included": cluster_count - len(pnl_by_day),
+        "missing_timestamp_count": 0,
+    }
+
+
 def _concentration(trades: Sequence[object], key: str) -> tuple[float, str | None]:
     pnl: dict[str, float] = defaultdict(float)
     for trade in trades:
@@ -106,7 +187,6 @@ def evaluate_profitability_gate(
     cfg = thresholds or ProfitabilityThresholds()
     trades = list(lockbox_trades)
     pnls = [float(_value(trade, "net_pnl", 0.0)) for trade in trades]
-    returns = np.asarray([float(_value(trade, "net_return", 0.0)) for trade in trades], dtype=float)
     final_equity = initial_equity_usdt + sum(pnls)
     net_return = final_equity / initial_equity_usdt - 1.0 if initial_equity_usdt > 0 else -1.0
     profit = sum(value for value in pnls if value > 0)
@@ -131,10 +211,20 @@ def evaluate_profitability_gate(
         and mark_to_market_drawdown is not None
         and 0.0 <= mark_to_market_drawdown <= cfg.maximum_drawdown
     )
-    bootstrap_lower = _bootstrap_lower_expectancy(
-        returns,
-        samples=cfg.bootstrap_samples,
-        seed=cfg.bootstrap_seed,
+    clustered_returns, cluster_evidence = _daily_portfolio_returns(
+        trades,
+        initial_equity_usdt=initial_equity_usdt,
+    )
+    independent_cluster_count = int(cluster_evidence.get("cluster_count", 0))
+    bootstrap_lower = (
+        _bootstrap_lower_expectancy(
+            clustered_returns,
+            samples=cfg.bootstrap_samples,
+            seed=cfg.bootstrap_seed,
+        )
+        if bool(cluster_evidence.get("complete"))
+        and independent_cluster_count >= cfg.minimum_independent_return_clusters
+        else None
     )
     fold_returns = [float(fold.get("net_return", 0.0)) for fold in walk_forward_folds]
     positive_fold_ratio = (
@@ -156,6 +246,13 @@ def evaluate_profitability_gate(
             "required": True,
         },
         "minimum_trades": {"passed": len(trades) >= cfg.minimum_trades, "actual": len(trades), "threshold": cfg.minimum_trades},
+        "independent_return_clusters": {
+            "passed": bool(cluster_evidence.get("complete"))
+            and independent_cluster_count >= cfg.minimum_independent_return_clusters,
+            "actual": independent_cluster_count,
+            "threshold": cfg.minimum_independent_return_clusters,
+            "evidence": cluster_evidence,
+        },
         "lockbox_net_return": {"passed": net_return > cfg.minimum_net_return, "actual": net_return, "threshold": cfg.minimum_net_return},
         "profit_factor": {"passed": profit_factor_passed, "actual": profit_factor_actual, "threshold": cfg.minimum_profit_factor},
         "mark_to_market_drawdown": {
@@ -170,6 +267,9 @@ def evaluate_profitability_gate(
             "actual": bootstrap_lower,
             "threshold": cfg.minimum_bootstrap_expectancy,
             "confidence": 0.95,
+            "unit": "utc_calendar_day_portfolio_net_return",
+            "dependence_control": "moving_block_bootstrap_over_daily_portfolio_clusters",
+            "cluster_count": independent_cluster_count,
         },
         "two_x_cost_stress": {
             "passed": two_x_cost_net_return >= -cfg.maximum_2x_cost_loss,
@@ -208,6 +308,9 @@ def evaluate_profitability_gate(
             "max_drawdown": mark_to_market_drawdown,
             "realized_close_only_drawdown": realized_only_drawdown,
             "bootstrap_lower_expectancy": bootstrap_lower,
+            "bootstrap_expectancy_unit": "utc_calendar_day_portfolio_net_return",
+            "independent_return_cluster_count": independent_cluster_count,
+            "independent_return_cluster_evidence": cluster_evidence,
             "two_x_cost_net_return": two_x_cost_net_return,
             "positive_walk_forward_fold_ratio": positive_fold_ratio,
             "maximum_return_concentration_share": maximum_share,
