@@ -115,6 +115,17 @@ class BybitPublicPITStore:
         started_at: datetime,
     ) -> None:
         with self.connect() as connection:
+            # A prior process can disappear without executing its cancellation
+            # handler (host reboot, forced kill, interpreter crash). Reconcile
+            # those stale rows before declaring the new capture session live,
+            # otherwise operational evidence can falsely show two collectors.
+            connection.execute(
+                """UPDATE bybit_capture_sessions
+                      SET ended_at=?,status='disconnected',
+                          error=COALESCE(error, 'collector_restarted_after_unclean_shutdown')
+                    WHERE status='running'""",
+                (_iso(started_at),),
+            )
             connection.execute(
                 """INSERT INTO bybit_capture_sessions(
                        session_id,endpoint,symbols_json,started_at,status

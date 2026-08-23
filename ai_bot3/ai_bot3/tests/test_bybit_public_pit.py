@@ -16,6 +16,38 @@ def _ms(value: datetime) -> int:
     return int(value.timestamp() * 1000)
 
 
+def test_new_capture_session_reconciles_unclean_previous_process(tmp_path):
+    path = tmp_path / "bybit.sqlite3"
+    store = BybitPublicPITStore(path)
+    first = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    restarted = first + timedelta(minutes=5)
+    store.start_session(
+        "stale-session", endpoint="wss://public", symbols=["BTCUSDT"], started_at=first
+    )
+    store.start_session(
+        "replacement-session",
+        endpoint="wss://public",
+        symbols=["BTCUSDT"],
+        started_at=restarted,
+    )
+
+    with sqlite3.connect(path) as connection:
+        stale = connection.execute(
+            "SELECT status,ended_at,error FROM bybit_capture_sessions WHERE session_id=?",
+            ("stale-session",),
+        ).fetchone()
+        replacement = connection.execute(
+            "SELECT status FROM bybit_capture_sessions WHERE session_id=?",
+            ("replacement-session",),
+        ).fetchone()
+    assert stale == (
+        "disconnected",
+        "2026-01-01T00:05:00Z",
+        "collector_restarted_after_unclean_shutdown",
+    )
+    assert replacement == ("running",)
+
+
 def test_orderbook_snapshot_delta_and_disconnect_are_pit_and_fail_closed(tmp_path):
     path = tmp_path / "bybit.sqlite3"
     store = BybitPublicPITStore(path)
