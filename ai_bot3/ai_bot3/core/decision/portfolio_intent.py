@@ -30,7 +30,7 @@ class PortfolioIntentPolicy:
 
 
 class SignalBook:
-    """Select the newest, eligible forecast for every horizon of one symbol/release."""
+    """Select the newest forecast for every horizon of one symbol/release."""
 
     def __init__(self, forecasts: Iterable[ForecastEnvelope], *, now: datetime | None = None):
         current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
@@ -69,11 +69,13 @@ class PortfolioIntentBuilder:
             item for item in book if item.lineage.strategy_release_id == strategy_release_id
         ]
 
-        # A credible event gate is a portfolio-level veto, not another signal to
-        # outvote.  Dropping only the affected horizon could let the remaining
-        # horizons open risk during the same major-news blackout.
+        # An active, healthy event gate is a portfolio-level veto, not another
+        # directional vote.  Its forecast target is also its hard expiry: an old
+        # blackout must not block the symbol forever after the event view expires.
         if any(
-            item.regime.event_regime in {"blackout", "reduce_only"}
+            item.time.forecast_target_at > current
+            and item.quality.source_status == "ok"
+            and item.regime.event_regime in {"blackout", "reduce_only"}
             for item in release_book
         ):
             return None
