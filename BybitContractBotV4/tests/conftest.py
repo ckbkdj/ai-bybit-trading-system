@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+
+SERVICE_ROOT = Path(__file__).resolve().parents[1]
+if str(SERVICE_ROOT) not in sys.path:
+    sys.path.insert(0, str(SERVICE_ROOT))
+
 
 def pytest_configure(config):
     """Make the legacy fake model a confirmed-cancel exchange, not a REST oracle.
