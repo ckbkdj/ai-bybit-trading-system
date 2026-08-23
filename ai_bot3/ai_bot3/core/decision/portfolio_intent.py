@@ -34,8 +34,12 @@ class SignalBook:
 
     def __init__(self, forecasts: Iterable[ForecastEnvelope], *, now: datetime | None = None):
         current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        candidates = tuple(forecasts)
+        symbols = {item.instrument.symbol for item in candidates}
+        if len(symbols) > 1:
+            raise ValueError("one SignalBook cannot mix symbols")
         selected: dict[int, ForecastEnvelope] = {}
-        for forecast in forecasts:
+        for forecast in candidates:
             if forecast.time.created_at > current + timedelta(seconds=5):
                 continue
             previous = selected.get(forecast.time.horizon_sec)
@@ -61,7 +65,24 @@ class PortfolioIntentBuilder:
     ) -> PortfolioIntent | None:
         current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
         book = SignalBook(forecasts, now=current).forecasts
-        eligible = [item for item in book if self._eligible(item, strategy_release_id)]
+        release_book = [
+            item for item in book if item.lineage.strategy_release_id == strategy_release_id
+        ]
+
+        # A credible event gate is a portfolio-level veto, not another signal to
+        # outvote.  Dropping only the affected horizon could let the remaining
+        # horizons open risk during the same major-news blackout.
+        if any(
+            item.regime.event_regime in {"blackout", "reduce_only"}
+            for item in release_book
+        ):
+            return None
+
+        eligible = [
+            item
+            for item in release_book
+            if self._eligible(item, current=current)
+        ]
         if len(eligible) < self.policy.min_horizons:
             return None
         symbols = {item.instrument.symbol for item in eligible}
@@ -103,9 +124,12 @@ class PortfolioIntentBuilder:
                 )
             )
         created_at = max(item.time.created_at for item in eligible)
-        valid_until = min(created_at + timedelta(seconds=self.policy.ttl_sec), min(
-            item.time.forecast_target_at for item in eligible
-        ))
+        valid_until = min(
+            created_at + timedelta(seconds=self.policy.ttl_sec),
+            min(item.time.forecast_target_at for item in eligible),
+        )
+        if valid_until <= current:
+            return None
         decision_id = deterministic_id(
             "pd",
             strategy_release_id,
@@ -128,13 +152,13 @@ class PortfolioIntentBuilder:
             contributions=contributions,
         )
 
-    def _eligible(self, forecast: ForecastEnvelope, strategy_release_id: str) -> bool:
+    def _eligible(self, forecast: ForecastEnvelope, *, current: datetime) -> bool:
         return (
-            forecast.lineage.strategy_release_id == strategy_release_id
+            forecast.time.forecast_target_at > current
             and forecast.quality.source_status == "ok"
             and forecast.quality.calibration_status == "valid"
             and forecast.quality.data_quality >= self.policy.min_data_quality
             and forecast.quality.range_guard_score <= self.policy.max_range_guard_score
             and forecast.distribution.expected_return_bps is not None
-            and forecast.regime.event_regime not in {"blackout", "reduce_only"}
+            and forecast.regime.event_regime == "normal"
         )
