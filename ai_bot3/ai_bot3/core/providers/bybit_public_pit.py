@@ -409,14 +409,20 @@ class BybitPublicPITIngestor:
         session_id: str,
         execution_probe_notional_usdt: float = 1_000.0,
         feature_emit_interval_sec: float = 0.0,
+        raw_persist_interval_sec: float = 0.0,
         maximum_event_lag_sec: float = 10.0,
     ) -> None:
         self.store = store
         self.session_id = session_id
         self.execution_probe_notional_usdt = execution_probe_notional_usdt
-        if feature_emit_interval_sec < 0 or maximum_event_lag_sec <= 0:
+        if (
+            feature_emit_interval_sec < 0
+            or raw_persist_interval_sec < 0
+            or maximum_event_lag_sec <= 0
+        ):
             raise ValueError("invalid public capture cadence or lag limit")
         self.feature_emit_interval_sec = float(feature_emit_interval_sec)
+        self.raw_persist_interval_sec = float(raw_persist_interval_sec)
         self.maximum_event_lag_sec = float(maximum_event_lag_sec)
         self.books: dict[str, _Book] = defaultdict(_Book)
         self.trades: dict[str, Deque[tuple[datetime, float, float, str]]] = defaultdict(deque)
@@ -424,6 +430,9 @@ class BybitPublicPITIngestor:
         self.open_interest: dict[str, Deque[tuple[datetime, float]]] = defaultdict(deque)
         self.order_flow_imbalance: dict[str, Deque[tuple[datetime, float]]] = defaultdict(deque)
         self.last_feature_emit_at: dict[tuple[str, str], datetime] = {}
+        self.last_raw_persist_at: dict[tuple[str, str], datetime] = {}
+        self.recent_trade_ids: dict[str, set[str]] = defaultdict(set)
+        self.recent_trade_id_times: dict[str, Deque[tuple[datetime, str]]] = defaultdict(deque)
 
     def _validate_event_lag(
         self,
@@ -462,6 +471,26 @@ class BybitPublicPITIngestor:
         ):
             return False
         self.last_feature_emit_at[key] = received_at
+        return True
+
+    def _should_persist_raw(
+        self,
+        symbol: str,
+        group: str,
+        received_at: datetime,
+        *,
+        force: bool = False,
+    ) -> bool:
+        key = (symbol, group)
+        previous = self.last_raw_persist_at.get(key)
+        if (
+            not force
+            and previous is not None
+            and (received_at - previous).total_seconds()
+            < self.raw_persist_interval_sec
+        ):
+            return False
+        self.last_raw_persist_at[key] = received_at
         return True
 
     def invalidate_books(self, reason: str, received_at: datetime) -> None:
@@ -545,24 +574,34 @@ class BybitPublicPITIngestor:
         event_id = f"book:{symbol}:{update_id}:{payload_hash}"
         book = self.books[symbol]
         is_snapshot = event_type == "snapshot" or update_id == 1
+        if (
+            not is_snapshot
+            and book.update_id == update_id
+            and book.cross_sequence == cross_sequence
+        ):
+            return {"status": "duplicate_memory", "event_id": event_id}
         sequence_regressed = (
             book.cross_sequence is not None and cross_sequence < book.cross_sequence
         )
-        accepted = self.store.append_raw(
-            event_id=event_id,
-            session_id=self.session_id,
-            topic=topic,
-            symbol=symbol,
-            event_type=event_type,
-            exchange_time=event_time,
-            received_at=received_at,
-            update_id=update_id,
-            cross_sequence=cross_sequence,
-            book_state_valid=book.valid or is_snapshot,
-            payload=data,
+        raw_persisted = self._should_persist_raw(
+            symbol, "orderbook", received_at, force=is_snapshot
         )
-        if not accepted:
-            return {"status": "duplicate", "event_id": event_id}
+        if raw_persisted:
+            accepted = self.store.append_raw(
+                event_id=event_id,
+                session_id=self.session_id,
+                topic=topic,
+                symbol=symbol,
+                event_type=event_type,
+                exchange_time=event_time,
+                received_at=received_at,
+                update_id=update_id,
+                cross_sequence=cross_sequence,
+                book_state_valid=book.valid or is_snapshot,
+                payload=data,
+            )
+            if not accepted:
+                return {"status": "duplicate", "event_id": event_id}
         if sequence_regressed and not is_snapshot:
             book.valid = False
             self.store.flush()
@@ -697,6 +736,7 @@ class BybitPublicPITIngestor:
             "event_id": event_id,
             "features": factors if emitted else {},
             "features_emitted": emitted,
+            "raw_persisted": raw_persisted,
         }
 
     def _public_trades(
@@ -707,27 +747,40 @@ class BybitPublicPITIngestor:
         latest_event: datetime | None = None
         latest_id = ""
         symbol = topic.rsplit(".", 1)[-1].upper()
+        persist_message = self._should_persist_raw(
+            symbol, "trades", received_at
+        )
         for item in list(message.get("data") or []):
             row = dict(item)
             symbol = str(row.get("s") or symbol).upper()
             trade_id = str(row.get("i") or hashlib.sha256(_canonical(row).encode()).hexdigest())
+            trade_id_cutoff = received_at - timedelta(minutes=2)
+            id_times = self.recent_trade_id_times[symbol]
+            while id_times and id_times[0][0] < trade_id_cutoff:
+                _, expired_id = id_times.popleft()
+                self.recent_trade_ids[symbol].discard(expired_id)
+            if trade_id in self.recent_trade_ids[symbol]:
+                continue
+            self.recent_trade_ids[symbol].add(trade_id)
+            id_times.append((received_at, trade_id))
             event_id = f"trade:{symbol}:{trade_id}"
             event_time = _from_ms(row.get("T") or message.get("ts"))
             self._validate_event_lag(
                 event_time, received_at, "bybit.public.trades"
             )
-            if not self.store.append_raw(
-                event_id=event_id,
-                session_id=self.session_id,
-                topic=topic,
-                symbol=symbol,
-                event_type="trade",
-                exchange_time=event_time,
-                received_at=received_at,
-                payload=row,
-                cross_sequence=int(row.get("seq") or 0),
-            ):
-                continue
+            if persist_message:
+                if not self.store.append_raw(
+                    event_id=event_id,
+                    session_id=self.session_id,
+                    topic=topic,
+                    symbol=symbol,
+                    event_type="trade",
+                    exchange_time=event_time,
+                    received_at=received_at,
+                    payload=row,
+                    cross_sequence=int(row.get("seq") or 0),
+                ):
+                    continue
             accepted += 1
             latest_event = max(latest_event or event_time, event_time)
             latest_id = event_id
@@ -764,6 +817,7 @@ class BybitPublicPITIngestor:
             "accepted": accepted,
             "features": factors if emitted else {},
             "features_emitted": emitted,
+            "raw_persisted": persist_message,
         }
 
     def _liquidations(
@@ -832,17 +886,19 @@ class BybitPublicPITIngestor:
         self._validate_event_lag(event_time, received_at, "bybit.public.ticker")
         digest = hashlib.sha256(_canonical(data).encode()).hexdigest()[:40]
         event_id = f"ticker:{symbol}:{int(message.get('ts') or 0)}:{digest}"
-        if not self.store.append_raw(
-            event_id=event_id,
-            session_id=self.session_id,
-            topic=topic,
-            symbol=symbol,
-            event_type="ticker",
-            exchange_time=event_time,
-            received_at=received_at,
-            payload=data,
-        ):
-            return {"status": "duplicate"}
+        raw_persisted = self._should_persist_raw(symbol, "ticker", received_at)
+        if raw_persisted:
+            if not self.store.append_raw(
+                event_id=event_id,
+                session_id=self.session_id,
+                topic=topic,
+                symbol=symbol,
+                event_type="ticker",
+                exchange_time=event_time,
+                received_at=received_at,
+                payload=data,
+            ):
+                return {"status": "duplicate"}
         factors: dict[str, tuple[float, str]] = {}
         if data.get("markPrice") and data.get("indexPrice"):
             mark = float(data["markPrice"])
@@ -862,18 +918,25 @@ class BybitPublicPITIngestor:
                     (current - history[0][1]) / history[0][1],
                     "ratio",
                 )
-        for name, (value, unit) in factors.items():
-            self._feature(
-                event_id,
-                symbol,
-                name,
-                value,
-                unit,
-                event_time,
-                received_at,
-                "bybit.public.ticker",
-            )
-        return {"status": "accepted", "features": factors}
+        emitted = self._should_emit(symbol, "ticker", received_at)
+        if emitted:
+            for name, (value, unit) in factors.items():
+                self._feature(
+                    event_id,
+                    symbol,
+                    name,
+                    value,
+                    unit,
+                    event_time,
+                    received_at,
+                    "bybit.public.ticker",
+                )
+        return {
+            "status": "accepted",
+            "features": factors if emitted else {},
+            "features_emitted": emitted,
+            "raw_persisted": raw_persisted,
+        }
 
 
 class BybitPublicPITCollector:
@@ -887,6 +950,7 @@ class BybitPublicPITCollector:
         endpoint: str = BYBIT_PUBLIC_LINEAR_WS,
         orderbook_depth: int = 50,
         feature_emit_interval_sec: float = 5.0,
+        raw_persist_interval_sec: float = 5.0,
         maximum_event_lag_sec: float = 10.0,
     ) -> None:
         self.store = store
@@ -894,6 +958,7 @@ class BybitPublicPITCollector:
         self.endpoint = endpoint
         self.orderbook_depth = orderbook_depth
         self.feature_emit_interval_sec = feature_emit_interval_sec
+        self.raw_persist_interval_sec = raw_persist_interval_sec
         self.maximum_event_lag_sec = maximum_event_lag_sec
         if not self.symbols:
             raise ValueError("at least one Bybit symbol is required")
@@ -929,6 +994,7 @@ class BybitPublicPITCollector:
             self.store,
             session_id=session_id,
             feature_emit_interval_sec=self.feature_emit_interval_sec,
+            raw_persist_interval_sec=self.raw_persist_interval_sec,
             maximum_event_lag_sec=self.maximum_event_lag_sec,
         )
         try:

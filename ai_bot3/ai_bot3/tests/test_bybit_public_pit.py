@@ -120,7 +120,7 @@ def test_orderbook_snapshot_delta_and_disconnect_are_pit_and_fail_closed(tmp_pat
         },
     }
     assert ingestor.ingest(delta, received_at=delta_time + timedelta(milliseconds=250))["status"] == "accepted"
-    assert ingestor.ingest(delta, received_at=delta_time + timedelta(milliseconds=300))["status"] == "duplicate"
+    assert ingestor.ingest(delta, received_at=delta_time + timedelta(milliseconds=300))["status"] == "duplicate_memory"
     ofi = store.latest_features(
         "BTCUSDT", ["ofi_1m"], simulated_time=delta_time + timedelta(milliseconds=250)
     )
@@ -221,7 +221,7 @@ def test_public_trades_liquidations_and_ticker_create_direct_observations(tmp_pa
     assert point["funding_rate"]["value"] == 0.0002
 
 
-def test_collector_cadence_retains_raw_book_events_without_feature_write_amplification(
+def test_collector_cadence_samples_raw_book_evidence_and_bounds_feature_amplification(
     tmp_path,
 ):
     path = tmp_path / "bybit.sqlite3"
@@ -230,6 +230,7 @@ def test_collector_cadence_retains_raw_book_events_without_feature_write_amplifi
         store,
         session_id="cadence",
         feature_emit_interval_sec=5.0,
+        raw_persist_interval_sec=5.0,
     )
     event_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
     snapshot = {
@@ -266,11 +267,13 @@ def test_collector_cadence_retains_raw_book_events_without_feature_write_amplifi
     )
 
     assert first["features_emitted"] is True
+    assert first["raw_persisted"] is True
     assert second["features_emitted"] is False
+    assert second["raw_persisted"] is False
     with sqlite3.connect(path) as connection:
         assert connection.execute(
             "SELECT COUNT(*) FROM bybit_raw_public_events"
-        ).fetchone()[0] == 2
+        ).fetchone()[0] == 1
         assert connection.execute(
             "SELECT COUNT(*) FROM bybit_feature_observations"
         ).fetchone()[0] == 8
