@@ -343,3 +343,36 @@ def test_collector_batch_store_commits_explicitly_and_preserves_duplicate_identi
             "SELECT COUNT(*) FROM bybit_feature_observations"
         ).fetchone()[0] == 1
     store.close()
+
+
+def test_batched_snapshot_quality_recovery_does_not_deadlock_its_writer(tmp_path):
+    path = tmp_path / "bybit.sqlite3"
+    store = BybitPublicPITStore(path, batch_writes=True)
+    ingestor = BybitPublicPITIngestor(store, session_id="batch-snapshot")
+    event_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    snapshot = {
+        "topic": "orderbook.50.BTCUSDT",
+        "type": "snapshot",
+        "ts": _ms(event_time),
+        "cts": _ms(event_time),
+        "data": {
+            "s": "BTCUSDT",
+            "u": 1,
+            "seq": 1,
+            "b": [["99.9", "5"]],
+            "a": [["100.1", "5"]],
+        },
+    }
+
+    assert ingestor.ingest(
+        snapshot, received_at=event_time + timedelta(milliseconds=100)
+    )["status"] == "accepted"
+    store.flush()
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM bybit_raw_public_events"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM bybit_feature_observations"
+        ).fetchone()[0] == 8
+    store.close()

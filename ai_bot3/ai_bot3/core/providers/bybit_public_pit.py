@@ -565,6 +565,7 @@ class BybitPublicPITIngestor:
             return {"status": "duplicate", "event_id": event_id}
         if sequence_regressed and not is_snapshot:
             book.valid = False
+            self.store.flush()
             self.store.quality_store.source_event(
                 "bybit.public.orderbook",
                 "degraded",
@@ -582,6 +583,7 @@ class BybitPublicPITIngestor:
             book.best_ask_size = None
             book.imbalance_l5 = None
             self.order_flow_imbalance[symbol].clear()
+            self.store.flush()
             self.store.quality_store.source_event(
                 "bybit.public.orderbook", "ok", "snapshot_recovered", received_at
             )
