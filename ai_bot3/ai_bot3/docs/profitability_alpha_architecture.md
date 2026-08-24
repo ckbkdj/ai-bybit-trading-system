@@ -190,6 +190,7 @@ FOMC 采集不能用会议日历日期猜测 14:00，也不能把 minutes、impl
 - 单仓、总仓和杠杆约束；
 - 每个市场观测点对所有持仓 mark-to-market，计算真实盘中组合 drawdown。
 - 成交瞬间按 PIT reference/mid 而不是 fill price 标记权益，使入场 spread/slippage 立即进入回撤；2× 成本压力也同步作用于未平仓 funding MTM，不能只加压最终已实现收益。
+- 组合 development/lockbox 至少 100 笔、每个启用 horizon 至少 30 笔；费用后净 `net_pnl` 胜率至少 52%，2× 手续费/滑点/funding 压力净收益必须大于等于 0。三个条件都是代码门禁，不能用运行参数下调。
 - 同日跨币种和重叠持仓在统计门禁中属于同一组合收益簇，不能重复增加有效样本数。
 
 执行成本证据分两层，不能混写：

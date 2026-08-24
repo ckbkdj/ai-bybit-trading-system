@@ -37,7 +37,7 @@ def _profitable_trades() -> list[dict[str, object]]:
     regimes = ("normal", "high_volatility", "risk_off")
     started_at = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
     output = []
-    for index in range(60):
+    for index in range(120):
         value = -0.001 if index % 5 == 0 else 0.002
         output.append(
             {
@@ -66,7 +66,14 @@ def test_profitability_gate_passes_only_complete_stable_evidence():
     assert gate.profitability_gate == "PASSED"
     assert gate.stage == "candidate"
     assert gate.candidate_count == 1 and gate.live_count == 0
-    assert gate.checks["independent_return_clusters"]["actual"] == 60
+    assert gate.checks["independent_return_clusters"]["actual"] == 120
+    assert gate.checks["minimum_trades"] == {
+        "passed": True,
+        "actual": 120,
+        "threshold": 100,
+        "scope": "portfolio",
+    }
+    assert gate.checks["fee_adjusted_win_rate"]["actual"] == pytest.approx(0.8)
     assert gate.checks["bootstrap_lower_expectancy"]["unit"] == (
         "utc_calendar_day_portfolio_net_return"
     )
@@ -76,12 +83,14 @@ def test_profitability_thresholds_cannot_be_relaxed():
     unsafe = (
         ("minimum_net_return", -0.0001),
         ("minimum_profit_factor", 1.1999),
+        ("minimum_fee_adjusted_win_rate", 0.5199),
         ("maximum_drawdown", 0.030001),
         ("minimum_bootstrap_expectancy", -0.0001),
-        ("maximum_2x_cost_loss", 0.005001),
+        ("minimum_two_x_cost_net_return", -0.000001),
         ("minimum_positive_fold_ratio", 0.5999),
         ("maximum_concentration_share", 0.5001),
-        ("minimum_trades", 29),
+        ("minimum_portfolio_trades", 99),
+        ("minimum_horizon_trades", 29),
         ("minimum_independent_return_clusters", 19),
         ("bootstrap_samples", 1999),
     )
@@ -103,6 +112,57 @@ def test_profitability_gate_defaults_missing_release_evidence_to_failed():
     assert gate.profitability_gate == "FAILED"
     assert "execution_evidence" in gate.blockers
     assert "factor_ablation" in gate.blockers
+
+
+def test_profitability_gate_enforces_net_win_rate_and_nonnegative_cost_stress():
+    trades = _profitable_trades()
+    for index, trade in enumerate(trades):
+        trade["net_pnl"] = 7.0 if index % 2 == 0 else -1.0
+    gate = evaluate_profitability_gate(
+        trades,
+        [{"net_return": 0.01}] * 5,
+        initial_equity_usdt=100_000,
+        two_x_cost_net_return=-0.000001,
+        mark_to_market_max_drawdown=0.001,
+        mark_to_market_evidence_complete=True,
+        execution_evidence_complete=True,
+        factor_ablation_complete=True,
+    )
+
+    assert gate.profitability_gate == "FAILED"
+    assert gate.checks["fee_adjusted_win_rate"]["actual"] == pytest.approx(0.50)
+    assert "fee_adjusted_win_rate" in gate.blockers
+    assert "two_x_cost_stress" in gate.blockers
+
+
+def test_horizon_scope_requires_30_trades_while_portfolio_requires_100():
+    trades = _profitable_trades()[:30]
+    horizon = evaluate_profitability_gate(
+        trades,
+        [{"net_return": 0.01}] * 5,
+        initial_equity_usdt=100_000,
+        two_x_cost_net_return=0.01,
+        mark_to_market_max_drawdown=0.001,
+        mark_to_market_evidence_complete=True,
+        execution_evidence_complete=True,
+        factor_ablation_complete=True,
+        gate_scope="horizon",
+    )
+    portfolio = evaluate_profitability_gate(
+        trades,
+        [{"net_return": 0.01}] * 5,
+        initial_equity_usdt=100_000,
+        two_x_cost_net_return=0.01,
+        mark_to_market_max_drawdown=0.001,
+        mark_to_market_evidence_complete=True,
+        execution_evidence_complete=True,
+        factor_ablation_complete=True,
+    )
+
+    assert horizon.checks["minimum_trades"]["passed"] is True
+    assert horizon.checks["minimum_trades"]["threshold"] == 30
+    assert portfolio.checks["minimum_trades"]["passed"] is False
+    assert portfolio.checks["minimum_trades"]["threshold"] == 100
 
 
 def test_portfolio_profit_cannot_authorize_a_failed_precommitted_horizon():

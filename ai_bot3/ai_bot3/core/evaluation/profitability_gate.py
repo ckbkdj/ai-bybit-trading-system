@@ -15,12 +15,14 @@ import numpy as np
 class ProfitabilityThresholds:
     minimum_net_return: float = 0.0
     minimum_profit_factor: float = 1.20
+    minimum_fee_adjusted_win_rate: float = 0.52
     maximum_drawdown: float = 0.03
     minimum_bootstrap_expectancy: float = 0.0
-    maximum_2x_cost_loss: float = 0.005
+    minimum_two_x_cost_net_return: float = 0.0
     minimum_positive_fold_ratio: float = 0.60
     maximum_concentration_share: float = 0.50
-    minimum_trades: int = 30
+    minimum_portfolio_trades: int = 100
+    minimum_horizon_trades: int = 30
     minimum_independent_return_clusters: int = 20
     bootstrap_samples: int = 2000
     bootstrap_seed: int = 20260823
@@ -30,18 +32,22 @@ class ProfitabilityThresholds:
             raise ValueError("minimum_net_return cannot be below zero")
         if self.minimum_profit_factor < 1.20:
             raise ValueError("minimum_profit_factor cannot be below 1.20")
+        if self.minimum_fee_adjusted_win_rate < 0.52:
+            raise ValueError("minimum_fee_adjusted_win_rate cannot be below 52%")
         if not 0 < self.maximum_drawdown <= 0.03:
             raise ValueError("maximum_drawdown cannot exceed 3%")
         if self.minimum_bootstrap_expectancy < 0:
             raise ValueError("minimum_bootstrap_expectancy cannot be below zero")
-        if not 0 <= self.maximum_2x_cost_loss <= 0.005:
-            raise ValueError("maximum_2x_cost_loss cannot exceed 0.50%")
+        if self.minimum_two_x_cost_net_return < 0:
+            raise ValueError("minimum_two_x_cost_net_return cannot be below zero")
         if not 0.60 <= self.minimum_positive_fold_ratio <= 1:
             raise ValueError("minimum_positive_fold_ratio cannot be below 60%")
         if not 0 < self.maximum_concentration_share <= 0.50:
             raise ValueError("maximum_concentration_share cannot exceed 50%")
-        if self.minimum_trades < 30:
-            raise ValueError("minimum_trades cannot be below 30")
+        if self.minimum_portfolio_trades < 100:
+            raise ValueError("minimum_portfolio_trades cannot be below 100")
+        if self.minimum_horizon_trades < 30:
+            raise ValueError("minimum_horizon_trades cannot be below 30")
         if self.minimum_independent_return_clusters < 20:
             raise ValueError(
                 "minimum_independent_return_clusters cannot be below 20"
@@ -211,9 +217,17 @@ def evaluate_profitability_gate(
     mark_to_market_evidence_complete: bool = False,
     execution_evidence_complete: bool = False,
     factor_ablation_complete: bool = False,
+    gate_scope: str = "portfolio",
     thresholds: ProfitabilityThresholds | None = None,
 ) -> ProfitabilityGateResult:
     cfg = thresholds or ProfitabilityThresholds()
+    if gate_scope not in {"portfolio", "horizon"}:
+        raise ValueError("gate_scope must be portfolio or horizon")
+    minimum_trades = (
+        cfg.minimum_portfolio_trades
+        if gate_scope == "portfolio"
+        else cfg.minimum_horizon_trades
+    )
     trades = list(lockbox_trades)
     pnls = [float(_value(trade, "net_pnl", 0.0)) for trade in trades]
     final_equity = initial_equity_usdt + sum(pnls)
@@ -228,6 +242,9 @@ def evaluate_profitability_gate(
     )
     profit_factor_actual: float | str = (
         "Infinity" if profit > 0 and loss == 0 else float(profit_factor or 0.0)
+    )
+    fee_adjusted_win_rate = (
+        sum(value > 0 for value in pnls) / len(pnls) if pnls else 0.0
     )
     realized_only_drawdown = _maximum_drawdown(pnls, initial_equity_usdt)
     mark_to_market_drawdown = (
@@ -278,7 +295,12 @@ def evaluate_profitability_gate(
             "actual": bool(factor_ablation_complete),
             "required": True,
         },
-        "minimum_trades": {"passed": len(trades) >= cfg.minimum_trades, "actual": len(trades), "threshold": cfg.minimum_trades},
+        "minimum_trades": {
+            "passed": len(trades) >= minimum_trades,
+            "actual": len(trades),
+            "threshold": minimum_trades,
+            "scope": gate_scope,
+        },
         "independent_return_clusters": {
             "passed": bool(cluster_evidence.get("complete"))
             and independent_cluster_count >= cfg.minimum_independent_return_clusters,
@@ -288,6 +310,12 @@ def evaluate_profitability_gate(
         },
         "lockbox_net_return": {"passed": net_return > cfg.minimum_net_return, "actual": net_return, "threshold": cfg.minimum_net_return},
         "profit_factor": {"passed": profit_factor_passed, "actual": profit_factor_actual, "threshold": cfg.minimum_profit_factor},
+        "fee_adjusted_win_rate": {
+            "passed": fee_adjusted_win_rate >= cfg.minimum_fee_adjusted_win_rate,
+            "actual": fee_adjusted_win_rate,
+            "threshold": cfg.minimum_fee_adjusted_win_rate,
+            "basis": "positive net_pnl after all modeled costs",
+        },
         "mark_to_market_drawdown": {
             "passed": drawdown_passed,
             "actual": mark_to_market_drawdown,
@@ -306,9 +334,9 @@ def evaluate_profitability_gate(
             "calendar_cluster_count": int(cluster_evidence.get("cluster_count", 0)),
         },
         "two_x_cost_stress": {
-            "passed": two_x_cost_net_return >= -cfg.maximum_2x_cost_loss,
+            "passed": two_x_cost_net_return >= cfg.minimum_two_x_cost_net_return,
             "actual": two_x_cost_net_return,
-            "minimum": -cfg.maximum_2x_cost_loss,
+            "minimum": cfg.minimum_two_x_cost_net_return,
         },
         "positive_walk_forward_folds": {
             "passed": positive_fold_ratio >= cfg.minimum_positive_fold_ratio,
@@ -339,6 +367,7 @@ def evaluate_profitability_gate(
             "trade_count": len(trades),
             "net_return": net_return,
             "profit_factor": profit_factor_actual,
+            "fee_adjusted_win_rate": fee_adjusted_win_rate,
             "max_drawdown": mark_to_market_drawdown,
             "realized_close_only_drawdown": realized_only_drawdown,
             "bootstrap_lower_expectancy": bootstrap_lower,

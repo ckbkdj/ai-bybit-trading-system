@@ -2828,6 +2828,7 @@ class ProfitabilityRebuild:
                 factor_ablation_complete=bool(
                     factor_report["all_required_groups_evaluated"]
                 ),
+                gate_scope="horizon",
                 thresholds=ProfitabilityThresholds(),
             )
             horizon_development_gates[horizon] = horizon_gate
@@ -3399,6 +3400,7 @@ class ProfitabilityRebuild:
                 factor_ablation_complete=bool(
                     factor_report["all_required_groups_evaluated"]
                 ),
+                gate_scope="horizon",
                 thresholds=ProfitabilityThresholds(),
             )
             horizon_lockbox_gates[horizon] = horizon_gate
