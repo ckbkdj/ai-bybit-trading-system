@@ -226,7 +226,7 @@ def _require_precommitted_horizon_gates(
 
 
 def _ablation_ledger_summary(result: Mapping[str, object]) -> dict[str, object]:
-    return {
+    summary = {
         key: result.get(key)
         for key in (
             "oos_ablation_status",
@@ -242,9 +242,31 @@ def _ablation_ledger_summary(result: Mapping[str, object]) -> dict[str, object]:
             "worst_fold_improvement",
             "retained",
             "formal_feature_set",
+            "all_applicable_horizons_evaluated",
+            "retained_horizons",
         )
         if key in result
     }
+    summary["horizon_results"] = {
+        str(horizon): {
+            key: item.get(key)
+            for key in (
+                "oos_ablation_status",
+                "evaluated",
+                "oos_fold_count",
+                "execution_evidence",
+                "mean_improvement",
+                "bootstrap_lower_mean_improvement",
+                "improved_fold_ratio",
+                "worst_fold_improvement",
+                "retained",
+            )
+            if key in item
+        }
+        for horizon, item in dict(result.get("horizon_results") or {}).items()
+        if isinstance(item, Mapping)
+    }
+    return summary
 
 
 AblationProgressCallback = Callable[[Mapping[str, object]], None]
@@ -886,6 +908,122 @@ def _ablation_oof_threshold(selection: object) -> float:
     return float(threshold)
 
 
+def _horizon_scoped_ablation_result(
+    result: Mapping[str, object],
+    applicable_horizons: Sequence[int],
+) -> dict[str, object]:
+    """Prevent a factor that worked at one horizon leaking into another."""
+
+    output = dict(result)
+    fold_evidence = [
+        dict(item)
+        for item in list(output.get("folds") or [])
+        if isinstance(item, Mapping)
+    ]
+    horizon_results: dict[str, dict[str, object]] = {}
+    for horizon in applicable_horizons:
+        horizon_folds = [
+            item
+            for item in fold_evidence
+            if int(item.get("horizon_sec", -1)) == horizon
+        ]
+        evaluated_folds = [
+            item
+            for item in horizon_folds
+            if item.get("status") == "EVALUATED_OOS"
+            and isinstance(item.get("baseline_execution"), Mapping)
+            and isinstance(item.get("augmented_execution"), Mapping)
+        ]
+        baseline = [dict(item["baseline_execution"]) for item in evaluated_folds]
+        augmented = [dict(item["augmented_execution"]) for item in evaluated_folds]
+        common = {
+            "horizon_sec": horizon,
+            "factor_group": str(output["factor_group"]),
+            "factors": list(output.get("factors") or []),
+            "pit_observation_count": sum(
+                int(item.get("test_rows", 0)) for item in horizon_folds
+            ),
+            "oos_fold_count": len(evaluated_folds),
+            "folds": horizon_folds,
+        }
+        if len(evaluated_folds) < MINIMUM_ABLATION_TRADED_FOLDS:
+            horizon_results[str(horizon)] = {
+                **common,
+                "oos_ablation_status": "FAILED_INSUFFICIENT_HORIZON_OOS_FOLDS",
+                "evaluated": False,
+                "retained": False,
+                "formal_feature_set": False,
+            }
+            continue
+        execution_evidence = _ablation_execution_evidence(baseline, augmented)
+        if not bool(execution_evidence["passed"]):
+            horizon_results[str(horizon)] = {
+                **common,
+                "oos_ablation_status": (
+                    "FAILED_INSUFFICIENT_OOS_TRADES"
+                    if not bool(execution_evidence["trade_sample_complete"])
+                    else "FAILED_INCOMPLETE_EXECUTION_EVIDENCE"
+                ),
+                "evaluated": False,
+                "execution_evidence": execution_evidence,
+                "retained": False,
+                "formal_feature_set": False,
+            }
+            continue
+        comparison = compare_factor_groups(
+            baseline,
+            {str(output["factor_group"]): augmented},
+            primary_metric="net_return",
+            higher_is_better=True,
+            minimum_mean_improvement=0.0,
+            minimum_improved_fold_ratio=0.60,
+            minimum_worst_fold_improvement=-0.002,
+        )[0]
+        horizon_results[str(horizon)] = {
+            **common,
+            "oos_ablation_status": "EVALUATED_OOS",
+            "evaluated": True,
+            "execution_evidence": execution_evidence,
+            "metric": comparison.metric,
+            "baseline_mean": comparison.baseline_mean,
+            "augmented_mean": comparison.augmented_mean,
+            "mean_improvement": comparison.mean_improvement,
+            "bootstrap_lower_mean_improvement": (
+                comparison.bootstrap_lower_mean_improvement
+            ),
+            "bootstrap_confidence": comparison.bootstrap_confidence,
+            "bootstrap_samples": comparison.bootstrap_samples,
+            "improved_fold_ratio": comparison.improved_fold_ratio,
+            "worst_fold_improvement": comparison.worst_fold_improvement,
+            "retained": comparison.retained,
+            "formal_feature_set": comparison.retained,
+        }
+    all_horizons_evaluated = all(
+        item["oos_ablation_status"] == "EVALUATED_OOS"
+        for item in horizon_results.values()
+    )
+    retained_horizons = [
+        int(horizon)
+        for horizon, item in horizon_results.items()
+        if bool(item.get("retained"))
+    ]
+    if all_horizons_evaluated:
+        output["oos_ablation_status"] = "EVALUATED_OOS"
+    elif any(bool(item.get("evaluated")) for item in horizon_results.values()):
+        output["oos_ablation_status"] = "FAILED_INCOMPLETE_HORIZON_ABLATION"
+    output["evaluated"] = all_horizons_evaluated
+    output["aggregate_metrics_are_diagnostic_only"] = True
+    output["all_applicable_horizons_evaluated"] = all_horizons_evaluated
+    output["applicable_horizons"] = list(applicable_horizons)
+    output["horizon_results"] = horizon_results
+    output["retained_horizons"] = retained_horizons
+    output["retained"] = bool(retained_horizons)
+    output["formal_feature_set"] = (
+        all_horizons_evaluated and bool(retained_horizons)
+    )
+    return output
+
+
 def _factor_ablation_report(
     evaluated_groups: Mapping[str, Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
@@ -898,10 +1036,28 @@ def _factor_ablation_report(
     ):
         for group, factors in definitions.items():
             if group in evaluated:
-                groups.append(dict(evaluated[group]))
+                applicable_horizons = (
+                    HORIZONS_SEC
+                    if cadence == "all_horizons"
+                    else (180, 900)
+                    if cadence == "short"
+                    else (7200, 14400, 86400)
+                )
+                groups.append(
+                    _horizon_scoped_ablation_result(
+                        evaluated[group], applicable_horizons
+                    )
+                )
                 continue
+            applicable_horizons = (
+                HORIZONS_SEC
+                if cadence == "all_horizons"
+                else (180, 900)
+                if cadence == "short"
+                else (7200, 14400, 86400)
+            )
             groups.append(
-                {
+                _horizon_scoped_ablation_result({
                     "cadence": cadence,
                     "factor_group": group,
                     "factors": list(factors),
@@ -911,7 +1067,7 @@ def _factor_ablation_report(
                     "oos_fold_count": 0,
                     "retained": False,
                     "formal_feature_set": False,
-                }
+                }, applicable_horizons)
             )
     all_evaluated = all(
         item.get("oos_ablation_status") == "EVALUATED_OOS" for item in groups
@@ -937,6 +1093,19 @@ def _factor_ablation_report(
         "retained_factor_groups": [
             str(item["factor_group"]) for item in groups if bool(item.get("retained"))
         ],
+        "formal_factor_groups": [
+            str(item["factor_group"])
+            for item in groups
+            if bool(item.get("formal_feature_set"))
+        ],
+        "retained_factor_groups_by_horizon": {
+            str(horizon): [
+                str(item["factor_group"])
+                for item in groups
+                if horizon in set(item.get("retained_horizons") or [])
+            ]
+            for horizon in HORIZONS_SEC
+        },
         "groups": groups,
         "blocker": (
             None
@@ -2392,6 +2561,9 @@ class ProfitabilityRebuild:
             ablation_backtest,
             progress_callback=record_ablation_progress,
         )
+        legacy_result["legacy_brain_technical"] = _horizon_scoped_ablation_result(
+            legacy_result["legacy_brain_technical"], HORIZONS_SEC
+        )
         evaluated_factor_groups.update(legacy_result)
         self.ledger.append_event(
             self.trial_id,
@@ -2426,6 +2598,9 @@ class ProfitabilityRebuild:
                     factor_groups={group: columns},
                     progress_callback=record_ablation_progress,
                 )
+                result[group] = _horizon_scoped_ablation_result(
+                    result[group], (7200, 14400, 86400)
+                )
                 evaluated_factor_groups.update(result)
                 self.ledger.append_event(
                     self.trial_id,
@@ -2455,6 +2630,9 @@ class ProfitabilityRebuild:
                     factor_groups={group: columns},
                     progress_callback=record_ablation_progress,
                 )
+                result[group] = _horizon_scoped_ablation_result(
+                    result[group], (180, 900)
+                )
                 evaluated_factor_groups.update(result)
                 self.ledger.append_event(
                     self.trial_id,
@@ -2482,10 +2660,22 @@ class ProfitabilityRebuild:
         retained_groups = tuple(
             str(group) for group in factor_report["retained_factor_groups"]
         )
+        factor_results_by_group = {
+            str(item["factor_group"]): item
+            for item in factor_report["groups"]
+        }
         model_feature_columns_by_horizon: dict[int, tuple[str, ...]] = {}
         for horizon in HORIZONS_SEC:
             retained_factor_columns: list[str] = []
             for group in retained_groups:
+                retained_horizons = {
+                    int(value)
+                    for value in factor_results_by_group[group].get(
+                        "retained_horizons", []
+                    )
+                }
+                if horizon not in retained_horizons:
+                    continue
                 if group in LEGACY_FACTOR_GROUPS:
                     retained_factor_columns.extend(LEGACY_FACTOR_GROUPS[group])
                 if horizon in {180, 900} and group in SHORT_FACTOR_GROUPS:

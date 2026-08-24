@@ -16,7 +16,9 @@ from core.evaluation.profitability_rebuild import (
     _ablation_oof_threshold,
     _ablation_signals_from_predictions,
     _execution_release_evidence,
+    _factor_ablation_report,
     _failed_ablation_execution_result,
+    _horizon_scoped_ablation_result,
 )
 from core.models.two_stage import TwoStagePrediction
 
@@ -154,6 +156,71 @@ def test_ablation_with_enough_proxy_trades_is_not_formal_evidence():
     )
     assert result["formal_feature_set"] is False
     assert result["execution_evidence"]["direct_execution_cost_evidence_complete"] is False
+
+
+def test_factor_retention_is_scoped_to_the_horizon_with_complete_oos_evidence():
+    def arm(net_return: float, trades: int = 15) -> dict[str, object]:
+        return {
+            "net_return": net_return,
+            "signal_count": trades,
+            "trade_count": trades,
+            "direct_execution_cost_trade_count": trades,
+            "proxy_execution_cost_trade_count": 0,
+            "execution_cost_evidence_complete": True,
+            "simulation_complete": True,
+            "unresolved_position_count": 0,
+            "risk_policy_compliant": True,
+            "risk_budget_breach_count": 0,
+        }
+
+    folds = []
+    for fold_id in ("h180-1", "h180-2"):
+        folds.append(
+            {
+                "horizon_sec": 180,
+                "fold_id": fold_id,
+                "status": "EVALUATED_OOS",
+                "test_rows": 500,
+                "baseline_execution": arm(0.01),
+                "augmented_execution": arm(0.02),
+            }
+        )
+    folds.append(
+        {
+            "horizon_sec": 900,
+            "fold_id": "h900-only-one",
+            "status": "EVALUATED_OOS",
+            "test_rows": 500,
+            "baseline_execution": arm(0.01, 30),
+            "augmented_execution": arm(0.02, 30),
+        }
+    )
+    scoped = _horizon_scoped_ablation_result(
+        {
+            "cadence": "short",
+            "factor_group": "bybit_orderbook",
+            "factors": ["orderbook_spread_bps"],
+            "oos_ablation_status": "EVALUATED_OOS",
+            "evaluated": True,
+            "retained": True,
+            "formal_feature_set": True,
+            "folds": folds,
+        },
+        (180, 900),
+    )
+    assert scoped["retained_horizons"] == [180]
+    assert scoped["horizon_results"]["180"]["retained"] is True
+    assert scoped["horizon_results"]["900"]["oos_ablation_status"] == (
+        "FAILED_INSUFFICIENT_HORIZON_OOS_FOLDS"
+    )
+    assert scoped["oos_ablation_status"] == "FAILED_INCOMPLETE_HORIZON_ABLATION"
+    assert scoped["formal_feature_set"] is False
+
+    report = _factor_ablation_report({"bybit_orderbook": scoped})
+    assert "bybit_orderbook" in report["retained_factor_groups_by_horizon"]["180"]
+    assert "bybit_orderbook" not in report["retained_factor_groups_by_horizon"]["900"]
+    assert "bybit_orderbook" not in report["formal_factor_groups"]
+    assert report["all_required_groups_evaluated"] is False
 
 
 def test_ablation_research_budget_measures_rankings_without_faking_deployable_edge():

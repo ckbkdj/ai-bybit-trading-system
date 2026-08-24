@@ -350,6 +350,13 @@ blocker 只允许表示样本量、fold 或跨币种不足。PIT 违规、混周
 - baseline 和 augmented 都有足量真实交易；
 - 费用后平均改善、正改善 fold 比例和最差 fold 退化都过门槛。
 
+消融结果还必须按 horizon 检查，不能只看组级汇总：
+
+- `groups[].horizon_results` 必须覆盖该组全部适用周期；短周期为 180/900 秒，中长周期为 7200/14400/86400 秒，旧 Brain baseline 覆盖全部五个周期；
+- 每个周期独立满足 fold、真实交易、直接执行成本和稳定改善门槛；汇总 `mean_improvement` 只用于诊断；
+- `retained_factor_groups_by_horizon` 决定各周期可装载的因子，禁止把一个周期的 retained 结果传播到另一个周期；
+- `retained_horizons` 可保留已完成周期的研究证据，但只要任一适用周期未完成，组级 `formal_feature_set=false`、`all_required_groups_evaluated=false`，不得晋升 candidate。
+
 研究用固定 2% OOS ranking 只用于测量因子增益。它可以让负 edge 信号进入“研究回测”，但不会改写真实 lower-bound edge，也不会放松生产 TRADE gate。
 
 liquidation 组必须额外核对 `collection_evidence`。Bybit 官方公开的是 [`allLiquidation.{symbol}` 实时 WS](https://bybit-exchange.github.io/docs/v5/websocket/public/all-liquidation)，500ms 推送；当前 [V5 Market REST 清单](https://bybit-exchange.github.io/docs/api-explorer/v5/market/market)没有公共历史爆仓接口。因此 `historical_backfill_supported=false` 是真实来源限制，不是待补代码。达到 180 天 forward-only PIT 历史前，该组和总因子门禁保持失败。
