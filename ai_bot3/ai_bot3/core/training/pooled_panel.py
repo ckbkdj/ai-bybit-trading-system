@@ -258,14 +258,15 @@ class PooledPanelBuilder:
         boundary = pd.to_datetime(lockbox_start, utc=True, errors="coerce")
         if pd.isna(boundary):
             raise ValueError("sealed lockbox boundary is invalid")
+        purge = int(round(horizon_sec * self.purge_multiplier))
+        embargo = int(round(horizon_sec * self.embargo_multiplier))
+        development_cutoff = boundary - timedelta(seconds=purge)
         development = data[
-            (data["decision_at"] < boundary)
+            (data["decision_at"] < development_cutoff)
             & (data["label_available_at"] < boundary)
         ].copy().reset_index(drop=True)
         if len(development) < self.minimum_train_rows + self.minimum_test_rows:
             raise ValueError("sealed development panel is too small")
-        purge = int(round(horizon_sec * self.purge_multiplier))
-        embargo = int(round(horizon_sec * self.embargo_multiplier))
         folds = self._walk_forward_folds(development, horizon_sec, purge, embargo)
         if not folds:
             raise ValueError("no valid sealed-development walk-forward folds")

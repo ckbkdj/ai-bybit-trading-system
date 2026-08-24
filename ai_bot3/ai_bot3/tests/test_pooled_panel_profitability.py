@@ -81,7 +81,17 @@ def test_panel_fingerprint_includes_feature_values_not_only_labels():
 
 def test_sealed_development_never_materializes_lockbox_labels():
     panel = _panel()
-    boundary = panel["decision_at"].drop_duplicates().sort_values().iloc[-40]
+    last_pre_boundary_decision = (
+        panel["decision_at"].drop_duplicates().sort_values().iloc[-40]
+    )
+    boundary = last_pre_boundary_decision + timedelta(minutes=2)
+    # An early-exit label can be available before the boundary even though its
+    # maximum holding window overlaps the lockbox. Fixed purge, not outcome
+    # availability, must exclude it.
+    panel.loc[
+        panel["decision_at"] == last_pre_boundary_decision,
+        "label_available_at",
+    ] = last_pre_boundary_decision + timedelta(seconds=1)
     dataset = PooledPanelBuilder(
         minimum_train_rows=100,
         minimum_test_rows=20,
@@ -93,6 +103,8 @@ def test_sealed_development_never_materializes_lockbox_labels():
     assert dataset.lockbox_fingerprint is None
     assert dataset.lockbox_labels_materialized is False
     assert dataset.development["label_available_at"].max() < boundary
+    assert dataset.development["decision_at"].max() < boundary - timedelta(seconds=180)
+    assert last_pre_boundary_decision not in set(dataset.development["decision_at"])
     assert manifest["lockbox_status"] == "SEALED_UNLABELED"
     assert manifest["lockbox_rows"] == 0
 
