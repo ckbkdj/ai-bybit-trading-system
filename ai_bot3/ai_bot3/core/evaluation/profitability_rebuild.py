@@ -173,6 +173,9 @@ def _ablation_ledger_summary(result: Mapping[str, object]) -> dict[str, object]:
             "oos_fold_count",
             "execution_evidence",
             "mean_improvement",
+            "bootstrap_lower_mean_improvement",
+            "bootstrap_confidence",
+            "bootstrap_samples",
             "improved_fold_ratio",
             "worst_fold_improvement",
             "retained",
@@ -708,7 +711,10 @@ def _factor_ablation_report(
         item.get("oos_ablation_status") == "EVALUATED_OOS" for item in groups
     )
     return {
-        "method": "identical purged walk-forward folds; fee-adjusted event-driven net return",
+        "method": (
+            "identical purged walk-forward folds; fee-adjusted event-driven net return; "
+            "paired moving-block bootstrap lower improvement bound"
+        ),
         "baseline": "price_technical_only",
         "research_selection_policy": {
             "scope": "factor_ablation_only_not_release_eligible",
@@ -1046,6 +1052,11 @@ def _evaluate_legacy_technical_ablation(
             "baseline_mean": comparison.baseline_mean,
             "augmented_mean": comparison.augmented_mean,
             "mean_improvement": comparison.mean_improvement,
+            "bootstrap_lower_mean_improvement": (
+                comparison.bootstrap_lower_mean_improvement
+            ),
+            "bootstrap_confidence": comparison.bootstrap_confidence,
+            "bootstrap_samples": comparison.bootstrap_samples,
             "improved_fold_ratio": comparison.improved_fold_ratio,
             "worst_fold_improvement": comparison.worst_fold_improvement,
             "retained": comparison.retained,
@@ -1258,6 +1269,11 @@ def _evaluate_long_factor_ablation(
             "baseline_mean": comparison.baseline_mean,
             "augmented_mean": comparison.augmented_mean,
             "mean_improvement": comparison.mean_improvement,
+            "bootstrap_lower_mean_improvement": (
+                comparison.bootstrap_lower_mean_improvement
+            ),
+            "bootstrap_confidence": comparison.bootstrap_confidence,
+            "bootstrap_samples": comparison.bootstrap_samples,
             "improved_fold_ratio": comparison.improved_fold_ratio,
             "worst_fold_improvement": comparison.worst_fold_improvement,
             "measured_subset_would_retain": comparison.retained,
@@ -1469,6 +1485,11 @@ def _evaluate_bybit_pit_ablation(
             "baseline_mean": comparison.baseline_mean,
             "augmented_mean": comparison.augmented_mean,
             "mean_improvement": comparison.mean_improvement,
+            "bootstrap_lower_mean_improvement": (
+                comparison.bootstrap_lower_mean_improvement
+            ),
+            "bootstrap_confidence": comparison.bootstrap_confidence,
+            "bootstrap_samples": comparison.bootstrap_samples,
             "improved_fold_ratio": comparison.improved_fold_ratio,
             "worst_fold_improvement": comparison.worst_fold_improvement,
             "retained": comparison.retained,
