@@ -65,6 +65,18 @@ def _statistical_evidence() -> dict[str, object]:
     }
 
 
+def _calibration_evidence() -> dict[str, object]:
+    return {
+        "status": "PASSED",
+        "passed": True,
+        "complete": True,
+        "failed_group_count": 0,
+        "record_count": 500,
+        "unique_decision_timestamp_count": 100,
+        "method": "outer_oos_fixture",
+    }
+
+
 def _release_evidence_fixture(name: str) -> dict[str, object]:
     if name == "data_coverage_report.json":
         return {
@@ -85,6 +97,17 @@ def _release_evidence_fixture(name: str) -> dict[str, object]:
             "raw_source_complete": True,
             "outer_oos_complete": True,
         }
+    if name == "calibration_coverage_report.json":
+        return {
+            "status": "PASSED",
+            "complete": True,
+            "development": {"portfolio": {"passed": True}},
+            "lockbox": {
+                "portfolio": {"passed": True},
+                "used_for_calibration_or_tuning": False,
+                "alternative_models_scored": False,
+            },
+        }
     return {"report": name}
 
 
@@ -99,6 +122,7 @@ def test_profitability_gate_passes_only_complete_stable_evidence():
         execution_evidence_complete=True,
         factor_ablation_complete=True,
         statistical_overfit_evidence=_statistical_evidence(),
+        calibration_coverage_evidence=_calibration_evidence(),
     )
     assert gate.profitability_gate == "PASSED"
     assert gate.stage == "candidate"
@@ -178,6 +202,7 @@ def test_profitability_gate_enforces_net_win_rate_and_nonnegative_cost_stress():
         execution_evidence_complete=True,
         factor_ablation_complete=True,
         statistical_overfit_evidence=_statistical_evidence(),
+        calibration_coverage_evidence=_calibration_evidence(),
     )
 
     assert gate.profitability_gate == "FAILED"
@@ -198,6 +223,7 @@ def test_horizon_scope_requires_30_trades_while_portfolio_requires_100():
         execution_evidence_complete=True,
         factor_ablation_complete=True,
         statistical_overfit_evidence=_statistical_evidence(),
+        calibration_coverage_evidence=_calibration_evidence(),
         gate_scope="horizon",
     )
     portfolio = evaluate_profitability_gate(
@@ -210,6 +236,7 @@ def test_horizon_scope_requires_30_trades_while_portfolio_requires_100():
         execution_evidence_complete=True,
         factor_ablation_complete=True,
         statistical_overfit_evidence=_statistical_evidence(),
+        calibration_coverage_evidence=_calibration_evidence(),
     )
 
     assert horizon.checks["minimum_trades"]["passed"] is True
@@ -229,6 +256,7 @@ def test_portfolio_profit_cannot_authorize_a_failed_precommitted_horizon():
         execution_evidence_complete=True,
         factor_ablation_complete=True,
         statistical_overfit_evidence=_statistical_evidence(),
+        calibration_coverage_evidence=_calibration_evidence(),
     )
     failed_horizon = evaluate_profitability_gate(
         [],
@@ -269,6 +297,7 @@ def test_profitability_gate_does_not_treat_correlated_trades_as_independent():
         execution_evidence_complete=True,
         factor_ablation_complete=True,
         statistical_overfit_evidence=_statistical_evidence(),
+        calibration_coverage_evidence=_calibration_evidence(),
     )
     assert gate.profitability_gate == "FAILED"
     assert "independent_return_clusters" in gate.blockers
@@ -371,6 +400,7 @@ def test_candidate_manifest_binds_every_final_evidence_report(tmp_path):
         execution_evidence_complete=True,
         factor_ablation_complete=True,
         statistical_overfit_evidence=_statistical_evidence(),
+        calibration_coverage_evidence=_calibration_evidence(),
     )
     profitability = tmp_path / "profitability_report.json"
     model = tmp_path / "model.json"
@@ -418,6 +448,7 @@ def test_candidate_manifest_release_id_is_derived_from_bound_evidence(tmp_path):
         execution_evidence_complete=True,
         factor_ablation_complete=True,
         statistical_overfit_evidence=_statistical_evidence(),
+        calibration_coverage_evidence=_calibration_evidence(),
     )
     profitability = tmp_path / "profitability_report.json"
     model = tmp_path / "model.json"
@@ -484,6 +515,7 @@ def test_development_gate_can_pass_without_creating_a_candidate_or_opening_lockb
         execution_evidence_complete=True,
         factor_ablation_complete=True,
         statistical_overfit_evidence=_statistical_evidence(),
+        calibration_coverage_evidence=_calibration_evidence(),
     )
     assert development.profitability_gate == "PASSED"
     assert development.stage == "development_validated"

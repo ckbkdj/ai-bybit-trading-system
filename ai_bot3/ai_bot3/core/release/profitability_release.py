@@ -20,6 +20,7 @@ REQUIRED_EVIDENCE_REPORTS = (
     "data_coverage_report.json",
     "missing_intervals_report.json",
     "independent_timestamp_count_report.json",
+    "calibration_coverage_report.json",
 )
 
 
@@ -36,6 +37,7 @@ def _evidence_semantic_failure(name: str, path: Path) -> str | None:
         "data_coverage_report.json",
         "missing_intervals_report.json",
         "independent_timestamp_count_report.json",
+        "calibration_coverage_report.json",
     }:
         return None
     try:
@@ -63,6 +65,27 @@ def _evidence_semantic_failure(name: str, path: Path) -> str | None:
             payload.get("outer_oos_complete")
         ):
             return "independent_timestamp_scope_incomplete"
+    elif name == "calibration_coverage_report.json":
+        development = payload.get("development")
+        lockbox = payload.get("lockbox")
+        if payload.get("status") != "PASSED" or not bool(payload.get("complete")):
+            return "calibration_coverage_incomplete"
+        if not isinstance(development, Mapping) or not isinstance(lockbox, Mapping):
+            return "calibration_scopes_missing"
+        development_portfolio = development.get("portfolio")
+        lockbox_portfolio = lockbox.get("portfolio")
+        if not isinstance(development_portfolio, Mapping) or not bool(
+            development_portfolio.get("passed")
+        ):
+            return "development_calibration_failed"
+        if not isinstance(lockbox_portfolio, Mapping) or not bool(
+            lockbox_portfolio.get("passed")
+        ):
+            return "lockbox_calibration_failed"
+        if bool(lockbox.get("used_for_calibration_or_tuning")) or bool(
+            lockbox.get("alternative_models_scored")
+        ):
+            return "lockbox_calibration_policy_violated"
     return None
 
 

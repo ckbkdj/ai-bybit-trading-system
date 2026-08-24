@@ -22,6 +22,10 @@ from core.evaluation.profitability_gate import (
     write_profitability_report,
 )
 from core.evaluation.ablation import compare_factor_groups
+from core.evaluation.calibration_coverage import (
+    directional_calibration_rows,
+    evaluate_quantile_coverage,
+)
 from core.evaluation.statistical_governance import (
     TrialLedger,
     TrialRecord,
@@ -3068,6 +3072,9 @@ class ProfitabilityRebuild:
         development_evaluation_timestamps_by_horizon: dict[int, list[object]] = {
             horizon: [] for horizon in HORIZONS_SEC
         }
+        development_calibration_rows_by_horizon: dict[
+            int, list[dict[str, object]]
+        ] = {horizon: [] for horizon in HORIZONS_SEC}
         for horizon, dataset in release_datasets.items():
             model_feature_columns = model_feature_columns_by_horizon[horizon]
             for fold in dataset.folds:
@@ -3085,6 +3092,9 @@ class ProfitabilityRebuild:
                 report = backtest.run(signals, market)
                 development_evaluation_timestamps_by_horizon[horizon].extend(
                     test["decision_at"].tolist()
+                )
+                development_calibration_rows_by_horizon[horizon].extend(
+                    directional_calibration_rows(test, predictions)
                 )
                 selected_config_id = _hash_payload(
                     asdict(selection.selected_config)
@@ -3157,6 +3167,21 @@ class ProfitabilityRebuild:
                     }
                 )
 
+        development_calibration_by_horizon = {
+            horizon: evaluate_quantile_coverage(
+                development_calibration_rows_by_horizon[horizon],
+                required_horizons=[horizon],
+            )
+            for horizon in HORIZONS_SEC
+        }
+        development_calibration_evidence = evaluate_quantile_coverage(
+            [
+                row
+                for horizon in HORIZONS_SEC
+                for row in development_calibration_rows_by_horizon[horizon]
+            ],
+            required_horizons=HORIZONS_SEC,
+        )
         horizon_development_gates: dict[int, ProfitabilityGateResult] = {}
         horizon_development_reports: dict[int, dict[str, object]] = {}
         horizon_development_statistical_evidence: dict[int, dict[str, object]] = {}
@@ -3204,6 +3229,9 @@ class ProfitabilityRebuild:
                     factor_report["all_required_groups_evaluated"]
                 ),
                 statistical_overfit_evidence=horizon_statistical_evidence,
+                calibration_coverage_evidence=(
+                    development_calibration_by_horizon[horizon]
+                ),
                 gate_scope="horizon",
                 thresholds=ProfitabilityThresholds(),
             )
@@ -3297,6 +3325,7 @@ class ProfitabilityRebuild:
             execution_evidence_complete=candidate_execution_evidence_complete,
             factor_ablation_complete=bool(factor_report["all_required_groups_evaluated"]),
             statistical_overfit_evidence=development_statistical_evidence,
+            calibration_coverage_evidence=development_calibration_evidence,
             thresholds=ProfitabilityThresholds(),
         )
         oos_timestamp_evidence = {}
@@ -3334,6 +3363,27 @@ class ProfitabilityRebuild:
         )
         _archive_candidate_manifest(output, self.trial_id)
         write_profitability_report(output / "profitability_report.json", development_gate)
+        _atomic_json(
+            output / "calibration_coverage_report.json",
+            {
+                "schema_version": "profitability-calibration-release.v1",
+                "trial_id": self.trial_id,
+                "code_commit": self.config.code_commit,
+                "status": "LOCKBOX_NOT_EVALUATED",
+                "complete": False,
+                "development": {
+                    "portfolio": development_calibration_evidence,
+                    "horizons": {
+                        str(horizon): evidence
+                        for horizon, evidence in development_calibration_by_horizon.items()
+                    },
+                },
+                "lockbox": {
+                    "status": "SEALED_NOT_OPENED",
+                    "used_for_calibration_or_tuning": False,
+                },
+            },
+        )
         _atomic_json(
             output / "walk_forward_report.json",
             {
@@ -3670,6 +3720,9 @@ class ProfitabilityRebuild:
         lockbox_evaluation_timestamps_by_horizon: dict[int, list[object]] = {
             horizon: [] for horizon in development_eligible_horizons
         }
+        lockbox_calibration_rows_by_horizon: dict[
+            int, list[dict[str, object]]
+        ] = {horizon: [] for horizon in development_eligible_horizons}
         lockbox_bybit_evidence_by_horizon: dict[int, dict[str, object]] = {}
         for horizon in development_eligible_horizons:
             lockbox_parts: list[pd.DataFrame] = []
@@ -3826,10 +3879,12 @@ class ProfitabilityRebuild:
             lockbox_panel_fingerprints[horizon] = PooledPanelBuilder.fingerprint(
                 lockbox_panel
             )
+            lockbox_predictions = final_models[horizon].predict(lockbox_panel)
             horizon_signals = _signals_from_predictions(
-                lockbox_panel,
-                final_models[horizon].predict(lockbox_panel),
-                horizon,
+                lockbox_panel, lockbox_predictions, horizon
+            )
+            lockbox_calibration_rows_by_horizon[horizon].extend(
+                directional_calibration_rows(lockbox_panel, lockbox_predictions)
             )
             lockbox_signals_by_horizon[horizon].extend(horizon_signals)
             self.ledger.append_event(
@@ -3860,6 +3915,22 @@ class ProfitabilityRebuild:
                 str(horizon): fingerprint
                 for horizon, fingerprint in lockbox_panel_fingerprints.items()
             }
+        )
+
+        lockbox_calibration_by_horizon = {
+            horizon: evaluate_quantile_coverage(
+                lockbox_calibration_rows_by_horizon[horizon],
+                required_horizons=[horizon],
+            )
+            for horizon in development_eligible_horizons
+        }
+        lockbox_calibration_evidence = evaluate_quantile_coverage(
+            [
+                row
+                for horizon in development_eligible_horizons
+                for row in lockbox_calibration_rows_by_horizon[horizon]
+            ],
+            required_horizons=development_eligible_horizons,
         )
 
         horizon_lockbox_gates: dict[int, ProfitabilityGateResult] = {}
@@ -3905,6 +3976,9 @@ class ProfitabilityRebuild:
                     factor_report["all_required_groups_evaluated"]
                 ),
                 statistical_overfit_evidence=horizon_statistical_evidence,
+                calibration_coverage_evidence=(
+                    lockbox_calibration_by_horizon[horizon]
+                ),
                 gate_scope="horizon",
                 thresholds=ProfitabilityThresholds(),
             )
@@ -3966,6 +4040,7 @@ class ProfitabilityRebuild:
             ),
             factor_ablation_complete=bool(factor_report["all_required_groups_evaluated"]),
             statistical_overfit_evidence=lockbox_statistical_evidence,
+            calibration_coverage_evidence=lockbox_calibration_evidence,
             thresholds=ProfitabilityThresholds(),
         )
         gate = _require_precommitted_horizon_gates(
@@ -3974,6 +4049,47 @@ class ProfitabilityRebuild:
         if not gate.passed:
             _archive_candidate_manifest(output, self.trial_id)
         write_profitability_report(output / "profitability_report.json", gate)
+        calibration_release_passed = bool(
+            development_calibration_evidence.get("passed")
+            and lockbox_calibration_evidence.get("passed")
+            and all(
+                evidence.get("passed")
+                for evidence in development_calibration_by_horizon.values()
+            )
+            and all(
+                evidence.get("passed")
+                for evidence in lockbox_calibration_by_horizon.values()
+            )
+        )
+        _atomic_json(
+            output / "calibration_coverage_report.json",
+            {
+                "schema_version": "profitability-calibration-release.v1",
+                "trial_id": self.trial_id,
+                "code_commit": self.config.code_commit,
+                "status": "PASSED" if calibration_release_passed else "FAILED",
+                "complete": bool(
+                    development_calibration_evidence.get("complete")
+                    and lockbox_calibration_evidence.get("complete")
+                ),
+                "development": {
+                    "portfolio": development_calibration_evidence,
+                    "horizons": {
+                        str(horizon): evidence
+                        for horizon, evidence in development_calibration_by_horizon.items()
+                    },
+                },
+                "lockbox": {
+                    "portfolio": lockbox_calibration_evidence,
+                    "horizons": {
+                        str(horizon): evidence
+                        for horizon, evidence in lockbox_calibration_by_horizon.items()
+                    },
+                    "used_for_calibration_or_tuning": False,
+                    "alternative_models_scored": False,
+                },
+            },
+        )
         _atomic_json(
             output / "lockbox_report.json",
             {
@@ -4157,6 +4273,7 @@ class ProfitabilityRebuild:
                         "data_coverage_report.json",
                         "missing_intervals_report.json",
                         "independent_timestamp_count_report.json",
+                        "calibration_coverage_report.json",
                     )
                 },
             )
@@ -4242,6 +4359,21 @@ def write_failed_outputs(output_dir: Path, *, reason: str) -> ProfitabilityGateR
                 "complete": False,
                 "deflated_sharpe_probability": None,
                 "probability_of_backtest_overfitting": None,
+            },
+        ),
+        (
+            "calibration_coverage_report.json",
+            {
+                "schema_version": "profitability-calibration-release.v1",
+                "status": "FAILED",
+                "complete": False,
+                "reason": reason,
+                "development": {"status": "INCOMPLETE"},
+                "lockbox": {
+                    "status": "SEALED_NOT_OPENED",
+                    "used_for_calibration_or_tuning": False,
+                    "alternative_models_scored": False,
+                },
             },
         ),
     ):

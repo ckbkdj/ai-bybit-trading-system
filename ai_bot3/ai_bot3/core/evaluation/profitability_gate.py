@@ -226,6 +226,7 @@ def evaluate_profitability_gate(
     execution_evidence_complete: bool = False,
     factor_ablation_complete: bool = False,
     statistical_overfit_evidence: Mapping[str, object] | None = None,
+    calibration_coverage_evidence: Mapping[str, object] | None = None,
     gate_scope: str = "portfolio",
     thresholds: ProfitabilityThresholds | None = None,
 ) -> ProfitabilityGateResult:
@@ -261,6 +262,11 @@ def evaluate_profitability_gate(
         "deflated_sharpe_probability"
     )
     cscv_pbo = statistical_evidence.get("probability_of_backtest_overfitting")
+    calibration_evidence = dict(calibration_coverage_evidence or {})
+    calibration_complete = bool(calibration_evidence.get("complete"))
+    calibration_passed = bool(
+        calibration_complete and calibration_evidence.get("passed")
+    )
     realized_only_drawdown = _maximum_drawdown(pnls, initial_equity_usdt)
     mark_to_market_drawdown = (
         float(mark_to_market_max_drawdown)
@@ -309,6 +315,20 @@ def evaluate_profitability_gate(
             "passed": bool(factor_ablation_complete),
             "actual": bool(factor_ablation_complete),
             "required": True,
+        },
+        "return_quantile_calibration": {
+            "passed": calibration_passed,
+            "actual": calibration_evidence.get("status", "MISSING"),
+            "required": "PASSED",
+            "evidence_complete": calibration_complete,
+            "failed_group_count": calibration_evidence.get(
+                "failed_group_count"
+            ),
+            "record_count": calibration_evidence.get("record_count"),
+            "unique_decision_timestamp_count": calibration_evidence.get(
+                "unique_decision_timestamp_count"
+            ),
+            "method": calibration_evidence.get("method"),
         },
         "deflated_sharpe_ratio": {
             "passed": statistical_complete
@@ -406,6 +426,9 @@ def evaluate_profitability_gate(
             "fee_adjusted_win_rate": fee_adjusted_win_rate,
             "deflated_sharpe_probability": deflated_sharpe_probability,
             "cscv_probability_of_backtest_overfitting": cscv_pbo,
+            "return_quantile_calibration_status": calibration_evidence.get(
+                "status", "MISSING"
+            ),
             "max_drawdown": mark_to_market_drawdown,
             "realized_close_only_drawdown": realized_only_drawdown,
             "bootstrap_lower_expectancy": bootstrap_lower,

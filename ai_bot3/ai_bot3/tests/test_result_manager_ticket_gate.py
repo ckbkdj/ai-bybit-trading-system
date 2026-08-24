@@ -47,6 +47,17 @@ def _release_evidence_fixture(name: str) -> dict[str, object]:
             "raw_source_complete": True,
             "outer_oos_complete": True,
         }
+    if name == "calibration_coverage_report.json":
+        return {
+            "status": "PASSED",
+            "complete": True,
+            "development": {"portfolio": {"passed": True}},
+            "lockbox": {
+                "portfolio": {"passed": True},
+                "used_for_calibration_or_tuning": False,
+                "alternative_models_scored": False,
+            },
+        }
     return {"fixture": name}
 
 
