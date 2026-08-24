@@ -240,6 +240,8 @@ python scripts/run_profitability_rebuild.py `
 
 大样本训练失败时先读取 ledger 的 `pipeline_error`。编码器应只构造一次特征矩阵并逐列原地标准化；ridge、direction 和 meta 优化不得为截距额外复制整块矩阵。Bybit loader 还必须先冻结 sequence，再按 development 决策窗和各因子最大陈旧期在 SQL 层裁剪；禁止为一个早于现有盘口历史的开发窗把千万级全库载入内存。每个 horizon 第一遍只读取时间和覆盖范围来封存边界，第二遍按 symbol 逐个工程化、标注并释放；Bybit join 随该 horizon 完成后立即释放快照。dataset 建成时逐个弹出并释放原 panel，禁止为了一个尚未获准打开的 lockbox 常驻保存 25 份完整历史。通过 development 后如需重建新 lockbox，必须先验证 K 线源 size/mtime 与 trial 冻结值完全一致。已用失败现场同形状的 85,128×40 float64 矩阵做回归验证。该验证只证明内存路径可执行，不是盈利证据。
 
+长时消融必须持续写入 `factor_ablation_fold_progress`：每个 horizon/fold 至少有 `STARTED` 以及 `COMPLETED` 或 `SKIPPED_INSUFFICIENT_PIT_ROWS`，并记录 train/test 行数。只有进程 CPU、数据库 mtime 和 ledger 心跳都停止增长时才判定可能卡死，不能因单个真实大样本 fold 数小时未完成就擅自终止。
+
 生产 shadow 推理若模型签名包含对应因子，必须同时配置：
 
 ```powershell

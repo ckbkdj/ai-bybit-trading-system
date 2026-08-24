@@ -19,6 +19,7 @@ from core.evaluation.profitability_rebuild import (
     ProfitabilityRebuildConfig,
     _build_direct_release_dataset,
     _bybit_names_for_horizon,
+    _emit_ablation_progress,
     _engineer_features,
     _market_bars,
     _maximum_execution_window_observed,
@@ -277,6 +278,30 @@ def test_release_walk_forward_excludes_proxy_rows_before_splitting():
             180,
             lockbox_start=start + timedelta(days=1),
         )
+
+
+def test_long_running_ablation_emits_auditable_fold_heartbeat():
+    events = []
+    _emit_ablation_progress(
+        events.append,
+        factor_group="legacy_brain_technical",
+        horizon_sec=180,
+        fold_id="outer_01",
+        status="STARTED",
+        train_rows=100_000,
+        test_rows=20_000,
+    )
+
+    assert events == [
+        {
+            "factor_group": "legacy_brain_technical",
+            "horizon_sec": 180,
+            "fold_id": "outer_01",
+            "status": "STARTED",
+            "train_rows": 100_000,
+            "test_rows": 20_000,
+        }
+    ]
 
 
 def test_development_label_materialization_stops_before_sealed_lockbox_path():

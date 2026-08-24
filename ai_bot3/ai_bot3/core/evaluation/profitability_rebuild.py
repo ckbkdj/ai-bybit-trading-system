@@ -8,7 +8,7 @@ from contextlib import closing
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -221,6 +221,33 @@ def _ablation_ledger_summary(result: Mapping[str, object]) -> dict[str, object]:
         )
         if key in result
     }
+
+
+AblationProgressCallback = Callable[[Mapping[str, object]], None]
+
+
+def _emit_ablation_progress(
+    callback: AblationProgressCallback | None,
+    *,
+    factor_group: str,
+    horizon_sec: int,
+    fold_id: str,
+    status: str,
+    train_rows: int,
+    test_rows: int,
+) -> None:
+    if callback is None:
+        return
+    callback(
+        {
+            "factor_group": factor_group,
+            "horizon_sec": horizon_sec,
+            "fold_id": fold_id,
+            "status": status,
+            "train_rows": train_rows,
+            "test_rows": test_rows,
+        }
+    )
 
 
 def _execution_release_evidence(
@@ -1049,6 +1076,8 @@ def _evaluate_legacy_technical_ablation(
     market: Mapping[str, Sequence[MarketBar]],
     selector: NestedWalkForwardSelector,
     backtest: EventDrivenBacktest,
+    *,
+    progress_callback: AblationProgressCallback | None = None,
 ) -> dict[str, dict[str, object]]:
     """Evaluate reusable legacy Brain indicators on untouched outer folds."""
 
@@ -1068,6 +1097,15 @@ def _evaluate_legacy_technical_ablation(
                 test[list(columns)].notna().all(axis=1)
             ].reset_index(drop=True)
             if len(eligible_train) < 100 or len(eligible_test) < 30:
+                _emit_ablation_progress(
+                    progress_callback,
+                    factor_group=group,
+                    horizon_sec=horizon,
+                    fold_id=fold.fold_id,
+                    status="SKIPPED_INSUFFICIENT_PIT_ROWS",
+                    train_rows=len(eligible_train),
+                    test_rows=len(eligible_test),
+                )
                 fold_evidence.append(
                     {
                         "horizon_sec": horizon,
@@ -1078,6 +1116,15 @@ def _evaluate_legacy_technical_ablation(
                     }
                 )
                 continue
+            _emit_ablation_progress(
+                progress_callback,
+                factor_group=group,
+                horizon_sec=horizon,
+                fold_id=fold.fold_id,
+                status="STARTED",
+                train_rows=len(eligible_train),
+                test_rows=len(eligible_test),
+            )
             baseline_selection = selector.select_and_fit(
                 eligible_train,
                 FEATURE_COLUMNS,
@@ -1148,6 +1195,15 @@ def _evaluate_legacy_technical_ablation(
                         meta_threshold=augmented_selection.selected_config.meta_trade_probability,
                     ),
                 }
+            )
+            _emit_ablation_progress(
+                progress_callback,
+                factor_group=group,
+                horizon_sec=horizon,
+                fold_id=fold.fold_id,
+                status="COMPLETED",
+                train_rows=len(eligible_train),
+                test_rows=len(eligible_test),
             )
     if len(baseline_folds) < 2:
         return {
@@ -1228,6 +1284,7 @@ def _evaluate_long_factor_ablation(
     backtest: EventDrivenBacktest,
     *,
     factor_groups: Mapping[str, tuple[str, ...]] = LONG_FACTOR_GROUPS,
+    progress_callback: AblationProgressCallback | None = None,
 ) -> dict[str, dict[str, object]]:
     results: dict[str, dict[str, object]] = {}
     long_datasets = {
@@ -1275,6 +1332,15 @@ def _evaluate_long_factor_ablation(
                 eligible_train = train.loc[train_mask].reset_index(drop=True)
                 eligible_test = test.loc[test_mask].reset_index(drop=True)
                 if len(eligible_train) < 100 or len(eligible_test) < 30:
+                    _emit_ablation_progress(
+                        progress_callback,
+                        factor_group=group,
+                        horizon_sec=horizon,
+                        fold_id=fold.fold_id,
+                        status="SKIPPED_INSUFFICIENT_PIT_ROWS",
+                        train_rows=len(eligible_train),
+                        test_rows=len(eligible_test),
+                    )
                     fold_evidence.append(
                         {
                             "horizon_sec": horizon,
@@ -1285,6 +1351,15 @@ def _evaluate_long_factor_ablation(
                         }
                     )
                     continue
+                _emit_ablation_progress(
+                    progress_callback,
+                    factor_group=group,
+                    horizon_sec=horizon,
+                    fold_id=fold.fold_id,
+                    status="STARTED",
+                    train_rows=len(eligible_train),
+                    test_rows=len(eligible_test),
+                )
                 baseline_selection = selector.select_and_fit(
                     eligible_train,
                     FEATURE_COLUMNS,
@@ -1357,6 +1432,15 @@ def _evaluate_long_factor_ablation(
                         "augmented_execution": augmented_metrics,
                         "augmented_prediction_gate": augmented_gate_diagnostics,
                     }
+                )
+                _emit_ablation_progress(
+                    progress_callback,
+                    factor_group=group,
+                    horizon_sec=horizon,
+                    fold_id=fold.fold_id,
+                    status="COMPLETED",
+                    train_rows=len(eligible_train),
+                    test_rows=len(eligible_test),
                 )
         if len(baseline_folds) < 2:
             results[group] = {
@@ -1448,6 +1532,7 @@ def _evaluate_bybit_pit_ablation(
     *,
     factor_groups: Mapping[str, tuple[str, ...]] = SHORT_FACTOR_GROUPS,
     minimum_history_days: float = MINIMUM_SHORT_FACTOR_HISTORY_DAYS,
+    progress_callback: AblationProgressCallback | None = None,
 ) -> dict[str, dict[str, object]]:
     """Ablate real short-horizon features only after sufficient PIT history exists."""
 
@@ -1506,6 +1591,15 @@ def _evaluate_bybit_pit_ablation(
                 eligible_train = train.loc[train_mask].reset_index(drop=True)
                 eligible_test = test.loc[test_mask].reset_index(drop=True)
                 if len(eligible_train) < 1_000 or len(eligible_test) < 200:
+                    _emit_ablation_progress(
+                        progress_callback,
+                        factor_group=group,
+                        horizon_sec=horizon,
+                        fold_id=fold.fold_id,
+                        status="SKIPPED_INSUFFICIENT_PIT_ROWS",
+                        train_rows=len(eligible_train),
+                        test_rows=len(eligible_test),
+                    )
                     fold_evidence.append(
                         {
                             "horizon_sec": horizon,
@@ -1516,6 +1610,15 @@ def _evaluate_bybit_pit_ablation(
                         }
                     )
                     continue
+                _emit_ablation_progress(
+                    progress_callback,
+                    factor_group=group,
+                    horizon_sec=horizon,
+                    fold_id=fold.fold_id,
+                    status="STARTED",
+                    train_rows=len(eligible_train),
+                    test_rows=len(eligible_test),
+                )
                 baseline_selection = selector.select_and_fit(
                     eligible_train,
                     FEATURE_COLUMNS,
@@ -1586,6 +1689,15 @@ def _evaluate_bybit_pit_ablation(
                             meta_threshold=augmented_selection.selected_config.meta_trade_probability,
                         ),
                     }
+                )
+                _emit_ablation_progress(
+                    progress_callback,
+                    factor_group=group,
+                    horizon_sec=horizon,
+                    fold_id=fold.fold_id,
+                    status="COMPLETED",
+                    train_rows=len(eligible_train),
+                    test_rows=len(eligible_test),
                 )
         if len(baseline_folds) < 2:
             results[group] = {
@@ -2033,6 +2145,17 @@ class ProfitabilityRebuild:
             BacktestConfig(require_positive_lower_bound_edge=False)
         )
         evaluated_factor_groups: dict[str, dict[str, object]] = {}
+
+        def record_ablation_progress(payload: Mapping[str, object]) -> None:
+            self.ledger.append_event(
+                self.trial_id,
+                "running",
+                {
+                    "phase": "factor_ablation_fold_progress",
+                    **dict(payload),
+                },
+            )
+
         self.ledger.append_event(
             self.trial_id,
             "running",
@@ -2042,7 +2165,11 @@ class ProfitabilityRebuild:
             },
         )
         legacy_result = _evaluate_legacy_technical_ablation(
-            release_datasets, market, selector, ablation_backtest
+            release_datasets,
+            market,
+            selector,
+            ablation_backtest,
+            progress_callback=record_ablation_progress,
         )
         evaluated_factor_groups.update(legacy_result)
         self.ledger.append_event(
@@ -2076,6 +2203,7 @@ class ProfitabilityRebuild:
                     selector,
                     ablation_backtest,
                     factor_groups={group: columns},
+                    progress_callback=record_ablation_progress,
                 )
                 evaluated_factor_groups.update(result)
                 self.ledger.append_event(
@@ -2104,6 +2232,7 @@ class ProfitabilityRebuild:
                     ablation_backtest,
                     bybit_pit_evidence,
                     factor_groups={group: columns},
+                    progress_callback=record_ablation_progress,
                 )
                 evaluated_factor_groups.update(result)
                 self.ledger.append_event(
