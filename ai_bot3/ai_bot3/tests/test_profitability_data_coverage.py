@@ -120,6 +120,9 @@ def test_short_horizon_coverage_cannot_silently_collapse_to_six_or_31_days(tmp_p
         code_commit="1" * 40,
     )
     assert config.max_bars_per_symbol >= 175_200
+    assert config.walk_forward_folds == 6
+    with pytest.raises(ValueError, match="between 4 and 8"):
+        replace(config, walk_forward_folds=3)
 
 
 def test_each_horizon_enforces_the_preregistered_history_floor():
@@ -283,6 +286,25 @@ def test_trial_identity_binds_feature_store_content_not_only_size_and_mtime(tmp_
         "sha256"
     ]
     assert first.trial_id != second.trial_id
+
+
+def test_trial_identity_binds_walk_forward_and_lockbox_partition_config(tmp_path):
+    feature_store = tmp_path / "features.sqlite3"
+    feature_store.touch()
+
+    def config(**changes):
+        baseline = ProfitabilityRebuildConfig(
+            feature_store_path=feature_store,
+            output_dir=tmp_path / "reports",
+            trial_ledger_path=tmp_path / "trials.sqlite3",
+            model_output_dir=tmp_path / "models",
+            code_commit="1" * 40,
+        )
+        return replace(baseline, **changes)
+
+    baseline_id = ProfitabilityRebuild(config()).trial_id
+    assert ProfitabilityRebuild(config(walk_forward_folds=5)).trial_id != baseline_id
+    assert ProfitabilityRebuild(config(lockbox_fraction=0.20)).trial_id != baseline_id
 
 
 def test_label_decisions_do_not_treat_overlapping_execution_windows_as_independent():

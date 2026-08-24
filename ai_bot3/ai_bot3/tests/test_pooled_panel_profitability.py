@@ -6,12 +6,17 @@ from pathlib import Path
 
 import pandas as pd
 import numpy as np
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from core.training.pooled_panel import PooledPanelBuilder, dataset_manifest
+from core.training.pooled_panel import (
+    PooledPanelBuilder,
+    dataset_manifest,
+    split_factor_research_and_evaluation,
+)
 
 
 def _panel(rows: int = 320) -> pd.DataFrame:
@@ -131,3 +136,41 @@ def test_regime_is_causal_and_future_rows_cannot_rewrite_past_labels():
     ].iloc[: len(prefix)].tolist()
     assert before == after
     assert before[:8] == ["insufficient_history"] * 8
+
+
+def test_factor_research_oos_is_disjoint_from_frozen_feature_evaluation_oos():
+    dataset = PooledPanelBuilder(
+        lockbox_fraction=0.15,
+        minimum_train_rows=100,
+        minimum_test_rows=20,
+        maximum_folds=6,
+    ).build_horizon(_panel(), 180)
+
+    research, evaluation, evidence = split_factor_research_and_evaluation(dataset)
+    research_rows = {
+        int(index) for fold in research.folds for index in fold.test_indices
+    }
+    evaluation_rows = {
+        int(index) for fold in evaluation.folds for index in fold.test_indices
+    }
+
+    assert len(research.folds) == 3
+    assert len(evaluation.folds) == 3
+    assert research_rows.isdisjoint(evaluation_rows)
+    assert evidence["oos_test_row_overlap_count"] == 0
+    assert evidence["evaluation_oos_used_for_factor_selection"] is False
+    assert pd.Timestamp(evidence["evaluation_oos_start"]) >= pd.Timestamp(
+        evidence["factor_research_oos_end"]
+    ) + timedelta(seconds=int(evidence["required_stage_embargo_sec"]))
+
+
+def test_factor_research_partition_fails_closed_when_too_few_folds_exist():
+    dataset = PooledPanelBuilder(
+        lockbox_fraction=0.15,
+        minimum_train_rows=100,
+        minimum_test_rows=20,
+        maximum_folds=3,
+    ).build_horizon(_panel(), 180)
+
+    with pytest.raises(ValueError, match="at least 4"):
+        split_factor_research_and_evaluation(dataset)

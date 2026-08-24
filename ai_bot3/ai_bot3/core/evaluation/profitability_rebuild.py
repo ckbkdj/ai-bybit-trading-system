@@ -66,6 +66,7 @@ from core.training.pooled_panel import (
     PooledPanelBuilder,
     causal_regime_labels,
     dataset_manifest,
+    split_factor_research_and_evaluation,
 )
 from core.training.nested_walk_forward import NestedWalkForwardSelector
 from core.training.bybit_execution_bars import (
@@ -223,15 +224,18 @@ class ProfitabilityRebuildConfig:
     flow_pit_store_path: Path | None = None
     verify_flow_raw_hashes: bool = True
     max_bars_per_symbol: int = 200_000
-    walk_forward_folds: int = 3
+    walk_forward_folds: int = 6
     lockbox_fraction: float = 0.15
     random_seed: int = 20260823
 
     def __post_init__(self) -> None:
         if self.max_bars_per_symbol < 20_000:
             raise ValueError("max_bars_per_symbol is too small for required short-horizon coverage")
-        if not 2 <= self.walk_forward_folds <= 8:
-            raise ValueError("walk_forward_folds must be between 2 and 8")
+        if not 4 <= self.walk_forward_folds <= 8:
+            raise ValueError(
+                "walk_forward_folds must be between 4 and 8 so factor research "
+                "and frozen-feature evaluation each have at least two OOS folds"
+            )
 
 
 def _atomic_json(path: Path, payload: object) -> None:
@@ -3139,6 +3143,12 @@ class ProfitabilityRebuild:
             ),
             "verify_flow_raw_hashes": config.verify_flow_raw_hashes,
             "max_bars_per_symbol": config.max_bars_per_symbol,
+            "walk_forward_folds": config.walk_forward_folds,
+            "lockbox_fraction": config.lockbox_fraction,
+            "random_seed": config.random_seed,
+            "development_stage_policy": (
+                "chronological_disjoint_factor_research_then_frozen_feature_evaluation"
+            ),
             "horizons": HORIZONS_SEC,
             "symbols": SYMBOLS,
         }
@@ -3452,6 +3462,36 @@ class ProfitabilityRebuild:
             str(horizon): evidence
             for horizon, evidence in release_dataset_evidence.items()
         }
+        factor_research_datasets: dict[int, HorizonDataset] = {}
+        evaluation_datasets: dict[int, HorizonDataset] = {}
+        factor_research_release_datasets: dict[int, HorizonDataset] = {}
+        evaluation_release_datasets: dict[int, HorizonDataset] = {}
+        development_stage_partitions: dict[str, dict[str, object]] = {}
+        for horizon, dataset in datasets.items():
+            research, evaluation, evidence = (
+                split_factor_research_and_evaluation(dataset)
+            )
+            factor_research_datasets[horizon] = research
+            evaluation_datasets[horizon] = evaluation
+            development_stage_partitions[str(horizon)] = {
+                "full_panel": evidence,
+                "direct_execution_release": None,
+            }
+        for horizon, dataset in release_datasets.items():
+            research, evaluation, evidence = (
+                split_factor_research_and_evaluation(dataset)
+            )
+            factor_research_release_datasets[horizon] = research
+            evaluation_release_datasets[horizon] = evaluation
+            development_stage_partitions[str(horizon)][
+                "direct_execution_release"
+            ] = evidence
+            release_dataset_evidence[horizon]["stage_partition"] = evidence
+        datasets = evaluation_datasets
+        release_datasets = evaluation_release_datasets
+        source_evidence["development_oos_stage_partition"] = (
+            development_stage_partitions
+        )
         panels.clear()
         del panels
         current_feature_store_stat = self.config.feature_store_path.stat()
@@ -3475,6 +3515,15 @@ class ProfitabilityRebuild:
                     str(horizon): evidence
                     for horizon, evidence in release_dataset_evidence.items()
                 },
+                "factor_research_datasets": {
+                    str(horizon): dataset_manifest(dataset)
+                    for horizon, dataset in factor_research_datasets.items()
+                },
+                "frozen_feature_evaluation_datasets": {
+                    str(horizon): dataset_manifest(dataset)
+                    for horizon, dataset in evaluation_datasets.items()
+                },
+                "development_oos_stage_partition": development_stage_partitions,
             },
         )
         walk_forward: list[dict[str, object]] = []
@@ -3548,7 +3597,7 @@ class ProfitabilityRebuild:
             },
         )
         legacy_result = _evaluate_legacy_technical_ablation(
-            release_datasets,
+            factor_research_release_datasets,
             market,
             selector,
             ablation_backtest,
@@ -3584,7 +3633,7 @@ class ProfitabilityRebuild:
                     },
                 )
                 result = _evaluate_long_factor_ablation(
-                    release_datasets,
+                    factor_research_release_datasets,
                     market,
                     selector,
                     ablation_backtest,
@@ -3615,7 +3664,7 @@ class ProfitabilityRebuild:
                     },
                 )
                 result = _evaluate_bybit_pit_ablation(
-                    release_datasets,
+                    factor_research_release_datasets,
                     market,
                     selector,
                     ablation_backtest,
@@ -3637,6 +3686,11 @@ class ProfitabilityRebuild:
                     },
                 )
         factor_report = _factor_ablation_report(evaluated_factor_groups)
+        factor_report["oos_stage_partition"] = development_stage_partitions
+        factor_report["factor_selection_scope"] = (
+            "chronologically_earlier_factor_research_oos_only"
+        )
+        factor_report["frozen_feature_evaluation_oos_used_for_selection"] = False
         self.ledger.append_event(
             self.trial_id,
             "running",
@@ -4060,8 +4114,16 @@ class ProfitabilityRebuild:
                     for horizon, evidence in release_dataset_evidence.items()
                 },
                 "candidate_horizon_selection_source": (
-                    "development_outer_oos_only_before_lockbox"
+                    "frozen_feature_development_evaluation_oos_before_lockbox"
                 ),
+                "factor_research_datasets": {
+                    str(h): dataset_manifest(ds)
+                    for h, ds in factor_research_datasets.items()
+                },
+                "frozen_feature_evaluation_datasets": {
+                    str(h): dataset_manifest(ds) for h, ds in datasets.items()
+                },
+                "development_oos_stage_partition": development_stage_partitions,
                 "positive_fold_ratio": development_gate.metrics[
                     "positive_walk_forward_fold_ratio"
                 ],
@@ -4196,7 +4258,7 @@ class ProfitabilityRebuild:
                 development_eligible_horizons
             ),
             "candidate_horizon_selection_source": (
-                "development_outer_oos_only_before_lockbox"
+                "frozen_feature_development_evaluation_oos_before_lockbox"
             ),
             "lockbox_fingerprint": None,
             "lockbox_start_by_horizon": {
@@ -4890,7 +4952,7 @@ class ProfitabilityRebuild:
                     development_eligible_horizons
                 ),
                 "candidate_horizon_selection_source": (
-                    "development_outer_oos_only_before_lockbox"
+                    "frozen_feature_development_evaluation_oos_before_lockbox"
                 ),
                 "horizon_results": {
                     str(horizon): report
@@ -5041,7 +5103,7 @@ class ProfitabilityRebuild:
                     development_eligible_horizons
                 ),
                 "candidate_horizon_selection_source": (
-                    "development_outer_oos_only_before_lockbox"
+                    "frozen_feature_development_evaluation_oos_before_lockbox"
                 ),
                 "lockbox_fingerprint": lockbox_fingerprint,
                 "lockbox_consumed": True,
@@ -5107,6 +5169,10 @@ class ProfitabilityRebuild:
                     "candidate_configs": [asdict(config) for config in candidate_configs],
                     "features_by_horizon": model_feature_columns_by_horizon,
                     "nested_walk_forward": True,
+                    "walk_forward_folds": self.config.walk_forward_folds,
+                    "development_stage_policy": (
+                        "chronological_disjoint_factor_research_then_frozen_feature_evaluation"
+                    ),
                 }
             ),
             code_commit=self.config.code_commit,

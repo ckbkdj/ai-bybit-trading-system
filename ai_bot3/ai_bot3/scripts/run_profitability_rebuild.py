@@ -92,7 +92,7 @@ def main() -> int:
         default=Path(configured_flow_pit) if configured_flow_pit else None,
     )
     parser.add_argument("--max-bars-per-symbol", type=int, default=200_000)
-    parser.add_argument("--walk-forward-folds", type=int, default=3)
+    parser.add_argument("--walk-forward-folds", type=int, default=6)
     args = parser.parse_args()
     head_commit = _local_head_commit()
     if args.code_commit and args.code_commit.lower() != head_commit:

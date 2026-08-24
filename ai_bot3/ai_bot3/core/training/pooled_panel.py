@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from array import array
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from typing import Mapping, Sequence
 
@@ -85,6 +85,75 @@ class HorizonDataset:
     lockbox_fingerprint: str | None
     lockbox_start: str
     lockbox_labels_materialized: bool = True
+
+
+def split_factor_research_and_evaluation(
+    dataset: HorizonDataset,
+    *,
+    minimum_folds_per_stage: int = 2,
+) -> tuple[HorizonDataset, HorizonDataset, dict[str, object]]:
+    """Freeze factor research before the outer evaluation OOS begins.
+
+    Factor retention is a model-selection decision.  It therefore cannot use
+    the same outer folds later reported as the development performance
+    estimate.  The chronological fold schedule is split without inspecting
+    labels or returns: the first block is available only to factor ablation and
+    the second block is available only to the frozen-feature evaluation.
+    """
+
+    if minimum_folds_per_stage < 2:
+        raise ValueError("each development stage requires at least two folds")
+    folds = tuple(dataset.folds)
+    required = minimum_folds_per_stage * 2
+    if len(folds) < required:
+        raise ValueError(
+            f"at least {required} walk-forward folds are required to isolate "
+            "factor research from outer evaluation"
+        )
+    split_position = len(folds) // 2
+    research_folds = folds[:split_position]
+    evaluation_folds = folds[split_position:]
+    if min(len(research_folds), len(evaluation_folds)) < minimum_folds_per_stage:
+        raise ValueError("factor research/evaluation fold partition is too small")
+
+    research_end = pd.to_datetime(
+        research_folds[-1].test_end, utc=True, errors="raise"
+    )
+    evaluation_start = pd.to_datetime(
+        evaluation_folds[0].test_start, utc=True, errors="raise"
+    )
+    required_embargo_sec = max(
+        int(research_folds[-1].embargo_sec),
+        int(evaluation_folds[0].embargo_sec),
+    )
+    if evaluation_start < research_end + timedelta(seconds=required_embargo_sec):
+        raise ValueError("factor research and evaluation folds violate embargo")
+
+    research_test_indices = {
+        int(index) for fold in research_folds for index in fold.test_indices
+    }
+    evaluation_test_indices = {
+        int(index) for fold in evaluation_folds for index in fold.test_indices
+    }
+    if research_test_indices.intersection(evaluation_test_indices):
+        raise ValueError("factor research and evaluation OOS rows overlap")
+
+    research = replace(dataset, folds=research_folds)
+    evaluation = replace(dataset, folds=evaluation_folds)
+    evidence = {
+        "policy": "chronological_disjoint_oos_factor_research_then_frozen_feature_evaluation",
+        "partition_uses_labels_or_returns": False,
+        "factor_research_fold_ids": [fold.fold_id for fold in research_folds],
+        "evaluation_fold_ids": [fold.fold_id for fold in evaluation_folds],
+        "factor_research_fold_count": len(research_folds),
+        "evaluation_fold_count": len(evaluation_folds),
+        "factor_research_oos_end": research_end.isoformat().replace("+00:00", "Z"),
+        "evaluation_oos_start": evaluation_start.isoformat().replace("+00:00", "Z"),
+        "required_stage_embargo_sec": required_embargo_sec,
+        "oos_test_row_overlap_count": 0,
+        "evaluation_oos_used_for_factor_selection": False,
+    }
+    return research, evaluation, evidence
 
 
 def _as_utc(series: pd.Series, name: str) -> pd.Series:
@@ -384,4 +453,5 @@ __all__: Sequence[str] = (
     "WalkForwardFold",
     "causal_regime_labels",
     "dataset_manifest",
+    "split_factor_research_and_evaluation",
 )

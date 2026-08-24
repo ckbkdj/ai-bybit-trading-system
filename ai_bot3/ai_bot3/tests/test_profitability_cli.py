@@ -36,4 +36,5 @@ def test_cli_passes_separate_lockbox_store_without_opening_it(tmp_path, monkeypa
 
     assert run_profitability_rebuild.main() == 2
     assert captured["config"].lockbox_bybit_pit_store_path == sealed_store
+    assert captured["config"].walk_forward_folds == 6
     assert not sealed_store.exists()
