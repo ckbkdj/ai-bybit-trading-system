@@ -141,31 +141,61 @@ class _Encoder:
             for column in self.categorical
         }
         raw = self._raw(frame)
-        self.mean = np.nanmean(raw, axis=0)
-        self.scale = np.nanstd(raw, axis=0)
-        self.mean = np.where(np.isfinite(self.mean), self.mean, 0.0)
-        self.scale = np.where(np.isfinite(self.scale) & (self.scale > 1e-12), self.scale, 1.0)
-        return self.transform(frame)
+        self.mean = np.empty(raw.shape[1], dtype=float)
+        self.scale = np.empty(raw.shape[1], dtype=float)
+        for index in range(raw.shape[1]):
+            column = raw[:, index]
+            finite = np.isfinite(column)
+            if finite.any():
+                self.mean[index] = float(column[finite].mean())
+                deviation = column[finite] - self.mean[index]
+                self.scale[index] = float(np.sqrt(np.mean(deviation * deviation)))
+            else:
+                self.mean[index] = 0.0
+                self.scale[index] = 1.0
+            if not np.isfinite(self.scale[index]) or self.scale[index] <= 1e-12:
+                self.scale[index] = 1.0
+        return self._standardize_in_place(raw)
 
     def _raw(self, frame: pd.DataFrame) -> np.ndarray:
-        blocks: list[np.ndarray] = []
-        if self.numeric:
-            numeric = frame[self.numeric].apply(pd.to_numeric, errors="coerce").to_numpy(float)
-            blocks.append(numeric)
+        width = len(self.numeric) + sum(
+            len(self.categories[column]) for column in self.categorical
+        )
+        if width == 0:
+            raise ValueError("at least one model feature is required")
+        raw = np.empty((len(frame), width), dtype=float)
+        offset = 0
+        for column in self.numeric:
+            raw[:, offset] = pd.to_numeric(
+                frame[column], errors="coerce"
+            ).to_numpy(dtype=float, copy=False)
+            offset += 1
         for column in self.categorical:
             values = frame[column].astype(str).fillna("<missing>")
-            categories = self.categories[column]
-            blocks.append(np.column_stack([(values == category).to_numpy(float) for category in categories]))
-        if not blocks:
-            raise ValueError("at least one model feature is required")
-        return np.column_stack(blocks)
+            for category in self.categories[column]:
+                raw[:, offset] = (values == category).to_numpy(
+                    dtype=float, copy=False
+                )
+                offset += 1
+        return raw
+
+    def _standardize_in_place(self, raw: np.ndarray) -> np.ndarray:
+        if self.mean is None or self.scale is None:
+            raise RuntimeError("encoder is not fitted")
+        for index in range(raw.shape[1]):
+            column = raw[:, index]
+            invalid = ~np.isfinite(column)
+            if invalid.any():
+                column[invalid] = self.mean[index]
+            column -= self.mean[index]
+            column /= self.scale[index]
+        return raw
 
     def transform(self, frame: pd.DataFrame) -> np.ndarray:
         if self.mean is None or self.scale is None:
             raise RuntimeError("encoder is not fitted")
         raw = self._raw(frame)
-        raw = np.where(np.isfinite(raw), raw, self.mean)
-        return (raw - self.mean) / self.scale
+        return self._standardize_in_place(raw)
 
     def state(self) -> dict[str, object]:
         return {
@@ -201,14 +231,29 @@ def _sigmoid(values: np.ndarray) -> np.ndarray:
 
 
 def _fit_ridge(x: np.ndarray, y: np.ndarray, penalty: float) -> np.ndarray:
-    design = np.column_stack([np.ones(len(x)), x])
-    regularizer = np.eye(design.shape[1]) * penalty
+    width = x.shape[1] + 1
+    gram = np.empty((width, width), dtype=float)
+    column_sums = x.sum(axis=0)
+    gram[0, 0] = len(x)
+    gram[0, 1:] = column_sums
+    gram[1:, 0] = column_sums
+    gram[1:, 1:] = x.T @ x
+    right_hand_side = np.empty(width, dtype=float)
+    right_hand_side[0] = y.sum()
+    right_hand_side[1:] = x.T @ y
+    regularizer = np.eye(width) * penalty
     regularizer[0, 0] = 0.0
-    return np.linalg.solve(design.T @ design + regularizer, design.T @ y)
+    return np.linalg.solve(gram + regularizer, right_hand_side)
 
 
 def _ridge_predict(x: np.ndarray, weights: np.ndarray) -> np.ndarray:
-    return np.column_stack([np.ones(len(x)), x]) @ weights
+    return weights[0] + x @ weights[1:]
+
+
+def _linear_predict(x: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    """Apply scalar or multi-output weights without allocating an intercept column."""
+
+    return weights[0] + x @ weights[1:]
 
 
 class TwoStageAlphaModel:
@@ -283,21 +328,21 @@ class TwoStageAlphaModel:
     ) -> dict[str, np.ndarray]:
         if symbols is None or self.direction_weights is None:
             return {}
-        design = np.column_stack([np.ones(len(direction_x)), direction_x])
-        global_logits = design @ self.direction_weights
-        one_hot = np.eye(3)[targets]
+        global_logits = _linear_predict(direction_x, self.direction_weights)
         heads: dict[str, np.ndarray] = {}
         for symbol in sorted(set(symbols.tolist())):
             positions = np.flatnonzero(symbols == symbol)
             if len(positions) < self.config.minimum_symbol_head_rows:
                 continue
-            local_design = design[positions]
+            local_x = direction_x[positions]
             local_global = global_logits[positions]
-            local_targets = one_hot[positions]
             weights = np.zeros_like(self.direction_weights)
             for _ in range(max(20, self.config.direction_iterations // 2)):
-                probabilities = _softmax(local_global + local_design @ weights)
-                gradient = local_design.T @ (probabilities - local_targets) / len(positions)
+                errors = _softmax(local_global + _linear_predict(local_x, weights))
+                errors[np.arange(len(positions)), targets[positions]] -= 1.0
+                gradient = np.empty_like(weights)
+                gradient[0] = errors.mean(axis=0)
+                gradient[1:] = local_x.T @ errors / len(positions)
                 gradient[1:] += self.config.symbol_head_l2 * weights[1:]
                 weights -= self.config.learning_rate * gradient
             heads[str(symbol)] = weights
@@ -332,7 +377,7 @@ class TwoStageAlphaModel:
             return frame
         if "side" not in frame:
             raise ValueError("side is required by the action interaction contract")
-        output = frame.copy()
+        output = frame.loc[:, self.feature_columns].copy()
         side = frame["side"].astype(str).str.upper()
         if not side.isin({"BUY", "SELL"}).all():
             raise ValueError("side must be BUY or SELL")
@@ -397,11 +442,12 @@ class TwoStageAlphaModel:
             direction_frame, self.direction_feature_columns
         )
         self.direction_weights = np.zeros((direction_x.shape[1] + 1, 3), dtype=float)
-        design = np.column_stack([np.ones(len(direction_x)), direction_x])
-        targets = np.eye(3)[direction]
         for _ in range(self.config.direction_iterations):
-            probabilities = _softmax(design @ self.direction_weights)
-            gradient = design.T @ (probabilities - targets) / len(direction_x)
+            errors = _softmax(_linear_predict(direction_x, self.direction_weights))
+            errors[np.arange(len(direction_x)), direction] -= 1.0
+            gradient = np.empty_like(self.direction_weights)
+            gradient[0] = errors.mean(axis=0)
+            gradient[1:] = direction_x.T @ errors / len(direction_x)
             gradient[1:] += self.config.l2 * self.direction_weights[1:]
             self.direction_weights -= self.config.learning_rate * gradient
         self.symbol_direction_weights = self._fit_symbol_direction_heads(
@@ -577,7 +623,7 @@ class TwoStageAlphaModel:
     def fit(self, frame: pd.DataFrame, feature_columns: Sequence[str]) -> "TwoStageAlphaModel":
         if len(frame) < 50:
             raise ValueError("at least 50 pooled observations are required")
-        data = frame.copy().reset_index(drop=True)
+        data = frame
         self.action_interaction_columns = (
             [
                 column
@@ -602,14 +648,16 @@ class TwoStageAlphaModel:
             oof_mae[oof_valid],
             oof_mfe[oof_valid],
         )
-        meta_design = np.column_stack([np.ones(len(meta_x)), meta_x])
         utility = net[oof_valid] - self.config.tail_penalty * mae[oof_valid]
         trade_target = (utility > 0).astype(float)
-        self.meta_weights = np.zeros(meta_design.shape[1], dtype=float)
+        self.meta_weights = np.zeros(meta_x.shape[1] + 1, dtype=float)
         sample_weight = 1.0 + np.minimum(10.0, np.abs(utility) / max(float(np.median(np.abs(utility))) if len(utility) else 1.0, 1e-12))
         for _ in range(self.config.meta_iterations):
-            probability = _sigmoid(meta_design @ self.meta_weights)
-            gradient = meta_design.T @ ((probability - trade_target) * sample_weight) / len(meta_x)
+            probability = _sigmoid(_linear_predict(meta_x, self.meta_weights))
+            errors = (probability - trade_target) * sample_weight
+            gradient = np.empty_like(self.meta_weights)
+            gradient[0] = errors.mean()
+            gradient[1:] = meta_x.T @ errors / len(meta_x)
             gradient[1:] += self.config.l2 * self.meta_weights[1:]
             self.meta_weights -= self.config.learning_rate * gradient
         residuals = net[oof_valid] - oof_net[oof_valid]
@@ -666,13 +714,14 @@ class TwoStageAlphaModel:
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         if any(value is None for value in (self.direction_weights, self.net_weights, self.mae_weights, self.mfe_weights)):
             raise RuntimeError("model is not fitted")
-        design = np.column_stack([np.ones(len(direction_x)), direction_x])
-        direction_logits = design @ self.direction_weights
+        direction_logits = _linear_predict(direction_x, self.direction_weights)
         if symbols is not None:
             for symbol, weights in self.symbol_direction_weights.items():
                 positions = np.flatnonzero(symbols == symbol)
                 if len(positions):
-                    direction_logits[positions] += design[positions] @ weights
+                    direction_logits[positions] += _linear_predict(
+                        direction_x[positions], weights
+                    )
         probabilities = _softmax(direction_logits)
         expected_net = _ridge_predict(x, self.net_weights)
         mae = _ridge_predict(x, self.mae_weights)
@@ -716,7 +765,7 @@ class TwoStageAlphaModel:
             x, direction_x, symbols=symbols
         )
         meta_x = self._meta_features(x, direction_x, symbols=symbols)
-        trade_probability = _sigmoid(np.column_stack([np.ones(len(meta_x)), meta_x]) @ self.meta_weights)
+        trade_probability = _sigmoid(_linear_predict(meta_x, self.meta_weights))
         entropy = meta_x[:, -1]
         p10 = expected_net + self.residual_quantiles[0]
         p50 = expected_net + self.residual_quantiles[1]

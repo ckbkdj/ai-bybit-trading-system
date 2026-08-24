@@ -143,6 +143,8 @@ python scripts/run_bybit_public_pit_collector.py `
 
 如果进程存在但 session 不更新，先看 stderr 重连日志。不要把“PID 活着”当作采集成功。
 
+采集器使用数据库 lease 防止同一 PIT 仓双开：新进程启动时会在立即写事务内检查 `running` session 的启动时间和最近 raw event。120 秒内仍活跃的 session 必须拒绝竞争进程，不能把它改成 `disconnected`；只有超过 stale threshold 的无活动 session 才可按非正常退出接管。健康检查要同时核对最新 raw event 的 `session_id` 与 session 状态为 `running`。
+
 ## 5. Bybit 官方历史 archive 回填
 
 archive replay 与实时采集共用数据库时只能单进程运行。更推荐先停 public collector，完成一批 archive、checkpoint 后再恢复 collector。
@@ -233,6 +235,8 @@ python scripts/run_profitability_rebuild.py `
 | 2 | pipeline 完成但盈利/证据门禁失败，正确状态是 rejected |
 
 每个 trial 必须在 `data/research_trials.sqlite3` 中保留 running、阶段事件和最终 rejected/candidate 记录。不要删除失败 trial。
+
+大样本训练失败时先读取 ledger 的 `pipeline_error`。编码器应只构造一次特征矩阵并逐列原地标准化；ridge、direction 和 meta 优化不得为截距额外复制整块矩阵。已用失败现场同形状的 85,128×40 float64 矩阵做回归验证。该验证只证明内存路径可执行，不是盈利证据。
 
 ## 9. 报告阅读顺序
 

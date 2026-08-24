@@ -18,6 +18,7 @@ from core.providers.bybit_public_pit import (
     BybitPublicPITCollector,
     BybitPublicPITIngestor,
     BybitPublicPITStore,
+    CaptureConflict,
     StalePublicEvent,
 )
 from core.training.bybit_pit_panel import BybitPITFeatureSource
@@ -58,6 +59,29 @@ def test_new_capture_session_reconciles_unclean_previous_process(tmp_path):
         "collector_restarted_after_unclean_shutdown",
     )
     assert replacement == ("running",)
+
+
+def test_new_capture_session_cannot_disconnect_a_live_collector(tmp_path):
+    path = tmp_path / "bybit.sqlite3"
+    store = BybitPublicPITStore(path)
+    first = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    store.start_session(
+        "live-session", endpoint="wss://public", symbols=["BTCUSDT"], started_at=first
+    )
+
+    with pytest.raises(CaptureConflict, match="active database lease"):
+        store.start_session(
+            "competing-session",
+            endpoint="wss://public",
+            symbols=["BTCUSDT"],
+            started_at=first + timedelta(seconds=60),
+        )
+
+    with sqlite3.connect(path) as connection:
+        sessions = connection.execute(
+            "SELECT session_id,status FROM bybit_capture_sessions ORDER BY session_id"
+        ).fetchall()
+    assert sessions == [("live-session", "running")]
 
 
 def test_liquidation_v1_invalidation_migration_has_durable_marker(tmp_path):

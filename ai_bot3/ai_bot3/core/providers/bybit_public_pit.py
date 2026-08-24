@@ -107,6 +107,8 @@ class BybitPublicPITStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_bybit_raw_pit
                     ON bybit_raw_public_events(symbol, topic, received_at, sequence);
+                CREATE INDEX IF NOT EXISTS idx_bybit_raw_session_received
+                    ON bybit_raw_public_events(session_id, received_at);
                 CREATE TABLE IF NOT EXISTS bybit_feature_observations(
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                     observation_id TEXT NOT NULL UNIQUE,
@@ -321,20 +323,53 @@ class BybitPublicPITStore:
         endpoint: str,
         symbols: Sequence[str],
         started_at: datetime,
+        active_session_stale_after_sec: float = 120.0,
     ) -> None:
+        if active_session_stale_after_sec <= 0:
+            raise ValueError("active session stale threshold must be positive")
         self.flush()
         with self.connect() as connection:
-            # A prior process can disappear without executing its cancellation
-            # handler (host reboot, forced kill, interpreter crash). Reconcile
-            # those stale rows before declaring the new capture session live,
-            # otherwise operational evidence can falsely show two collectors.
-            connection.execute(
-                """UPDATE bybit_capture_sessions
-                      SET ended_at=?,status='disconnected',
-                          error=COALESCE(error, 'collector_restarted_after_unclean_shutdown')
-                    WHERE status='running'""",
-                (_iso(started_at),),
+            # Serialize the lease check and insert. Without an immediate write
+            # lock, two collectors can both observe no running row and connect.
+            connection.execute("BEGIN IMMEDIATE")
+            running = connection.execute(
+                """SELECT sessions.session_id,sessions.started_at,
+                          MAX(events.received_at) AS latest_received_at
+                     FROM bybit_capture_sessions AS sessions
+                     LEFT JOIN bybit_raw_public_events AS events
+                       ON events.session_id=sessions.session_id
+                    WHERE sessions.status='running'
+                    GROUP BY sessions.session_id,sessions.started_at"""
+            ).fetchall()
+            stale_cutoff = _iso(
+                started_at - timedelta(seconds=active_session_stale_after_sec)
             )
+            active = []
+            stale = []
+            for row in running:
+                activity = max(
+                    str(row["started_at"]),
+                    str(row["latest_received_at"] or ""),
+                )
+                if activity >= stale_cutoff:
+                    active.append(str(row["session_id"]))
+                else:
+                    stale.append(str(row["session_id"]))
+            if active:
+                raise CaptureConflict(
+                    "another Bybit public collector has an active database lease"
+                )
+            for stale_session_id in stale:
+                connection.execute(
+                    """UPDATE bybit_capture_sessions
+                          SET ended_at=?,status='disconnected',
+                              error=COALESCE(
+                                  error,
+                                  'collector_restarted_after_unclean_shutdown'
+                              )
+                        WHERE session_id=? AND status='running'""",
+                    (_iso(started_at), stale_session_id),
+                )
             connection.execute(
                 """INSERT INTO bybit_capture_sessions(
                        session_id,endpoint,symbols_json,started_at,status

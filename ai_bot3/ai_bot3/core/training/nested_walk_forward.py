@@ -116,7 +116,9 @@ class NestedWalkForwardSelector:
         outer_train: pd.DataFrame,
         feature_columns: Sequence[str],
     ) -> NestedModelSelection:
-        data = outer_train.copy().reset_index(drop=True)
+        # The selector never mutates the caller's frame. Keeping the original
+        # indexed view avoids duplicating a full multi-horizon training fold.
+        data = outer_train
         folds = self._folds(data)
         candidate_results: list[dict[str, object]] = []
         for config in self.candidate_configs:

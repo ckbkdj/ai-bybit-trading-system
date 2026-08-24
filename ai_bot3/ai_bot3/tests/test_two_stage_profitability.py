@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from core.models.two_stage import TwoStageAlphaModel, TwoStageConfig
+from core.models import two_stage
 
 
 def _training_frame(rows: int = 160) -> pd.DataFrame:
@@ -176,3 +177,47 @@ def test_pooled_model_learns_regularized_symbol_specific_signal_response(tmp_pat
         [item.expected_net_return for item in predictions],
         [item.expected_net_return for item in replay],
     )
+
+
+def test_encoder_fits_from_one_matrix_and_standardizes_in_place():
+    frame = pd.DataFrame(
+        {
+            "numeric": [1.0, float("nan"), 3.0, 5.0],
+            "symbol": ["BTC", "ETH", "BTC", "SOL"],
+        }
+    )
+    encoder = two_stage._Encoder()
+    original_raw = encoder._raw
+    calls = 0
+
+    def counted_raw(value: pd.DataFrame) -> np.ndarray:
+        nonlocal calls
+        calls += 1
+        return original_raw(value)
+
+    encoder._raw = counted_raw  # type: ignore[method-assign]
+    encoded = encoder.fit(frame, ["numeric", "symbol"])
+
+    assert calls == 1
+    assert encoded.shape == (4, 4)
+    assert np.isfinite(encoded).all()
+    assert np.allclose(encoded.mean(axis=0), 0.0, atol=1e-12)
+
+
+def test_memory_efficient_ridge_matches_explicit_intercept_solution():
+    rng = np.random.default_rng(20260824)
+    x = rng.normal(size=(400, 12))
+    y = rng.normal(size=400)
+    penalty = 0.75
+    design = np.column_stack([np.ones(len(x)), x])
+    regularizer = np.eye(design.shape[1]) * penalty
+    regularizer[0, 0] = 0.0
+    expected = np.linalg.solve(
+        design.T @ design + regularizer,
+        design.T @ y,
+    )
+
+    actual = two_stage._fit_ridge(x, y, penalty)
+
+    assert np.allclose(actual, expected, atol=1e-12, rtol=1e-12)
+    assert np.allclose(two_stage._ridge_predict(x, actual), design @ expected)
