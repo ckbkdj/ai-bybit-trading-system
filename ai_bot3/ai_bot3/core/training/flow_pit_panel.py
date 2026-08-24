@@ -57,8 +57,11 @@ class FlowPITFeatureSource:
         connection.row_factory = sqlite3.Row
         return connection
 
-    def maximum_sequence(self) -> int:
+    def snapshot_watermarks(self) -> tuple[int, int]:
+        """Freeze observation and invalidation journals in one SQLite snapshot."""
+
         with closing(self._connect()) as connection:
+            connection.execute("BEGIN")
             table = connection.execute(
                 """SELECT 1 FROM sqlite_master
                      WHERE type='table' AND name='flow_pit_observations'"""
@@ -68,10 +71,34 @@ class FlowPITFeatureSource:
             row = connection.execute(
                 "SELECT COALESCE(MAX(sequence),0) FROM flow_pit_observations"
             ).fetchone()
-        return int(row[0])
+            invalidation_table = connection.execute(
+                """SELECT 1 FROM sqlite_master
+                     WHERE type='table'
+                       AND name='flow_pit_observation_invalidations'"""
+            ).fetchone()
+            invalidation_row = (
+                connection.execute(
+                    """SELECT COALESCE(MAX(rowid),0)
+                         FROM flow_pit_observation_invalidations"""
+                ).fetchone()
+                if invalidation_table
+                else (0,)
+            )
+        return int(row[0]), int(invalidation_row[0])
+
+    def maximum_sequence(self) -> int:
+        return self.snapshot_watermarks()[0]
+
+    def maximum_invalidation_rowid(self) -> int:
+        return self.snapshot_watermarks()[1]
 
     @staticmethod
-    def _snapshot_digest(frame: pd.DataFrame) -> str:
+    def _snapshot_digest(
+        frame: pd.DataFrame,
+        *,
+        maximum_sequence: int,
+        maximum_invalidation_rowid: int,
+    ) -> str:
         columns = [
             "sequence",
             "observation_id",
@@ -91,6 +118,16 @@ class FlowPITFeatureSource:
             payload[column] = pd.to_datetime(payload[column], utc=True).astype(str)
         digest = hashlib.sha256()
         digest.update(json.dumps(columns, separators=(",", ":")).encode())
+        digest.update(
+            json.dumps(
+                {
+                    "maximum_invalidation_rowid": maximum_invalidation_rowid,
+                    "maximum_sequence": maximum_sequence,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        )
         digest.update(
             pd.util.hash_pandas_object(payload, index=False, categorize=True)
             .to_numpy(dtype="uint64")
@@ -160,6 +197,7 @@ class FlowPITFeatureSource:
         names: Sequence[str],
         *,
         maximum_sequence: int | None = None,
+        maximum_invalidation_rowid: int | None = None,
     ) -> tuple[pd.DataFrame, dict[str, object]]:
         requested = tuple(dict.fromkeys(str(name) for name in names))
         if not requested:
@@ -167,13 +205,23 @@ class FlowPITFeatureSource:
         unknown = sorted(set(requested).difference(FLOW_FEATURE_CONTRACTS))
         if unknown:
             raise ValueError(f"flow PIT features have no source contract: {unknown}")
+        if (maximum_sequence is None) != (maximum_invalidation_rowid is None):
+            raise ValueError(
+                "flow PIT observation and invalidation watermarks must be frozen together"
+            )
+        current_sequence, current_invalidation_rowid = self.snapshot_watermarks()
         frozen_sequence = (
-            self.maximum_sequence()
-            if maximum_sequence is None
-            else int(maximum_sequence)
+            current_sequence if maximum_sequence is None else int(maximum_sequence)
+        )
+        frozen_invalidation_rowid = (
+            current_invalidation_rowid
+            if maximum_invalidation_rowid is None
+            else int(maximum_invalidation_rowid)
         )
         if frozen_sequence < 0:
             raise ValueError("flow PIT maximum_sequence cannot be negative")
+        if frozen_invalidation_rowid < 0:
+            raise ValueError("flow PIT maximum_invalidation_rowid cannot be negative")
         placeholders = ",".join("?" for _ in requested)
         with closing(self._connect()) as connection:
             rows = connection.execute(
@@ -182,11 +230,11 @@ class FlowPITFeatureSource:
                             o.series_id,o.observation_date,o.response_id
                        FROM flow_pit_observations o
                        LEFT JOIN flow_pit_observation_invalidations i
-                         ON i.observation_id=o.observation_id
-                      WHERE o.name IN ({placeholders}) AND o.sequence<=?
-                        AND i.observation_id IS NULL
-                      ORDER BY name,available_at,sequence""",
-                requested + (frozen_sequence,),
+                         ON i.observation_id=o.observation_id AND i.rowid<=?
+                       WHERE o.name IN ({placeholders}) AND o.sequence<=?
+                         AND i.observation_id IS NULL
+                       ORDER BY name,available_at,sequence""",
+                (frozen_invalidation_rowid,) + requested + (frozen_sequence,),
             ).fetchall()
         frame = pd.DataFrame([dict(row) for row in rows])
         if frame.empty:
@@ -199,7 +247,27 @@ class FlowPITFeatureSource:
                 "equivalent_duplicate_count": 0,
                 "feature_coverage": {},
                 "snapshot_maximum_sequence": frozen_sequence,
-                "snapshot_sha256": hashlib.sha256(b"").hexdigest(),
+                "snapshot_maximum_invalidation_rowid": frozen_invalidation_rowid,
+                "snapshot_sha256": self._snapshot_digest(
+                    pd.DataFrame(
+                        columns=[
+                            "sequence",
+                            "observation_id",
+                            "name",
+                            "value",
+                            "unit",
+                            "event_time",
+                            "available_at",
+                            "ingested_at",
+                            "source",
+                            "series_id",
+                            "observation_date",
+                            "response_id",
+                        ]
+                    ),
+                    maximum_sequence=frozen_sequence,
+                    maximum_invalidation_rowid=frozen_invalidation_rowid,
+                ),
                 "response_count": 0,
                 "raw_response_hashes_verified": self.verify_raw_hashes,
             }
@@ -295,7 +363,12 @@ class FlowPITFeatureSource:
             "equivalent_duplicate_count": active_observation_count - len(frame),
             "feature_coverage": coverage,
             "snapshot_maximum_sequence": frozen_sequence,
-            "snapshot_sha256": self._snapshot_digest(frame),
+            "snapshot_maximum_invalidation_rowid": frozen_invalidation_rowid,
+            "snapshot_sha256": self._snapshot_digest(
+                frame,
+                maximum_sequence=frozen_sequence,
+                maximum_invalidation_rowid=frozen_invalidation_rowid,
+            ),
             "response_count": len(responses),
             "response_content_sha256": sorted(
                 str(item["content_sha256"]) for item in responses

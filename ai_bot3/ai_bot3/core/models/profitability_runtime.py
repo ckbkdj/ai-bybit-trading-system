@@ -140,6 +140,7 @@ def _verified_pit_history(
     store_path: str,
     names: tuple[str, ...],
     maximum_sequence: int,
+    maximum_invalidation_rowid: int,
 ) -> tuple[pd.DataFrame, dict[str, object]]:
     """Verify immutable raw evidence once for each append-only store snapshot."""
 
@@ -150,6 +151,12 @@ def _verified_pit_history(
         source = FlowPITFeatureSource(path)
     else:  # pragma: no cover - internal programming error
         raise ValueError(f"unsupported PIT source kind: {source_kind}")
+    if source_kind == "flow":
+        return source.load(
+            names,
+            maximum_sequence=maximum_sequence,
+            maximum_invalidation_rowid=maximum_invalidation_rowid,
+        )
     return source.load(names, maximum_sequence=maximum_sequence)
 
 
@@ -170,12 +177,17 @@ def _latest_global_pit_values(
     else:  # pragma: no cover - internal programming error
         raise ValueError(f"unsupported PIT source kind: {source_kind}")
     requested = tuple(dict.fromkeys(names))
-    maximum_sequence = source.maximum_sequence()
+    if source_kind == "flow":
+        maximum_sequence, maximum_invalidation_rowid = source.snapshot_watermarks()
+    else:
+        maximum_sequence = source.maximum_sequence()
+        maximum_invalidation_rowid = 0
     history, snapshot = _verified_pit_history(
         source_kind,
         str(path),
         requested,
         maximum_sequence,
+        maximum_invalidation_rowid,
     )
     joined = source.join(
         pd.DataFrame({"decision_at": [pd.Timestamp(decision_at)]}),
@@ -206,6 +218,9 @@ def _latest_global_pit_values(
         "requested_features": list(requested),
         "available_at": availability,
         "snapshot_maximum_sequence": maximum_sequence,
+        "snapshot_maximum_invalidation_rowid": snapshot.get(
+            "snapshot_maximum_invalidation_rowid"
+        ),
         "snapshot_sha256": snapshot.get("snapshot_sha256"),
         "response_count": snapshot.get("response_count"),
         "raw_response_hashes_verified": snapshot.get(

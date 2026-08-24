@@ -115,8 +115,11 @@ def test_coinshares_backfill_uses_published_date_raw_hashes_and_signed_weekly_fl
         ]
 
     source = FlowPITFeatureSource(database)
+    maximum_sequence, maximum_invalidation_rowid = source.snapshot_watermarks()
     history, evidence = source.load(
-        [FEATURE_NAME], maximum_sequence=source.maximum_sequence()
+        [FEATURE_NAME],
+        maximum_sequence=maximum_sequence,
+        maximum_invalidation_rowid=maximum_invalidation_rowid,
     )
     assert evidence["response_count"] == 60
     decisions = pd.DataFrame(
@@ -200,6 +203,7 @@ def test_flow_source_rejects_conflicting_active_parser_outputs(tmp_path: Path):
     source = FlowPITFeatureSource(database)
     with pytest.raises(RuntimeError, match="ambiguous active releases"):
         source.load([FEATURE_NAME])
+    frozen_sequence, frozen_invalidation_rowid = source.snapshot_watermarks()
 
     with store.connect() as connection:
         connection.execute(
@@ -214,9 +218,16 @@ def test_flow_source_rejects_conflicting_active_parser_outputs(tmp_path: Path):
             ),
         )
         connection.commit()
+    with pytest.raises(RuntimeError, match="ambiguous active releases"):
+        source.load(
+            [FEATURE_NAME],
+            maximum_sequence=frozen_sequence,
+            maximum_invalidation_rowid=frozen_invalidation_rowid,
+        )
     history, evidence = source.load([FEATURE_NAME])
     assert len(history) == 60
     assert evidence["equivalent_duplicate_count"] == 0
+    assert evidence["snapshot_maximum_invalidation_rowid"] > frozen_invalidation_rowid
 
 
 def test_coinshares_parser_separates_headline_cumulative_and_nearest_direction():

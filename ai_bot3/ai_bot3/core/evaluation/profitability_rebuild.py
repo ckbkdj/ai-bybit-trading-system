@@ -1424,11 +1424,16 @@ class ProfitabilityRebuild:
                 verify_raw_hashes=config.verify_macro_raw_hashes,
             ).maximum_sequence()
         self.flow_pit_snapshot_maximum_sequence = None
+        self.flow_pit_snapshot_maximum_invalidation_rowid = None
         if config.flow_pit_store_path is not None:
-            self.flow_pit_snapshot_maximum_sequence = FlowPITFeatureSource(
+            flow_source = FlowPITFeatureSource(
                 config.flow_pit_store_path,
                 verify_raw_hashes=config.verify_flow_raw_hashes,
-            ).maximum_sequence()
+            )
+            (
+                self.flow_pit_snapshot_maximum_sequence,
+                self.flow_pit_snapshot_maximum_invalidation_rowid,
+            ) = flow_source.snapshot_watermarks()
         feature_store_stat = config.feature_store_path.stat()
         self.feature_store_snapshot = (
             feature_store_stat.st_size,
@@ -1462,6 +1467,9 @@ class ProfitabilityRebuild:
                 else None
             ),
             "flow_pit_snapshot_maximum_sequence": self.flow_pit_snapshot_maximum_sequence,
+            "flow_pit_snapshot_maximum_invalidation_rowid": (
+                self.flow_pit_snapshot_maximum_invalidation_rowid
+            ),
             "verify_flow_raw_hashes": config.verify_flow_raw_hashes,
             "max_bars_per_symbol": config.max_bars_per_symbol,
             "horizons": HORIZONS_SEC,
@@ -1672,6 +1680,9 @@ class ProfitabilityRebuild:
             flow_history, flow_pit_evidence = flow_source.load(
                 flow_names,
                 maximum_sequence=self.flow_pit_snapshot_maximum_sequence,
+                maximum_invalidation_rowid=(
+                    self.flow_pit_snapshot_maximum_invalidation_rowid
+                ),
             )
             for horizon in HORIZONS_SEC:
                 panels[horizon] = flow_source.join(
@@ -2120,6 +2131,9 @@ class ProfitabilityRebuild:
             ),
             "flow_pit_snapshot_maximum_sequence": (
                 self.flow_pit_snapshot_maximum_sequence
+            ),
+            "flow_pit_snapshot_maximum_invalidation_rowid": (
+                self.flow_pit_snapshot_maximum_invalidation_rowid
             ),
             "lockbox_start_by_horizon": {
                 str(horizon): value.isoformat().replace("+00:00", "Z")

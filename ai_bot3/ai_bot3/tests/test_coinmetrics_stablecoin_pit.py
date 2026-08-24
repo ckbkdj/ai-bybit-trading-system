@@ -143,8 +143,11 @@ def test_flow_snapshot_hash_raw_evidence_and_asof_join(tmp_path: Path):
         requester=_requester,
     )
     source = FlowPITFeatureSource(database)
+    maximum_sequence, maximum_invalidation_rowid = source.snapshot_watermarks()
     history, evidence = source.load(
-        FEATURE_NAMES, maximum_sequence=source.maximum_sequence()
+        FEATURE_NAMES,
+        maximum_sequence=maximum_sequence,
+        maximum_invalidation_rowid=maximum_invalidation_rowid,
     )
     assert evidence["response_count"] == 1
     assert evidence["raw_response_hashes_verified"] is True
