@@ -10,6 +10,8 @@ from typing import Mapping, Sequence
 import numpy as np
 import pandas as pd
 
+from core.model_monitoring import DistributionCheck, scaled_feature_range_guard_score
+
 
 @dataclass(frozen=True)
 class TwoStageConfig:
@@ -840,6 +842,16 @@ class TwoStageAlphaModel:
                 )
             )
         return output
+
+    def feature_range_guard(self, frame: pd.DataFrame) -> DistributionCheck:
+        """Evaluate Level-1 inputs in the fitted standardized feature spaces."""
+
+        if not self.fitted:
+            raise RuntimeError("model is not fitted")
+        action_values = self.encoder.transform(self._action_frame(frame))
+        direction_values = self.direction_encoder.transform(frame)
+        combined = np.concatenate((action_values, direction_values), axis=1)
+        return scaled_feature_range_guard_score(combined, scaler=None)
 
     def save(self, path: Path) -> None:
         if not self.fitted:

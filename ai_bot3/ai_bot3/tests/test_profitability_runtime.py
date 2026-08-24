@@ -333,6 +333,10 @@ def test_bybit_trained_bundle_rejects_cross_venue_runtime_prices(tmp_path):
     assert evidence["ohlcv_contract_valid"] is True
     assert evidence["interval_sec"] == 180
     assert evidence["observed_bar_count"] == len(market)
+    assert evidence["last_price"] == market["close"].iloc[-1]
+    assert verified["feature_evidence"]["runtime_contract_verified"] is True
+    assert 0.0 <= verified["range_guard_score"] <= 1.0
+    assert verified["range_guard_details"]["method"] == "standardized_3_5_sigma"
 
 
 def _external_context(decision_at: datetime, *, status: str = "ok", age_days: int = 1):

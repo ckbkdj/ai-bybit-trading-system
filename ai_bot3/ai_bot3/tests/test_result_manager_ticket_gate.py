@@ -257,6 +257,7 @@ def _authorized_alpha(
     *,
     horizon_sec: int,
 ) -> dict:
+    last_observed_at = datetime.now(timezone.utc) - timedelta(seconds=5)
     return {
         "model_family": "profitability_two_stage",
         "model_bundle_id": "profitability-two-stage-test",
@@ -277,6 +278,13 @@ def _authorized_alpha(
         "expected_mae_bps": 50.0,
         "expected_mfe_bps": 120.0,
         "lower_bound_net_edge_bps": 40.0,
+        "range_guard_score": 0.1,
+        "range_guard_details": {
+            "method": "standardized_3_5_sigma",
+            "violation_fraction": 0.0,
+            "maximum_excess": 0.0,
+        },
+        "market_regime": "risk_on",
         "feature_evidence": {
             "price_path": {
                 "status": "verified",
@@ -287,6 +295,11 @@ def _authorized_alpha(
                 "ohlcv_contract_valid": True,
                 "observed_bar_count": 100,
                 "interval_sec": horizon_sec,
+                "first_observed_at": _iso(
+                    last_observed_at - timedelta(seconds=99 * horizon_sec)
+                ),
+                "last_observed_at": _iso(last_observed_at),
+                "last_price": 100_000.0,
                 "candidate_freshness_verified": True,
                 "age_seconds": 5.0,
                 "maximum_age_seconds": float(
@@ -430,12 +443,38 @@ def test_verified_profitability_release_can_create_candidate_ticket_only():
         )
         near = _prediction("rejected")
         near["alpha_prediction"] = _authorized_alpha(manifest, horizon_sec=180)
+        near["current_price"] = 1.0
+        near["data_source_status"] = "error"
+        near["data_source_reliable"] = False
+        near["context_completeness"] = {"score": 0.0}
+        near["calibration_status"] = "invalid"
+        near["range_guard_score"] = 1.0
         far = _prediction("rejected")
         far["alpha_prediction"] = _authorized_alpha(manifest, horizon_sec=900)
+        far["current_price"] = 1.0
+        far["data_source_status"] = "error"
+        far["data_source_reliable"] = False
+        far["context_completeness"] = {"score": 0.0}
+        far["calibration_status"] = "invalid"
+        far["range_guard_score"] = 1.0
         asyncio.run(manager.save_result("BTCUSDT", "scalping", near))
         assert _counts(db) == (1, 0)
         asyncio.run(manager.save_result("BTCUSDT", "mid_short", far))
         assert _counts(db) == (2, 1)
+        active = manager.control_plane.active_forecasts(
+            "BTCUSDT", strategy_release_id=manager.strategy_release_bundle.strategy_release_id
+        )
+        assert len(active) == 2
+        assert all(item.instrument.exchange == "bybit" for item in active)
+        assert all(item.quality.source_status == "ok" for item in active)
+        assert all(item.quality.data_quality == 1.0 for item in active)
+        assert all(item.quality.calibration_status == "valid" for item in active)
+        assert all(item.quality.range_guard_score == 0.1 for item in active)
+        tickets, _ = manager.control_plane.list_tickets()
+        assert len(tickets) == 1
+        assert tickets[0].entry is not None
+        assert tickets[0].entry.reference_price == 100_000.0
+        assert tickets[0].guards.forecast_market == "bybit"
 
 
 def test_candidate_ticket_rejects_malformed_edge_or_runtime_price_contract():
@@ -446,6 +485,12 @@ def test_candidate_ticket_rejects_malformed_edge_or_runtime_price_contract():
         "nan_edge",
         "invalid_bar_count",
         "infinite_interval",
+        "invalid_generated_at",
+        "future_observation",
+        "broken_observation_span",
+        "nonfinite_last_price",
+        "invalid_range_guard",
+        "excessive_range_guard",
         "stale_age",
         "inflated_maximum_age",
     ):
@@ -485,6 +530,24 @@ def test_candidate_ticket_rejects_malformed_edge_or_runtime_price_contract():
                 far_alpha["feature_evidence"]["price_path"]["interval_sec"] = float(
                     "inf"
                 )
+            elif defect == "invalid_generated_at":
+                far["generated_at"] = "not-a-timestamp"
+            elif defect == "future_observation":
+                far_alpha["feature_evidence"]["price_path"][
+                    "last_observed_at"
+                ] = _iso(datetime.now(timezone.utc) + timedelta(days=1))
+            elif defect == "broken_observation_span":
+                far_alpha["feature_evidence"]["price_path"][
+                    "first_observed_at"
+                ] = far_alpha["feature_evidence"]["price_path"]["last_observed_at"]
+            elif defect == "nonfinite_last_price":
+                far_alpha["feature_evidence"]["price_path"]["last_price"] = float(
+                    "inf"
+                )
+            elif defect == "invalid_range_guard":
+                far_alpha["range_guard_score"] = float("nan")
+            elif defect == "excessive_range_guard":
+                far_alpha["range_guard_score"] = 0.36
             elif defect == "stale_age":
                 far_alpha["feature_evidence"]["price_path"]["age_seconds"] = 2_701
             elif defect == "inflated_maximum_age":
@@ -497,6 +560,11 @@ def test_candidate_ticket_rejects_malformed_edge_or_runtime_price_contract():
             asyncio.run(manager.save_result("BTCUSDT", "mid_short", far))
 
             assert _counts(db) == (2, 0)
+            active = manager.control_plane.active_forecasts(
+                "BTCUSDT",
+                strategy_release_id=manager.strategy_release_bundle.strategy_release_id,
+            )
+            assert len(active) == 1
 
 
 def test_prediction_file_is_atomic_and_read_does_not_refresh_its_age():

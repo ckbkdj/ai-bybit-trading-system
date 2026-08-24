@@ -142,6 +142,7 @@ def _validate_price_frame(
         "last_observed_at": _iso(
             decision_times.iloc[-1].to_pydatetime().astimezone(timezone.utc)
         ),
+        "last_price": float(numeric["close"].iloc[-1]),
         "ohlcv_contract_valid": True,
     }
 
@@ -668,6 +669,8 @@ def generate_profitability_alpha_prediction(
             "maximum_age_seconds": candidate_maximum_age_seconds,
             **dict(feature_evidence["price_frame"]),
         }
+        feature_evidence["runtime_contract_verified"] = True
+        range_guard = model.feature_range_guard(rows)
         predictions = model.predict(rows)
 
         report_path = profitability_report_path or (
@@ -734,6 +737,13 @@ def generate_profitability_alpha_prediction(
             "expected_mae_bps": selected.expected_mae * 10_000,
             "expected_mfe_bps": selected.expected_mfe * 10_000,
             "uncertainty": selected.uncertainty,
+            "range_guard_score": range_guard.score,
+            "range_guard_details": {
+                "method": range_guard.method,
+                "violation_fraction": range_guard.violation_fraction,
+                "maximum_excess": range_guard.maximum_excess,
+            },
+            "market_regime": str(rows.iloc[-1]["regime"]),
             "meta_trade_probability": selected.meta_trade_probability,
             "lower_bound_net_edge_bps": selected.lower_bound_net_edge * 10_000,
             "feature_evidence": feature_evidence,

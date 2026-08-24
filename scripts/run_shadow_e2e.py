@@ -99,7 +99,9 @@ def prediction(
         "direction_confidence": 0.9,
         "predicted_return": expected_return,
         "calibrated_predicted_return": expected_return,
-        "current_price": 100_000.0,
+        # Deliberately differs from the signed Bybit Alpha path.  A candidate
+        # ticket must ignore this legacy display price.
+        "current_price": 1.0,
         "current_price_age_seconds": 5,
         "range_guard_score": 0.1,
         "calibration_status": "valid",
@@ -375,6 +377,7 @@ def publish_release_gated_ticket(temp: Path, control_db: Path, now: datetime) ->
         evidence_report_paths=evidence_report_paths,
     ).to_dict()
     def alpha_prediction_for(horizon_sec: int) -> dict:
+        last_observed_at = now - timedelta(seconds=5)
         return {
             "model_family": "profitability_two_stage",
             "model_bundle_id": "profitability-two-stage-shadow-e2e",
@@ -395,6 +398,13 @@ def publish_release_gated_ticket(temp: Path, control_db: Path, now: datetime) ->
             "expected_mae_bps": 50.0,
             "expected_mfe_bps": 120.0,
             "lower_bound_net_edge_bps": 40.0,
+            "range_guard_score": 0.1,
+            "range_guard_details": {
+                "method": "standardized_3_5_sigma",
+                "violation_fraction": 0.0,
+                "maximum_excess": 0.0,
+            },
+            "market_regime": "risk_on",
             "feature_evidence": {
                 "price_path": {
                     "status": "verified",
@@ -405,6 +415,11 @@ def publish_release_gated_ticket(temp: Path, control_db: Path, now: datetime) ->
                     "ohlcv_contract_valid": True,
                     "observed_bar_count": 100,
                     "interval_sec": horizon_sec,
+                    "first_observed_at": (
+                        last_observed_at - timedelta(seconds=99 * horizon_sec)
+                    ).isoformat(),
+                    "last_observed_at": last_observed_at.isoformat(),
+                    "last_price": 100_000.0,
                     "candidate_freshness_verified": True,
                     "age_seconds": 5.0,
                     "maximum_age_seconds": float(
@@ -477,10 +492,32 @@ def publish_release_gated_ticket(temp: Path, control_db: Path, now: datetime) ->
             f"2 forecasts / 1 intent / 1 ticket: "
             f"{forecast_count}/{intent_count}/{ticket_count}"
         )
+    tickets, _ = manager.control_plane.list_tickets()
+    if len(tickets) != 1 or tickets[0].entry is None:
+        raise RuntimeError("release-gated path did not persist one priced ticket")
+    ticket = tickets[0]
+    if (
+        ticket.entry.reference_price != 100_000.0
+        or ticket.guards.forecast_market != "bybit"
+    ):
+        raise RuntimeError(
+            "candidate ticket did not use the verified Bybit Alpha price boundary"
+        )
+    active = manager.control_plane.active_forecasts(
+        "BTCUSDT", strategy_release_id=RELEASE_ID
+    )
+    if len(active) != 2 or any(
+        item.instrument.exchange != "bybit" for item in active
+    ):
+        raise RuntimeError(
+            "candidate release book contains a non-Bybit or unauthorized forecast"
+        )
     return {
         "forecast_count": forecast_count,
         "portfolio_intent_count": intent_count,
         "ticket_count": ticket_count,
+        "ticket_reference_price": ticket.entry.reference_price,
+        "forecast_market": ticket.guards.forecast_market,
         "strategy_release_id": RELEASE_ID,
     }
 

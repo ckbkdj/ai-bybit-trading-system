@@ -4,7 +4,7 @@ import logging
 import math
 import os
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -29,6 +29,24 @@ def _finite_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return parsed if math.isfinite(parsed) else None
+
+
+def _aware_utc(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        text = value.strip()
+        if text.endswith(("Z", "z")):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(timezone.utc)
 
 
 # 预测结果中需要保留的扩展字段（向后兼容；缺失时回退默认值，不会导致前端崩溃）
@@ -236,6 +254,14 @@ class ResultManager:
         lower_edge = _finite_float(alpha.get("lower_bound_net_edge_bps"))
         if lower_edge is None or lower_edge <= 0:
             return False
+        range_guard_score = _finite_float(alpha.get("range_guard_score"))
+        if (
+            range_guard_score is None
+            or range_guard_score < 0
+            or range_guard_score
+            > self.portfolio_intent_builder.policy.max_range_guard_score
+        ):
+            return False
         feature_evidence = alpha.get("feature_evidence")
         price_path = (
             feature_evidence.get("price_path")
@@ -251,9 +277,25 @@ class ResultManager:
         maximum_age_seconds = _finite_float(
             price_path.get("maximum_age_seconds")
         )
+        last_price = _finite_float(price_path.get("last_price"))
+        first_observed_at = _aware_utc(price_path.get("first_observed_at"))
+        last_observed_at = _aware_utc(price_path.get("last_observed_at"))
+        generated_at = _aware_utc(prediction.get("generated_at"))
+        saved_at = _aware_utc(prediction.get("saved_at"))
         expected_maximum_age = float(
             MAX_CANDIDATE_KLINE_AGE_SEC[expected_horizon]
         )
+        observed_age_seconds = (
+            (saved_at - last_observed_at).total_seconds()
+            if saved_at is not None and last_observed_at is not None
+            else None
+        )
+        observed_span_seconds = (
+            (last_observed_at - first_observed_at).total_seconds()
+            if first_observed_at is not None and last_observed_at is not None
+            else None
+        )
+        expected_span_seconds = float((observed_bar_count - 1) * interval_sec)
         if (
             not isinstance(price_path, dict)
             or price_path.get("status") != "verified"
@@ -268,9 +310,27 @@ class ResultManager:
             or price_path.get("candidate_freshness_verified") is not True
             or age_seconds is None
             or maximum_age_seconds is None
+            or last_price is None
+            or last_price <= 0
+            or first_observed_at is None
+            or last_observed_at is None
+            or generated_at is None
+            or saved_at is None
             or age_seconds < 0
             or maximum_age_seconds <= 0
             or age_seconds > maximum_age_seconds
+            or observed_age_seconds is None
+            or observed_age_seconds < 0
+            or observed_age_seconds > expected_maximum_age
+            or observed_span_seconds is None
+            or not math.isclose(
+                observed_span_seconds,
+                expected_span_seconds,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+            or last_observed_at > generated_at + timedelta(seconds=5)
+            or generated_at > saved_at + timedelta(seconds=5)
             or not math.isclose(
                 maximum_age_seconds,
                 expected_maximum_age,
@@ -315,19 +375,25 @@ class ResultManager:
         file_path = self._get_file_path(symbol, mode)
         await asyncio.to_thread(_atomic_json_write, file_path, normalized)
         try:
-            forecast = self.forecast_adapter.adapt(symbol, mode, normalized)
+            ticket_authorized = bool(
+                self.tickets_enabled
+                and self._brain_authorized_for_ticket(normalized, mode)
+            )
+            forecast = self.forecast_adapter.adapt(
+                symbol,
+                mode,
+                normalized,
+                execution_authorized=ticket_authorized,
+            )
             await asyncio.to_thread(self.control_plane.publish, forecast, None)
             ticket = None
             portfolio_intent = None
-            if self.tickets_enabled and self._brain_authorized_for_ticket(
-                normalized, mode
-            ):
-                reference_price = (
-                    normalized.get("current_price")
-                    or normalized.get("kline_last_price")
-                    or normalized.get("last")
+            if ticket_authorized:
+                reference_price = _finite_float(
+                    normalized["alpha_prediction"]["feature_evidence"][
+                        "price_path"
+                    ]["last_price"]
                 )
-                reference_price = _finite_float(reference_price)
                 if reference_price is not None and reference_price > 0:
                     release_id = self.strategy_release_bundle.strategy_release_id
                     forecasts = await asyncio.to_thread(
