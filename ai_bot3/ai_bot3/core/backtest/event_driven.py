@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
@@ -167,26 +168,91 @@ def _drawdown(curve: Sequence[float]) -> float:
     return maximum
 
 
+@dataclass(frozen=True, slots=True)
+class _MarketPathIndex:
+    bars: tuple[MarketBar, ...]
+    open_times: tuple[datetime, ...]
+    close_times: tuple[datetime, ...]
+
+    @classmethod
+    def build(cls, values: Sequence[MarketBar]) -> "_MarketPathIndex":
+        bars = tuple(
+            sorted(values, key=lambda bar: (bar.open_time, bar.available_at))
+        )
+        if any(
+            later.close_time < earlier.close_time
+            for earlier, later in zip(bars, bars[1:])
+        ):
+            raise ValueError("market path close times must be chronological")
+        return cls(
+            bars=bars,
+            open_times=tuple(bar.open_time for bar in bars),
+            close_times=tuple(bar.close_time for bar in bars),
+        )
+
+    def signal_window(
+        self,
+        *,
+        signal_at: datetime,
+        max_wait_sec: int,
+        max_holding_sec: int,
+        latency_ms: int,
+    ) -> tuple[MarketBar, ...]:
+        """Return only bars that can affect entry, barriers, or timeout proof."""
+
+        activation = signal_at + timedelta(milliseconds=latency_ms)
+        latest_open = signal_at + timedelta(
+            seconds=max_wait_sec + max_holding_sec
+        )
+        start = bisect_right(self.close_times, activation)
+        stop = bisect_right(self.open_times, latest_open)
+        # Preserve the first post-activation observation even when a data gap
+        # puts its open beyond the timeout; it is needed to prove ENTRY_TIMEOUT.
+        if start < len(self.bars) and stop <= start:
+            stop = start + 1
+        return self.bars[start:stop]
+
+    def trade_window(self, trade: TradeRecord) -> tuple[MarketBar, ...]:
+        start = bisect_right(self.close_times, trade.entry_at)
+        stop = bisect_left(self.open_times, trade.exit_at)
+        return self.bars[start:stop]
+
+
+def _prepare_market_index(
+    market_bars: Mapping[str, Sequence[MarketBar]],
+) -> dict[str, _MarketPathIndex]:
+    return {
+        str(key): _MarketPathIndex.build(values)
+        for key, values in market_bars.items()
+    }
+
+
 def _mark_to_market_curve(
     trades: Sequence[TradeRecord],
     market_bars: Mapping[str, Sequence[MarketBar]],
     initial_equity: float,
     *,
     until: datetime | None = None,
+    _market_index: Mapping[str, _MarketPathIndex] | None = None,
 ) -> tuple[EquityPoint, ...]:
     if not trades:
         return ()
-    bars_by_key = {
-        str(key): sorted(values, key=lambda bar: (bar.close_time, bar.available_at))
-        for key, values in market_bars.items()
-    }
+    market_index = dict(_market_index or _prepare_market_index(market_bars))
     cutoff = until.astimezone(timezone.utc) if until is not None else None
+    trade_bars = {
+        id(trade): (
+            market_index[trade.market_key].trade_window(trade)
+            if trade.market_key in market_index
+            else ()
+        )
+        for trade in trades
+    }
     observations = {trade.decision_at for trade in trades}
     observations.update(trade.entry_at for trade in trades)
     observations.update(trade.exit_at for trade in trades)
     bar_observations: set[datetime] = set()
     for trade in trades:
-        for bar in bars_by_key.get(trade.market_key, ()):
+        for bar in trade_bars[id(trade)]:
             if cutoff is not None and bar.available_at > cutoff:
                 continue
             if bar.close_time <= trade.entry_at or bar.open_time >= trade.exit_at:
@@ -220,7 +286,7 @@ def _mark_to_market_curve(
             mark = trade.entry_fill_price
             current_bar: MarketBar | None = None
             accrued_funding_bps = 0.0
-            for bar in bars_by_key.get(trade.market_key, ()):
+            for bar in trade_bars[id(trade)]:
                 if cutoff is not None and bar.available_at > cutoff:
                     continue
                 if bar.close_time > observed_at:
@@ -278,6 +344,32 @@ class EventDrivenBacktest:
     ) -> None:
         self.config = config or BacktestConfig()
         self.execution = execution or TripleBarrierConfig()
+        self._cached_market_signature: tuple[object, ...] | None = None
+        self._cached_market_index: dict[str, _MarketPathIndex] | None = None
+
+    def _market_index(
+        self, market_bars: Mapping[str, Sequence[MarketBar]]
+    ) -> dict[str, _MarketPathIndex]:
+        signature = (
+            id(market_bars),
+            tuple(
+                (
+                    str(key),
+                    id(values),
+                    len(values),
+                    values[0].open_time if values else None,
+                    values[-1].close_time if values else None,
+                )
+                for key, values in sorted(
+                    market_bars.items(), key=lambda item: str(item[0])
+                )
+            ),
+        )
+        if signature != self._cached_market_signature:
+            self._cached_market_index = _prepare_market_index(market_bars)
+            self._cached_market_signature = signature
+        assert self._cached_market_index is not None
+        return self._cached_market_index
 
     def run(
         self,
@@ -301,6 +393,7 @@ class EventDrivenBacktest:
             latency_ms=self.execution.latency_ms,
             stop_first_when_same_bar=self.execution.stop_first_when_same_bar,
         )
+        market_index = self._market_index(market_bars)
         ordered = sorted(signals, key=lambda item: (item.decision_at, item.signal_id))
         equity = cfg.initial_equity_usdt
         curve = [equity]
@@ -346,6 +439,7 @@ class EventDrivenBacktest:
                 market_bars,
                 cfg.initial_equity_usdt,
                 until=now,
+                _market_index=market_index,
             )
             current_equity = state_curve[-1].equity_usdt if state_curve else equity
             day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -383,11 +477,18 @@ class EventDrivenBacktest:
                 rejected["portfolio_exposure_limit"] += 1
                 continue
             quantity = notional / signal.reference_price
-            bars = list(
-                market_bars.get(
-                    signal.market_key or signal.symbol.upper(),
-                    market_bars.get(signal.symbol.upper(), ()),
-                )
+            market_key = signal.market_key or signal.symbol.upper()
+            path_index = market_index.get(
+                market_key, market_index.get(signal.symbol.upper())
+            )
+            if path_index is None:
+                rejected["missing_market_path"] += 1
+                continue
+            bars = path_index.signal_window(
+                signal_at=now,
+                max_wait_sec=signal.max_wait_sec,
+                max_holding_sec=signal.max_holding_sec,
+                latency_ms=execution.latency_ms,
             )
             if not bars:
                 rejected["missing_market_path"] += 1
@@ -466,7 +567,12 @@ class EventDrivenBacktest:
             active_until[symbol] = label.exit_at
 
         settle_until(datetime.max.replace(tzinfo=timezone.utc))
-        equity_curve = _mark_to_market_curve(trades, market_bars, cfg.initial_equity_usdt)
+        equity_curve = _mark_to_market_curve(
+            trades,
+            market_bars,
+            cfg.initial_equity_usdt,
+            _market_index=market_index,
+        )
         mtm_values = [cfg.initial_equity_usdt] + [point.equity_usdt for point in equity_curve]
 
         return EventDrivenReport(

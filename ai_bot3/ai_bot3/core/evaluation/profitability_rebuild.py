@@ -1915,7 +1915,8 @@ class ProfitabilityRebuild:
         self.ledger.claim_lockbox(
             sealed_lockbox_descriptor, self.trial_id, purpose="final_evaluation"
         )
-        lockbox_panels: dict[int, pd.DataFrame] = {}
+        lockbox_panel_fingerprints: dict[int, str] = {}
+        lockbox_signals: list[SignalEvent] = []
         for horizon in HORIZONS_SEC:
             lockbox_parts: list[pd.DataFrame] = []
             max_wait_sec = max(30, min(300, horizon // 2))
@@ -1967,6 +1968,11 @@ class ProfitabilityRebuild:
                         history=symbol_history,
                         source_evidence=lockbox_bybit_evidence,
                     )
+                    del symbol_history
+                # The final backtest must use the full immutable history that
+                # contains this lockbox path.  Leaving the development-only
+                # sequence here would reject every lockbox signal as missing.
+                market[f"{symbol}:{horizon}"] = bars
                 lockbox_parts.append(
                     _panel_frame(
                         enriched,
@@ -2004,25 +2010,39 @@ class ProfitabilityRebuild:
                     names=bybit_names,
                     history=lockbox_bybit_history,
                 )
-            lockbox_panels[horizon] = PooledPanelBuilder.validate(
+            lockbox_panel = PooledPanelBuilder.validate(
                 lockbox_panel, horizon
             )
+            lockbox_panel_fingerprints[horizon] = PooledPanelBuilder.fingerprint(
+                lockbox_panel
+            )
+            horizon_signals = _signals_from_predictions(
+                lockbox_panel,
+                final_models[horizon].predict(lockbox_panel),
+                horizon,
+            )
+            lockbox_signals.extend(horizon_signals)
+            self.ledger.append_event(
+                self.trial_id,
+                "running",
+                {
+                    "phase": "lockbox_horizon_scored",
+                    "horizon_sec": horizon,
+                    "panel_rows": len(lockbox_panel),
+                    "signals": len(horizon_signals),
+                    "panel_fingerprint": lockbox_panel_fingerprints[horizon],
+                },
+            )
+            lockbox_history.clear()
+            lockbox_parts.clear()
+            lockbox_bybit_history = None
+            del lockbox_panel
         lockbox_fingerprint = _hash_payload(
             {
-                str(horizon): PooledPanelBuilder.fingerprint(panel)
-                for horizon, panel in lockbox_panels.items()
+                str(horizon): fingerprint
+                for horizon, fingerprint in lockbox_panel_fingerprints.items()
             }
         )
-        lockbox_signals: list[SignalEvent] = []
-        for horizon, dataset in datasets.items():
-            lockbox_panel = lockbox_panels[horizon]
-            lockbox_signals.extend(
-                _signals_from_predictions(
-                    lockbox_panel,
-                    final_models[horizon].predict(lockbox_panel),
-                    horizon,
-                )
-            )
 
         lockbox_report = backtest.run(lockbox_signals, market)
         stressed_report = backtest.run(lockbox_signals, market, cost_multiplier=2.0)

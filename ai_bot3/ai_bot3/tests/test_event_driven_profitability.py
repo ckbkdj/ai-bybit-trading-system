@@ -4,10 +4,10 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import core.backtest.event_driven as event_driven
 from core.backtest.event_driven import BacktestConfig, EventDrivenBacktest, SignalEvent
 from core.labels.triple_barrier import MarketBar
 
@@ -235,3 +235,36 @@ def test_unrealized_drawdown_blocks_new_cross_symbol_risk():
     )
     assert [trade.signal_id for trade in report.trades] == ["btc-open-loss"]
     assert report.rejected_signals["equity_drawdown_limit"] == 1
+
+
+def test_event_backtest_passes_only_the_bounded_holding_path_to_labeler(monkeypatch):
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    signal_at = start + timedelta(days=2)
+    signal = SignalEvent(
+        signal_id="bounded-market-path",
+        symbol="BTCUSDT",
+        side="BUY",
+        decision_at=signal_at,
+        reference_price=100.0,
+        lower_bound_net_edge=0.001,
+        take_profit_bps=100,
+        stop_loss_bps=100,
+        max_holding_sec=180,
+    )
+    bars = [
+        _bar(start + timedelta(minutes=index), 102.0, 99.0, 101.0)
+        for index in range(5_000)
+    ]
+    observed_path_lengths: list[int] = []
+    original = event_driven.build_triple_barrier_label
+
+    def capture_path(spec, path, config):
+        observed_path_lengths.append(len(path))
+        return original(spec, path, config)
+
+    monkeypatch.setattr(event_driven, "build_triple_barrier_label", capture_path)
+    report = EventDrivenBacktest().run([signal], {"BTCUSDT": bars})
+
+    assert len(report.trades) == 1
+    assert observed_path_lengths and observed_path_lengths[0] <= 6
+    assert observed_path_lengths[0] < len(bars)
