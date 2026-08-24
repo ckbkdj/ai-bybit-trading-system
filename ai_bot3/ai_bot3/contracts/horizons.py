@@ -23,6 +23,15 @@ HORIZON_TIMEFRAME: Mapping[int, str] = MappingProxyType(
         86400: "1d",
     }
 )
+MAX_CANDIDATE_KLINE_AGE_SEC: Mapping[int, int] = MappingProxyType(
+    {
+        180: 10 * 60,
+        900: 45 * 60,
+        7200: 4 * 60 * 60,
+        14400: 8 * 60 * 60,
+        86400: 36 * 60 * 60,
+    }
+)
 
 
 def horizon_for_mode(mode: str) -> int:
@@ -35,6 +44,7 @@ def horizon_for_mode(mode: str) -> int:
 __all__: Sequence[str] = (
     "HORIZONS_SEC",
     "HORIZON_TIMEFRAME",
+    "MAX_CANDIDATE_KLINE_AGE_SEC",
     "MODE_HORIZONS",
     "horizon_for_mode",
 )

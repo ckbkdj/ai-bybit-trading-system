@@ -196,6 +196,7 @@ FOMC 采集不能用会议日历日期猜测 14:00，也不能把 minutes、impl
 20. 因子消融禁止 complete-case 选样。某 fold 的任一已安排 train/OOS 行缺少因子时，该 fold 必须记录 `FAILED_INCOMPLETE_FACTOR_COVERAGE`；不能删除缺失行后比较 baseline/augmented，也不能让研究阶段只看有值子集、最终训练做均值填补、生产阶段再因缺失拒绝。稳定币日序列从共同可用日起必须连续到请求结束日；周度 fund flow 的首部、内部、尾部缺口均不得超过其 15 天 staleness 合约。
 21. production replay 或外部调用传入的 `latest_decision_at` 必须与价格 frame 最后一条真实观测时间完全一致。禁止用更晚的声明时间覆盖最后一根 K 线时间，否则会把陈旧价格伪装成新鲜数据，并使 Bybit/macro/flow 的 as-of join 读取到价格形成以后才可用的因子。
 22. 正式 Alpha runtime 必须在模型边界重新验证至少 49 根价格的严格周期网格、有限且合法的 OHLCV；不能只信任上游抓取器或 `input_price_source` 字符串。candidate 包还必须再次按周期检查最后价格年龄，陈旧或未来时间一律 `NO_TRADE`。
+23. `ResultManager` 不能只信任 Alpha 自报的 `candidate_freshness_verified=true`。出票边界必须再次要求下界净 edge、价格年龄和最大允许年龄都是有限数，实际 age 不超过按周期固定的上限，且 bar count/interval 可严格解析；`NaN`、无穷值、畸形结构或擅自放大的 freshness 上限都必须失败关闭而不是抛异常或出票。
 
 ## 7. 事件回测和回撤
 

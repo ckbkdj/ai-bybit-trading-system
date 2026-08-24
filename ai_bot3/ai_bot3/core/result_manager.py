@@ -1,6 +1,7 @@
 # 这个类负责保存每个模型的独立预测结果，并能聚合所有最新结果
 import json
 import logging
+import math
 import os
 import tempfile
 from datetime import datetime, timezone
@@ -10,7 +11,7 @@ from typing import Any, Dict, Optional
 import asyncio
 
 from adapters.legacy_forecast_adapter import LegacyForecastAdapter
-from contracts.horizons import horizon_for_mode
+from contracts.horizons import MAX_CANDIDATE_KLINE_AGE_SEC, horizon_for_mode
 from core.control_plane import ControlPlaneRepository
 from core.decision.ticket_builder import TicketBuilder
 from core.release.profitability_release import verify_candidate_authorization
@@ -18,6 +19,16 @@ from core.release.profitability_release import verify_candidate_authorization
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat()
+
+
+def _finite_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
 
 
 # 预测结果中需要保留的扩展字段（向后兼容；缺失时回退默认值，不会导致前端崩溃）
@@ -220,15 +231,28 @@ class ResultManager:
             expected_horizon = horizon_for_mode(mode)
             if int(alpha.get("horizon_sec")) != expected_horizon:
                 return False
-        except (TypeError, ValueError):
+        except (OverflowError, TypeError, ValueError):
             return False
-        if float(alpha.get("lower_bound_net_edge_bps") or 0.0) <= 0:
+        lower_edge = _finite_float(alpha.get("lower_bound_net_edge_bps"))
+        if lower_edge is None or lower_edge <= 0:
             return False
         feature_evidence = alpha.get("feature_evidence")
         price_path = (
             feature_evidence.get("price_path")
             if isinstance(feature_evidence, dict)
             else None
+        )
+        try:
+            observed_bar_count = int(price_path.get("observed_bar_count"))
+            interval_sec = int(price_path.get("interval_sec"))
+        except (AttributeError, OverflowError, TypeError, ValueError):
+            return False
+        age_seconds = _finite_float(price_path.get("age_seconds"))
+        maximum_age_seconds = _finite_float(
+            price_path.get("maximum_age_seconds")
+        )
+        expected_maximum_age = float(
+            MAX_CANDIDATE_KLINE_AGE_SEC[expected_horizon]
         )
         if (
             not isinstance(price_path, dict)
@@ -239,9 +263,20 @@ class ResultManager:
             or price_path.get("same_venue") is not True
             or price_path.get("continuous") is not True
             or price_path.get("ohlcv_contract_valid") is not True
-            or int(price_path.get("observed_bar_count") or 0) < 49
-            or int(price_path.get("interval_sec") or 0) != expected_horizon
+            or observed_bar_count < 49
+            or interval_sec != expected_horizon
             or price_path.get("candidate_freshness_verified") is not True
+            or age_seconds is None
+            or maximum_age_seconds is None
+            or age_seconds < 0
+            or maximum_age_seconds <= 0
+            or age_seconds > maximum_age_seconds
+            or not math.isclose(
+                maximum_age_seconds,
+                expected_maximum_age,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
         ):
             return False
         if not self.profitability_authorized or not self.profitability_manifest:
@@ -292,11 +327,8 @@ class ResultManager:
                     or normalized.get("kline_last_price")
                     or normalized.get("last")
                 )
-                try:
-                    reference_price = float(reference_price)
-                except (TypeError, ValueError):
-                    reference_price = 0.0
-                if reference_price > 0:
+                reference_price = _finite_float(reference_price)
+                if reference_price is not None and reference_price > 0:
                     release_id = self.strategy_release_bundle.strategy_release_id
                     forecasts = await asyncio.to_thread(
                         self.control_plane.active_forecasts,

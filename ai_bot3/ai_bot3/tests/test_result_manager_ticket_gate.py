@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from core.result_manager import ResultManager
+from contracts.horizons import MAX_CANDIDATE_KLINE_AGE_SEC
 from contracts.strategy_release_v1 import StrategyReleaseBundle
 from core.evaluation.profitability_gate import ProfitabilityGateResult, write_profitability_report
 from core.release.profitability_release import (
@@ -287,6 +288,10 @@ def _authorized_alpha(
                 "observed_bar_count": 100,
                 "interval_sec": horizon_sec,
                 "candidate_freshness_verified": True,
+                "age_seconds": 5.0,
+                "maximum_age_seconds": float(
+                    MAX_CANDIDATE_KLINE_AGE_SEC[horizon_sec]
+                ),
             }
         },
         "return_quantiles_bps": {
@@ -433,8 +438,17 @@ def test_verified_profitability_release_can_create_candidate_ticket_only():
         assert _counts(db) == (2, 1)
 
 
-def test_candidate_ticket_rejects_horizon_or_runtime_price_contract_mismatch():
-    for defect in ("wrong_horizon", "unverified_grid"):
+def test_candidate_ticket_rejects_malformed_edge_or_runtime_price_contract():
+    for defect in (
+        "wrong_horizon",
+        "infinite_horizon",
+        "unverified_grid",
+        "nan_edge",
+        "invalid_bar_count",
+        "infinite_interval",
+        "stale_age",
+        "inflated_maximum_age",
+    ):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             db = root / "control.sqlite3"
@@ -457,8 +471,26 @@ def test_candidate_ticket_rejects_horizon_or_runtime_price_contract_mismatch():
                 manifest,
                 horizon_sec=180 if defect == "wrong_horizon" else 900,
             )
-            if defect == "unverified_grid":
+            if defect == "infinite_horizon":
+                far_alpha["horizon_sec"] = float("inf")
+            elif defect == "unverified_grid":
                 far_alpha["feature_evidence"]["price_path"]["continuous"] = False
+            elif defect == "nan_edge":
+                far_alpha["lower_bound_net_edge_bps"] = float("nan")
+            elif defect == "invalid_bar_count":
+                far_alpha["feature_evidence"]["price_path"][
+                    "observed_bar_count"
+                ] = {"not": "an integer"}
+            elif defect == "infinite_interval":
+                far_alpha["feature_evidence"]["price_path"]["interval_sec"] = float(
+                    "inf"
+                )
+            elif defect == "stale_age":
+                far_alpha["feature_evidence"]["price_path"]["age_seconds"] = 2_701
+            elif defect == "inflated_maximum_age":
+                far_alpha["feature_evidence"]["price_path"][
+                    "maximum_age_seconds"
+                ] = 999_999
             far["alpha_prediction"] = far_alpha
 
             asyncio.run(manager.save_result("BTCUSDT", "scalping", near))

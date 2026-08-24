@@ -11,7 +11,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
-from contracts.horizons import horizon_for_mode
+from contracts.horizons import MAX_CANDIDATE_KLINE_AGE_SEC, horizon_for_mode
 from core.features.profitability_technical import (
     LEGACY_BRAIN_FEATURE_COLUMNS,
     TECHNICAL_FEATURE_COLUMNS,
@@ -42,13 +42,6 @@ EXTERNAL_FEATURE_ALIASES: Mapping[str, str] = {
 }
 
 MAX_EXTERNAL_PANEL_AGE = timedelta(days=7)
-MAX_CANDIDATE_KLINE_AGE: Mapping[int, timedelta] = {
-    180: timedelta(minutes=10),
-    900: timedelta(minutes=45),
-    7200: timedelta(hours=4),
-    14400: timedelta(hours=8),
-    86400: timedelta(hours=36),
-}
 
 
 def _utc(value: Any) -> datetime:
@@ -598,7 +591,9 @@ def generate_profitability_alpha_prediction(
                 timezone.utc
             )
             candidate_age = datetime.now(timezone.utc) - candidate_last
-            maximum_age = MAX_CANDIDATE_KLINE_AGE[horizon]
+            maximum_age = timedelta(
+                seconds=MAX_CANDIDATE_KLINE_AGE_SEC[horizon]
+            )
             candidate_age_seconds = candidate_age.total_seconds()
             candidate_maximum_age_seconds = maximum_age.total_seconds()
             if candidate_age < timedelta(0) or candidate_age > maximum_age:

@@ -21,6 +21,7 @@ AI_ROOT = WORKSPACE / "ai_bot3" / "ai_bot3"
 sys.path.insert(0, str(AI_ROOT))
 
 from contracts.strategy_release_v1 import StrategyReleaseBundle
+from contracts.horizons import MAX_CANDIDATE_KLINE_AGE_SEC
 from core.evaluation.profitability_gate import ProfitabilityGateResult, write_profitability_report
 from core.release.profitability_release import (
     REQUIRED_EVIDENCE_REPORTS,
@@ -405,6 +406,10 @@ def publish_release_gated_ticket(temp: Path, control_db: Path, now: datetime) ->
                     "observed_bar_count": 100,
                     "interval_sec": horizon_sec,
                     "candidate_freshness_verified": True,
+                    "age_seconds": 5.0,
+                    "maximum_age_seconds": float(
+                        MAX_CANDIDATE_KLINE_AGE_SEC[horizon_sec]
+                    ),
                 }
             },
             "return_quantiles_bps": {
