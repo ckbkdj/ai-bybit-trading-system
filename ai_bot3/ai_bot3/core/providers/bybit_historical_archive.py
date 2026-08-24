@@ -402,6 +402,10 @@ def replay_orderbook_archive(
     content_sha256 = actual_sha256
     content_length = Path(path).stat().st_size
     archive_id = _archive_id("orderbook", normalized, trading_date, source_url)
+    archive_start = datetime.combine(
+        trading_date, datetime.min.time(), tzinfo=timezone.utc
+    )
+    archive_end = archive_start + timedelta(days=1)
     book = _ReplayBook({}, {})
     ofi_window: Deque[tuple[datetime, float]] = deque()
     rows_read = 0
@@ -452,9 +456,10 @@ def replay_orderbook_archive(
                 last_event = event_time
                 # Official daily files can contain a few deltas immediately
                 # before their UTC start and the next day's opening snapshot.
-                # Validate that narrow overlap, but never assign an out-of-day
-                # event to this archive's derived features.
-                if not in_trading_day:
+                # A leading snapshot/delta is required to initialize the first
+                # in-day delta, but it must never emit a feature. A trailing
+                # next-day event is irrelevant to this day's reconstruction.
+                if not in_trading_day and event_time >= archive_end:
                     continue
                 is_snapshot = event_type == "snapshot"
                 if (
@@ -498,6 +503,9 @@ def replay_orderbook_archive(
                 cutoff = available_at - timedelta(minutes=1)
                 while ofi_window and ofi_window[0][0] < cutoff:
                     ofi_window.popleft()
+
+                if not in_trading_day:
+                    continue
 
                 should_emit = is_snapshot or book.last_emit_at is None or (
                     available_at - book.last_emit_at

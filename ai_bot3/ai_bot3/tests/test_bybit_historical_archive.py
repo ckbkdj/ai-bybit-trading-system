@@ -9,6 +9,8 @@ import zipfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+import pandas as pd
+
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -60,8 +62,8 @@ def _book_message(offset_sec: int, sequence: int, *, snapshot: bool) -> dict:
 def _orderbook_zip(path: Path) -> None:
     member = f"{DAY.isoformat()}_{SYMBOL}_ob200.data"
     messages = (
-        _book_message(-1, 0, snapshot=False),
-        _book_message(1, 1, snapshot=True),
+        _book_message(-1, 0, snapshot=True),
+        _book_message(1, 1, snapshot=False),
         _book_message(16, 2, snapshot=False),
         _book_message(31, 3, snapshot=False),
         _book_message(86_402, 4, snapshot=True),
@@ -127,6 +129,7 @@ def test_official_archive_replay_preserves_event_available_ingested_chronology(t
         ["orderbook_spread_bps", "ofi_1m", "orderbook_depth_usdt_l5"]
     )
     assert len(history) == 9
+    assert (history["event_time"] >= pd.Timestamp(START)).all()
     assert (history["event_time"] < history["available_at"]).all()
     assert (history["available_at"] < history["ingested_at"]).all()
     assert history["ingested_at"].nunique() == 1

@@ -363,7 +363,7 @@ blocker 只允许表示样本量、fold 或跨币种不足。PIT 违规、混周
 
 liquidation 组必须额外核对 `collection_evidence`。Bybit 官方公开的是 [`allLiquidation.{symbol}` 实时 WS](https://bybit-exchange.github.io/docs/v5/websocket/public/all-liquidation)，500ms 推送；当前 [V5 Market REST 清单](https://bybit-exchange.github.io/docs/api-explorer/v5/market/market)没有公共历史爆仓接口。因此 `historical_backfill_supported=false` 是真实来源限制，不是待补代码。达到 180 天 forward-only PIT 历史前，该组和总因子门禁保持失败。
 
-Bybit orderbook 日归档允许验证但不写入特征的窄边界重叠：UTC 起点前最多 10 秒、终点后最多 10 秒。边界外事件必须整包原子失败；边界内的跨日事件计入 `rows_read` 和首尾原始证据，但不得进入当日派生 feature。该规则用于兼容官方文件在零点附近携带的前置 delta/次日 snapshot，不得扩展为任意跨日容忍。
+Bybit orderbook 日归档允许验证但不写入特征的窄边界重叠：UTC 起点前最多 10 秒、终点后最多 10 秒。边界外事件必须整包原子失败；边界内的跨日事件计入 `rows_read` 和首尾原始证据，但不得进入当日派生 feature。起点前的 snapshot/delta 只能初始化当日首个 delta 所需的订单簿状态与 sequence，首次 feature 的 `event_time` 必须仍在当日；终点后的事件直接跳过。该规则用于兼容官方文件在零点附近携带的前置 snapshot/delta 和次日 snapshot，不得扩展为任意跨日容忍。
 
 ## 11. Lockbox 操作
 
