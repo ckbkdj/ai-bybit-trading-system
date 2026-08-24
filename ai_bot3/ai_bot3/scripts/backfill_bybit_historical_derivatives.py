@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -14,6 +16,7 @@ if str(ROOT) not in sys.path:
 
 from core.providers.bybit_historical_derivatives import (  # noqa: E402
     DATA_KINDS,
+    audit_historical_derivative_window,
     historical_api_batch_completed,
     record_historical_api_failure,
     replay_derivative_day,
@@ -66,8 +69,23 @@ def parse_args() -> argparse.Namespace:
         default=ROOT / "model_results" / "evaluation" / "bybit_derivatives_backfill_report.json",
     )
     parser.add_argument("--timeout-sec", type=float, default=30.0)
+    parser.add_argument(
+        "--request-pause-sec",
+        type=float,
+        default=0.5,
+        help="Minimum pause between day batches to protect the public REST rate budget.",
+    )
     parser.add_argument("--max-batches", type=int)
     return parser.parse_args()
+
+
+def _write_json_atomic(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    os.replace(temporary, path)
 
 
 def main() -> int:
@@ -78,6 +96,8 @@ def main() -> int:
         raise SystemExit("--end must be a completed UTC trading day")
     if args.timeout_sec <= 0:
         raise SystemExit("--timeout-sec must be positive")
+    if args.request_pause_sec < 0:
+        raise SystemExit("--request-pause-sec must not be negative")
     if args.max_batches is not None and args.max_batches <= 0:
         raise SystemExit("--max-batches must be positive")
     symbols = tuple(dict.fromkeys(str(value).strip().upper() for value in args.symbols))
@@ -143,11 +163,27 @@ def main() -> int:
                 else:
                     completed += 1
                     records.append(evidence.to_dict())
+                if args.request_pause_sec:
+                    time.sleep(args.request_pause_sec)
             if stop:
                 break
         if stop:
             break
+    audit = audit_historical_derivative_window(
+        store,
+        start=args.start,
+        end=args.end,
+        symbols=symbols,
+        data_kinds=kinds,
+    )
     store.close()
+    complete = bool(audit["complete"]) and failed == 0
+    if complete:
+        status = "PASS"
+    elif int(audit["integrity_violation_count"]) > 0:
+        status = "FAILED_INTEGRITY"
+    else:
+        status = "FAILED_INCOMPLETE"
     report = {
         "schema_version": "bybit-historical-derivatives-backfill.v1",
         "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -160,6 +196,9 @@ def main() -> int:
         "completed_batches": completed,
         "skipped_completed_batches": skipped,
         "failed_batches": failed,
+        "max_batches_reached": stop,
+        "coverage_audit": audit,
+        "status": status,
         "records": records,
         "pit_semantics": (
             "Official historical REST responses are hashed and replayed at exchange event "
@@ -171,12 +210,11 @@ def main() -> int:
             "candidate_authorized": False,
         },
     }
-    args.report.parent.mkdir(parents=True, exist_ok=True)
-    args.report.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_json_atomic(args.report, report)
     print(
         json.dumps(
             {
-                "status": "PASS" if failed == 0 else "FAILED_PARTIAL",
+                "status": status,
                 "attempted_batches": attempted,
                 "completed_batches": completed,
                 "skipped_completed_batches": skipped,
@@ -187,7 +225,7 @@ def main() -> int:
             indent=2,
         )
     )
-    return 1 if failed else 0
+    return 0 if complete else 2
 
 
 if __name__ == "__main__":

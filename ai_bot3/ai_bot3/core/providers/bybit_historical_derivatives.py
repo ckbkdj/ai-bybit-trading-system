@@ -7,7 +7,7 @@ import urllib.request
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Callable, Mapping, Sequence
-from urllib.parse import urlencode, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from core.providers.bybit_public_pit import BybitPublicPITStore
 
@@ -22,6 +22,11 @@ ALLOWED_PATHS = {
     "/v5/market/index-price-kline",
 }
 DATA_KINDS = ("funding", "open_interest", "basis")
+FEATURE_BY_DATA_KIND = {
+    "funding": "funding_rate",
+    "open_interest": "open_interest_change_1h",
+    "basis": "perpetual_basis_bps",
+}
 
 
 def _utc(value: datetime) -> datetime:
@@ -206,6 +211,8 @@ def _fetch(
     result = payload.get("result")
     if not isinstance(result, dict):
         raise ValueError("Bybit historical API response has no result object")
+    if str(result.get("category")) != MARKET:
+        raise ValueError("Bybit historical API response category contract failed")
     rows = result.get("list")
     if not isinstance(rows, list):
         raise ValueError("Bybit historical API response has no result list")
@@ -240,6 +247,318 @@ def _manifest_sha(responses: Sequence[APIResponseEvidence]) -> str:
         for item in sorted(responses, key=lambda item: item.request_url)
     ]
     return hashlib.sha256(_canonical(manifest)).hexdigest()
+
+
+def _merge_price_rows(
+    destination: dict[int, float], rows: Mapping[int, float]
+) -> None:
+    """Merge non-overlapping REST pages without concealing conflicting rows."""
+
+    for timestamp_ms, value in rows.items():
+        prior = destination.get(timestamp_ms)
+        if prior is not None and prior != value:
+            raise ValueError("price-kline pages contain a conflicting duplicate")
+        destination[timestamp_ms] = value
+
+
+def _compact_date_ranges(values: Sequence[date]) -> list[dict[str, object]]:
+    if not values:
+        return []
+    ordered = sorted(set(values))
+    output: list[dict[str, object]] = []
+    first = previous = ordered[0]
+    for current in ordered[1:]:
+        if current == previous + timedelta(days=1):
+            previous = current
+            continue
+        output.append(
+            {
+                "start": first.isoformat(),
+                "end": previous.isoformat(),
+                "days": (previous - first).days + 1,
+            }
+        )
+        first = previous = current
+    output.append(
+        {
+            "start": first.isoformat(),
+            "end": previous.isoformat(),
+            "days": (previous - first).days + 1,
+        }
+    )
+    return output
+
+
+def audit_historical_derivative_window(
+    store: BybitPublicPITStore,
+    *,
+    start: date,
+    end: date,
+    symbols: Sequence[str],
+    data_kinds: Sequence[str] = DATA_KINDS,
+) -> dict[str, object]:
+    """Re-verify a requested derivative window from retained raw HTTP bodies.
+
+    This is intentionally independent of the backfill loop: a run can only report
+    complete when every requested day/symbol/kind is present and its raw response,
+    manifest, batch counts, and feature linkage still agree.
+    """
+
+    if start > end:
+        raise ValueError("historical derivative audit start is after end")
+    normalized_symbols = tuple(
+        dict.fromkeys(str(value).strip().upper() for value in symbols)
+    )
+    normalized_kinds = tuple(dict.fromkeys(str(value) for value in data_kinds))
+    if not normalized_symbols:
+        raise ValueError("historical derivative audit requires symbols")
+    if not normalized_kinds or any(value not in DATA_KINDS for value in normalized_kinds):
+        raise ValueError("historical derivative audit has unsupported data kinds")
+
+    requested_dates: list[date] = []
+    current = start
+    while current <= end:
+        requested_dates.append(current)
+        current += timedelta(days=1)
+    expected_keys = {
+        (data_kind, symbol, trading_date.isoformat())
+        for trading_date in requested_dates
+        for symbol in normalized_symbols
+        for data_kind in normalized_kinds
+    }
+    kind_placeholders = ",".join("?" for _ in normalized_kinds)
+    symbol_placeholders = ",".join("?" for _ in normalized_symbols)
+    parameters = (
+        *normalized_kinds,
+        *normalized_symbols,
+        start.isoformat(),
+        end.isoformat(),
+    )
+    store.flush()
+    violations: list[dict[str, str]] = []
+
+    def fail(batch_id: str, reason: str) -> None:
+        violations.append({"batch_id": batch_id, "reason": reason})
+
+    with store.connect() as connection:
+        batch_rows = connection.execute(
+            f"""SELECT * FROM bybit_historical_api_batches
+                  WHERE data_kind IN ({kind_placeholders})
+                    AND symbol IN ({symbol_placeholders})
+                    AND trading_date BETWEEN ? AND ?
+                  ORDER BY data_kind,symbol,trading_date""",
+            parameters,
+        ).fetchall()
+        batches = {
+            (str(row["data_kind"]), str(row["symbol"]), str(row["trading_date"])): dict(row)
+            for row in batch_rows
+        }
+        feature_rows = connection.execute(
+            f"""SELECT f.api_batch_id,COUNT(*) AS observation_count,
+                        MIN(f.event_time) AS first_event_time,
+                        MAX(f.event_time) AS last_event_time,
+                        COUNT(DISTINCT f.symbol) AS symbol_count,
+                        MIN(f.symbol) AS feature_symbol,
+                        COUNT(DISTINCT f.name) AS name_count,
+                        MIN(f.name) AS feature_name,
+                        SUM(CASE WHEN substr(f.event_time,1,10)<>b.trading_date
+                                 THEN 1 ELSE 0 END) AS outside_day_count
+                   FROM bybit_feature_observations AS f
+                   JOIN bybit_historical_api_batches AS b ON b.batch_id=f.api_batch_id
+                  WHERE b.data_kind IN ({kind_placeholders})
+                    AND b.symbol IN ({symbol_placeholders})
+                    AND b.trading_date BETWEEN ? AND ?
+                  GROUP BY f.api_batch_id""",
+            parameters,
+        ).fetchall()
+
+    features_by_batch = {
+        str(row["api_batch_id"]): dict(row) for row in feature_rows
+    }
+    response_connection = store.connect()
+
+    for key, batch in batches.items():
+        data_kind, symbol, trading_day = key
+        batch_id = str(batch["batch_id"])
+        try:
+            parsed_day = date.fromisoformat(trading_day)
+        except ValueError:
+            fail(batch_id, "invalid_trading_date")
+            continue
+        if batch_id != _batch_id(data_kind, symbol, parsed_day):
+            fail(batch_id, "batch_id_mismatch")
+        if str(batch["market"]) != MARKET:
+            fail(batch_id, "market_mismatch")
+        if str(batch["status"]) != "completed":
+            continue
+        responses = [
+            dict(row)
+            for row in response_connection.execute(
+                """SELECT * FROM bybit_historical_api_responses
+                     WHERE batch_id=? ORDER BY request_url""",
+                (batch_id,),
+            )
+        ]
+        if len(responses) != int(batch["response_count"]):
+            fail(batch_id, "response_count_mismatch")
+        evidence: list[APIResponseEvidence] = []
+        seen_urls: set[str] = set()
+        for response in responses:
+            request_url = str(response["request_url"])
+            try:
+                _validate_url(request_url)
+            except ValueError:
+                fail(batch_id, "response_url_not_allowlisted")
+            parsed = urlparse(request_url)
+            query = {
+                key: values[-1]
+                for key, values in parse_qs(parsed.query).items()
+            }
+            if query.get("category") != MARKET or query.get("symbol") != symbol:
+                fail(batch_id, "response_query_identity_mismatch")
+            if request_url in seen_urls:
+                fail(batch_id, "duplicate_response_url")
+            seen_urls.add(request_url)
+            raw_blob = response.get("content_blob")
+            if not isinstance(raw_blob, bytes):
+                fail(batch_id, "response_body_missing")
+                raw_blob = b""
+            content_blob = raw_blob
+            content_sha256 = hashlib.sha256(content_blob).hexdigest()
+            if (
+                len(content_blob) != int(response["content_length"])
+                or content_sha256 != str(response["content_sha256"])
+            ):
+                fail(batch_id, "response_body_hash_mismatch")
+            try:
+                payload = json.loads(content_blob)
+                result = payload["result"]
+                result_rows = result["list"]
+                payload_valid = (
+                    isinstance(payload, dict)
+                    and int(payload.get("retCode", -1)) == 0
+                    and isinstance(result, dict)
+                    and str(result.get("category")) == MARKET
+                    and isinstance(result_rows, list)
+                    and len(result_rows) == int(response["rows_read"])
+                )
+            except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+                payload_valid = False
+            if (
+                int(response["http_status"]) != 200
+                or int(response["ret_code"]) != 0
+                or not payload_valid
+            ):
+                fail(batch_id, "response_payload_contract_failed")
+            expected_response_id = "br_" + hashlib.sha256(
+                f"{batch_id}|{request_url}|{content_sha256}".encode()
+            ).hexdigest()[:48]
+            if str(response["response_id"]) != expected_response_id:
+                fail(batch_id, "response_id_mismatch")
+            evidence.append(
+                APIResponseEvidence(
+                    response_id=str(response["response_id"]),
+                    batch_id=batch_id,
+                    request_url=request_url,
+                    requested_at=str(response["requested_at"]),
+                    received_at=str(response["received_at"]),
+                    http_status=int(response["http_status"]),
+                    content_length=int(response["content_length"]),
+                    content_sha256=str(response["content_sha256"]),
+                    content_blob=content_blob,
+                    rows_read=int(response["rows_read"]),
+                    ret_code=int(response["ret_code"]),
+                )
+            )
+        if evidence and _manifest_sha(evidence) != str(batch["request_manifest_sha256"]):
+            fail(batch_id, "request_manifest_mismatch")
+        if sum(item.rows_read for item in evidence) != int(batch["rows_read"]):
+            fail(batch_id, "rows_read_mismatch")
+        feature = features_by_batch.get(batch_id)
+        if feature is None:
+            fail(batch_id, "feature_observations_missing")
+        elif (
+            int(feature["observation_count"]) != int(batch["feature_observation_count"])
+            or int(feature["observation_count"]) <= 0
+            or int(feature["symbol_count"]) != 1
+            or str(feature["feature_symbol"]) != symbol
+            or int(feature["name_count"]) != 1
+            or str(feature["feature_name"]) != FEATURE_BY_DATA_KIND[data_kind]
+            or int(feature["outside_day_count"]) != 0
+            or str(feature["first_event_time"]) != str(batch["first_event_time"])
+            or str(feature["last_event_time"]) != str(batch["last_event_time"])
+        ):
+            fail(batch_id, "feature_linkage_mismatch")
+    response_connection.close()
+
+    series: list[dict[str, object]] = []
+    complete_keys = {
+        key for key, batch in batches.items() if str(batch["status"]) == "completed"
+    }
+    failed_keys = {
+        key for key, batch in batches.items() if str(batch["status"]) == "failed"
+    }
+    for symbol in normalized_symbols:
+        for data_kind in normalized_kinds:
+            expected_for_series = {
+                (data_kind, symbol, value.isoformat()) for value in requested_dates
+            }
+            completed_dates = sorted(
+                date.fromisoformat(key[2])
+                for key in expected_for_series.intersection(complete_keys)
+            )
+            failed_dates = sorted(
+                date.fromisoformat(key[2])
+                for key in expected_for_series.intersection(failed_keys)
+            )
+            missing_dates = sorted(
+                date.fromisoformat(key[2])
+                for key in expected_for_series.difference(set(batches))
+            )
+            series.append(
+                {
+                    "symbol": symbol,
+                    "data_kind": data_kind,
+                    "expected_days": len(requested_dates),
+                    "completed_days": len(completed_dates),
+                    "failed_days": len(failed_dates),
+                    "missing_days": len(missing_dates),
+                    "first_completed_date": (
+                        completed_dates[0].isoformat() if completed_dates else None
+                    ),
+                    "last_completed_date": (
+                        completed_dates[-1].isoformat() if completed_dates else None
+                    ),
+                    "failed_date_ranges": _compact_date_ranges(failed_dates),
+                    "missing_date_ranges": _compact_date_ranges(missing_dates),
+                }
+            )
+
+    missing_key_count = len(expected_keys.difference(set(batches)))
+    failed_key_count = len(expected_keys.intersection(failed_keys))
+    completed_key_count = len(expected_keys.intersection(complete_keys))
+    complete = (
+        completed_key_count == len(expected_keys)
+        and failed_key_count == 0
+        and missing_key_count == 0
+        and not violations
+    )
+    return {
+        "schema_version": "bybit-historical-derivatives-audit.v1",
+        "status": "VERIFIED_COMPLETE" if complete else "FAILED",
+        "complete": complete,
+        "requested_start": start.isoformat(),
+        "requested_end": end.isoformat(),
+        "symbols": list(normalized_symbols),
+        "data_kinds": list(normalized_kinds),
+        "expected_batches": len(expected_keys),
+        "completed_batches": completed_key_count,
+        "failed_batches": failed_key_count,
+        "missing_batches": missing_key_count,
+        "integrity_violation_count": len(violations),
+        "integrity_violations": violations,
+        "series": series,
+    }
 
 
 def historical_api_batch_completed(
@@ -608,13 +927,14 @@ def replay_basis_day(
             result, response = _fetch(
                 url, batch_id=batch_id, requester=requester, timeout_sec=timeout_sec
             )
-            destination.update(
+            _merge_price_rows(
+                destination,
                 _price_rows(
                     result,
                     symbol=normalized,
                     start=window_start,
                     end=window_end,
-                )
+                ),
             )
             responses.append(response)
     timestamps = sorted(set(mark).intersection(index))
@@ -712,6 +1032,7 @@ __all__ = (
     "DATA_KINDS",
     "HTTPPayload",
     "HistoricalAPIBatchEvidence",
+    "audit_historical_derivative_window",
     "historical_api_batch_completed",
     "record_historical_api_failure",
     "replay_basis_day",

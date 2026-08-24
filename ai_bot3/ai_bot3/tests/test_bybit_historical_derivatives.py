@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from types import SimpleNamespace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -13,6 +14,7 @@ import pytest
 from core.providers import bybit_historical_derivatives as derivatives
 from core.providers.bybit_historical_derivatives import (
     HTTPPayload,
+    audit_historical_derivative_window,
     record_historical_api_failure,
     replay_basis_day,
     replay_funding_day,
@@ -20,6 +22,7 @@ from core.providers.bybit_historical_derivatives import (
 )
 from core.providers.bybit_public_pit import BybitPublicPITStore
 from core.training.bybit_pit_panel import BybitPITFeatureSource
+from scripts import backfill_bybit_historical_derivatives as backfill_script
 
 
 DAY = date(2026, 8, 1)
@@ -203,6 +206,131 @@ def test_incomplete_basis_grid_fails_atomically(tmp_path: Path) -> None:
         assert connection.execute(
             "SELECT COUNT(*) FROM bybit_historical_api_responses"
         ).fetchone()[0] == 0
+
+
+def test_response_category_mismatch_fails_atomically(tmp_path: Path) -> None:
+    def wrong_category_requester(url: str, timeout_sec: float) -> HTTPPayload:
+        response = _fake_requester(url, timeout_sec)
+        payload = json.loads(response.body)
+        payload["result"]["category"] = "spot"
+        return HTTPPayload(
+            body=json.dumps(payload, separators=(",", ":")).encode(),
+            requested_at=response.requested_at,
+            received_at=response.received_at,
+            http_status=response.http_status,
+        )
+
+    store = BybitPublicPITStore(tmp_path / "wrong-category.sqlite3")
+    with pytest.raises(ValueError, match="category contract"):
+        replay_funding_day(
+            store,
+            symbol=SYMBOL,
+            trading_date=DAY,
+            requester=wrong_category_requester,
+        )
+    with store.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM bybit_feature_observations"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM bybit_historical_api_batches"
+        ).fetchone()[0] == 0
+
+
+def test_derivative_window_audit_rehashes_raw_evidence_and_requires_every_day(
+    tmp_path: Path,
+) -> None:
+    store = BybitPublicPITStore(tmp_path / "audit.sqlite3")
+    replay_funding_day(
+        store, symbol=SYMBOL, trading_date=DAY, requester=_fake_requester
+    )
+
+    complete = audit_historical_derivative_window(
+        store,
+        start=DAY,
+        end=DAY,
+        symbols=[SYMBOL],
+        data_kinds=["funding"],
+    )
+    assert complete["status"] == "VERIFIED_COMPLETE"
+    assert complete["expected_batches"] == 1
+    assert complete["completed_batches"] == 1
+
+    incomplete = audit_historical_derivative_window(
+        store,
+        start=DAY,
+        end=DAY + timedelta(days=1),
+        symbols=[SYMBOL],
+        data_kinds=["funding"],
+    )
+    assert incomplete["status"] == "FAILED"
+    assert incomplete["missing_batches"] == 1
+    assert incomplete["series"][0]["missing_date_ranges"] == [
+        {"start": "2026-08-02", "end": "2026-08-02", "days": 1}
+    ]
+
+    # Simulate an offline SQLite-file modification after append-only controls
+    # were bypassed. The retained body must be independently re-hashed.
+    with store.connect() as connection:
+        connection.execute("DROP TRIGGER reject_bybit_api_response_update")
+        connection.execute(
+            "UPDATE bybit_historical_api_responses SET content_blob=?",
+            (b"{}",),
+        )
+        connection.commit()
+    corrupted = audit_historical_derivative_window(
+        store,
+        start=DAY,
+        end=DAY,
+        symbols=[SYMBOL],
+        data_kinds=["funding"],
+    )
+    assert corrupted["status"] == "FAILED"
+    assert corrupted["integrity_violation_count"] > 0
+    assert "response_body_hash_mismatch" in {
+        item["reason"] for item in corrupted["integrity_violations"]
+    }
+
+
+def test_max_batches_cannot_report_partial_window_as_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report = tmp_path / "report.json"
+    database = tmp_path / "partial.sqlite3"
+    monkeypatch.setattr(
+        backfill_script,
+        "parse_args",
+        lambda: SimpleNamespace(
+            start=DAY,
+            end=DAY + timedelta(days=1),
+            symbols=[SYMBOL],
+            kinds=["funding"],
+            database=database,
+            report=report,
+            timeout_sec=1.0,
+            request_pause_sec=0.0,
+            max_batches=1,
+        ),
+    )
+
+    def replay_with_fixture(store, *, data_kind, symbol, trading_date, timeout_sec):
+        assert data_kind == "funding"
+        return replay_funding_day(
+            store,
+            symbol=symbol,
+            trading_date=trading_date,
+            requester=_fake_requester,
+            timeout_sec=timeout_sec,
+        )
+
+    monkeypatch.setattr(
+        backfill_script, "replay_derivative_day", replay_with_fixture
+    )
+    assert backfill_script.main() == 2
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    assert payload["status"] == "FAILED_INCOMPLETE"
+    assert payload["max_batches_reached"] is True
+    assert payload["coverage_audit"]["missing_batches"] == 1
 
 
 def test_historical_api_batch_validation_is_atomic(tmp_path: Path) -> None:

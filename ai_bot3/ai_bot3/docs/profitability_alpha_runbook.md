@@ -183,6 +183,18 @@ python scripts/backfill_bybit_historical_archive.py `
 - 任何 ret_code、HTTP、分页或 chronology 失败都会使 batch failed；
 - liquidation 不从 OHLCV/REST 伪造。
 
+```powershell
+python scripts/backfill_bybit_historical_derivatives.py `
+  --start 2024-01-01 `
+  --end 2026-08-22 `
+  --symbols BTCUSDT ETHUSDT XRPUSDT SOLUSDT 1000PEPEUSDT `
+  --kinds funding open_interest basis `
+  --database data/bybit_public_pit.prelockbox.sqlite3 `
+  --report model_results/evaluation/bybit_derivatives_backfill_report.json
+```
+
+脚本结束时会独立审计整个请求窗，而不是只统计本次循环：逐日核对每个 symbol/kind、重新哈希保留的 HTTP 正文、重算 response ID 和 request manifest，并核对 batch/response/feature 行数及日期绑定。`--max-batches` 只是断点运行的工作量上限；窗口尚有任何 missing/failed 日时必须输出 `FAILED_INCOMPLETE` 并以非零状态退出，不能把局部回填报告为 PASS。
+
 每个 REST response 还必须在 `bybit_historical_api_responses.content_blob` 留存原始正文；store 写入和 PIT loader 都会重算 length/SHA，并复算 response ID 与 batch request manifest。旧记录若只有 SHA、没有正文，不得进入正式训练，必须重新回填。
 
 loader 会在冻结 feature sequence 下按 archive_id/api_batch_id 复算实际特征总行数，并要求与 completed manifest 的 `feature_observation_count` 完全一致。旧库即使 manifest 仍是 completed，只要曾缺行也必须重放该来源日，不能手工改 count。
