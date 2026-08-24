@@ -295,6 +295,33 @@ def test_runtime_fails_closed_when_horizon_model_is_modified(tmp_path):
     assert "hash mismatch" in alpha["reason"]
 
 
+def test_candidate_bundle_cannot_authorize_an_unapproved_horizon(tmp_path):
+    bundle = _bundle(tmp_path)
+    payload = json.loads(bundle.read_text(encoding="utf-8"))
+    model_path = payload["models"].pop("180")
+    model_hash = payload["model_sha256"].pop("180")
+    payload.update(
+        {
+            "release_stage": "candidate",
+            "profitability_gate": "PASSED",
+            "approved_horizons": [900],
+            "models": {"900": model_path},
+            "model_sha256": {"900": model_hash},
+        }
+    )
+    bundle.write_text(json.dumps(payload), encoding="utf-8")
+
+    alpha = generate_profitability_alpha_prediction(
+        _market_frame(),
+        symbol="BTCUSDT",
+        mode="scalping",
+        model_bundle_path=bundle,
+    )
+
+    assert alpha["status"] == "blocked"
+    assert "requested horizon is not approved" in alpha["reason"]
+
+
 def test_runtime_uses_fresh_symbol_specific_bybit_pit_features(tmp_path):
     bundle = _bundle(tmp_path, ("orderbook_spread_bps",))
     market = _market_frame()

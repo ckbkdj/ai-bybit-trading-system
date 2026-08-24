@@ -18,7 +18,10 @@ from core.evaluation.profitability_gate import (
     evaluate_profitability_gate,
     write_profitability_report,
 )
-from core.evaluation.profitability_rebuild import write_failed_outputs
+from core.evaluation.profitability_rebuild import (
+    _require_precommitted_horizon_gates,
+    write_failed_outputs,
+)
 from core.evaluation.statistical_governance import TrialLedger
 from core.release.profitability_release import (
     REQUIRED_EVIDENCE_REPORTS,
@@ -100,6 +103,41 @@ def test_profitability_gate_defaults_missing_release_evidence_to_failed():
     assert gate.profitability_gate == "FAILED"
     assert "execution_evidence" in gate.blockers
     assert "factor_ablation" in gate.blockers
+
+
+def test_portfolio_profit_cannot_authorize_a_failed_precommitted_horizon():
+    portfolio = evaluate_profitability_gate(
+        _profitable_trades(),
+        [{"net_return": value} for value in (0.01, 0.02, -0.001, 0.015, 0.005)],
+        initial_equity_usdt=100_000,
+        two_x_cost_net_return=0.01,
+        mark_to_market_max_drawdown=0.02,
+        mark_to_market_evidence_complete=True,
+        execution_evidence_complete=True,
+        factor_ablation_complete=True,
+    )
+    failed_horizon = evaluate_profitability_gate(
+        [],
+        [{"net_return": -0.01}] * 5,
+        initial_equity_usdt=100_000,
+        two_x_cost_net_return=-0.01,
+        mark_to_market_max_drawdown=0.0,
+        mark_to_market_evidence_complete=True,
+        execution_evidence_complete=False,
+        factor_ablation_complete=True,
+    )
+
+    scoped = _require_precommitted_horizon_gates(
+        portfolio, {180: portfolio, 900: failed_horizon}
+    )
+
+    assert portfolio.passed is True
+    assert scoped.passed is False
+    assert scoped.candidate_count == 0
+    assert "precommitted_horizon_profitability" in scoped.blockers
+    assert scoped.checks["precommitted_horizon_profitability"][
+        "passed_horizons"
+    ] == [180]
 
 
 def test_profitability_gate_does_not_treat_correlated_trades_as_independent():

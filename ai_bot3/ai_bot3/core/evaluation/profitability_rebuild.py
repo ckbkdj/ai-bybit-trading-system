@@ -163,6 +163,43 @@ def _atomic_json(path: Path, payload: object) -> None:
     temporary.replace(path)
 
 
+def _require_precommitted_horizon_gates(
+    portfolio_gate: ProfitabilityGateResult,
+    horizon_gates: Mapping[int, ProfitabilityGateResult],
+) -> ProfitabilityGateResult:
+    """Prevent a profitable portfolio from authorizing a failed horizon model."""
+
+    approved = sorted(
+        int(horizon) for horizon, result in horizon_gates.items() if result.passed
+    )
+    all_passed = bool(horizon_gates) and len(approved) == len(horizon_gates)
+    checks = dict(portfolio_gate.checks)
+    checks["precommitted_horizon_profitability"] = {
+        "passed": all_passed,
+        "required_horizons": sorted(int(value) for value in horizon_gates),
+        "passed_horizons": approved,
+        "policy": "every development-precommitted horizon must independently pass lockbox",
+    }
+    blocker_items = list(portfolio_gate.blockers)
+    if not all_passed:
+        blocker_items.append("precommitted_horizon_profitability")
+    blockers = tuple(dict.fromkeys(blocker_items))
+    passed = portfolio_gate.passed and all_passed
+    return ProfitabilityGateResult(
+        profitability_gate="PASSED" if passed else "FAILED",
+        stage="candidate" if passed else "rejected",
+        candidate_count=1 if passed else 0,
+        live_count=0,
+        checks=checks,
+        metrics={
+            **portfolio_gate.metrics,
+            "precommitted_horizons": sorted(int(value) for value in horizon_gates),
+            "individually_passed_horizons": approved,
+        },
+        blockers=blockers,
+    )
+
+
 def _ablation_ledger_summary(result: Mapping[str, object]) -> dict[str, object]:
     return {
         key: result.get(key)
@@ -1830,7 +1867,9 @@ class ProfitabilityRebuild:
             },
         )
         walk_forward: list[dict[str, object]] = []
-        development_signals: list[SignalEvent] = []
+        development_signals_by_horizon: dict[int, list[SignalEvent]] = {
+            horizon: [] for horizon in HORIZONS_SEC
+        }
         candidate_configs = (
             TwoStageConfig(
                 direction_iterations=80,
@@ -1982,7 +2021,7 @@ class ProfitabilityRebuild:
                     predictions,
                     meta_threshold=selection.selected_config.meta_trade_probability,
                 )
-                development_signals.extend(signals)
+                development_signals_by_horizon[horizon].extend(signals)
                 report = backtest.run(signals, market)
                 self.ledger.append_event(
                     self.trial_id,
@@ -2017,6 +2056,69 @@ class ProfitabilityRebuild:
                     }
                 )
 
+        horizon_development_gates: dict[int, ProfitabilityGateResult] = {}
+        horizon_development_reports: dict[int, dict[str, object]] = {}
+        for horizon in HORIZONS_SEC:
+            horizon_signals = development_signals_by_horizon[horizon]
+            horizon_report = backtest.run(horizon_signals, market)
+            horizon_stress = backtest.run(
+                horizon_signals, market, cost_multiplier=2.0
+            )
+            horizon_execution_evidence = _execution_release_evidence(
+                horizon_report
+            )
+            horizon_gate = evaluate_development_gate(
+                horizon_report.trades,
+                [
+                    fold
+                    for fold in walk_forward
+                    if int(fold["horizon_sec"]) == horizon
+                ],
+                initial_equity_usdt=horizon_report.initial_equity_usdt,
+                two_x_cost_net_return=horizon_stress.net_return,
+                mark_to_market_max_drawdown=horizon_report.max_drawdown,
+                mark_to_market_evidence_complete=horizon_report.mark_to_market_used,
+                execution_evidence_complete=bool(
+                    horizon_execution_evidence[
+                        "candidate_backtest_execution_evidence_complete"
+                    ]
+                ),
+                factor_ablation_complete=bool(
+                    factor_report["all_required_groups_evaluated"]
+                ),
+                thresholds=ProfitabilityThresholds(),
+            )
+            horizon_development_gates[horizon] = horizon_gate
+            horizon_development_reports[horizon] = {
+                "gate": horizon_gate.to_dict(),
+                "normal_cost": horizon_report.to_dict(include_trades=False),
+                "two_x_cost": horizon_stress.to_dict(include_trades=False),
+            }
+            self.ledger.append_event(
+                self.trial_id,
+                "running",
+                {
+                    "phase": "development_horizon_gate_scored",
+                    "horizon_sec": horizon,
+                    "profitability_gate": horizon_gate.profitability_gate,
+                    "blockers": list(horizon_gate.blockers),
+                },
+            )
+        development_eligible_horizons = tuple(
+            horizon
+            for horizon in HORIZONS_SEC
+            if horizon_development_gates[horizon].passed
+        )
+        development_signals = [
+            signal
+            for horizon in development_eligible_horizons
+            for signal in development_signals_by_horizon[horizon]
+        ]
+        eligible_walk_forward = [
+            fold
+            for fold in walk_forward
+            if int(fold["horizon_sec"]) in development_eligible_horizons
+        ]
         development_report = backtest.run(development_signals, market)
         development_stress = backtest.run(
             development_signals, market, cost_multiplier=2.0
@@ -2029,7 +2131,7 @@ class ProfitabilityRebuild:
         )
         development_gate = evaluate_development_gate(
             development_report.trades,
-            walk_forward,
+            eligible_walk_forward,
             initial_equity_usdt=development_report.initial_equity_usdt,
             two_x_cost_net_return=development_stress.net_return,
             mark_to_market_max_drawdown=development_report.max_drawdown,
@@ -2048,6 +2150,16 @@ class ProfitabilityRebuild:
                 "method": "nested pooled-panel walk-forward; inner OOS selects parameters, outer OOS scores once",
                 "outer_oos_used_for_tuning": False,
                 "folds": walk_forward,
+                "development_horizon_gates": {
+                    str(horizon): report
+                    for horizon, report in horizon_development_reports.items()
+                },
+                "development_eligible_horizons": list(
+                    development_eligible_horizons
+                ),
+                "candidate_horizon_selection_source": (
+                    "development_outer_oos_only_before_lockbox"
+                ),
                 "positive_fold_ratio": development_gate.metrics[
                     "positive_walk_forward_fold_ratio"
                 ],
@@ -2130,6 +2242,13 @@ class ProfitabilityRebuild:
                 for horizon, columns in model_feature_columns_by_horizon.items()
             },
             "retained_factor_groups": list(retained_groups),
+            "approved_horizons": [],
+            "development_eligible_horizons": list(
+                development_eligible_horizons
+            ),
+            "candidate_horizon_selection_source": (
+                "development_outer_oos_only_before_lockbox"
+            ),
             "lockbox_fingerprint": None,
             "lockbox_start_by_horizon": {
                 str(horizon): value.isoformat().replace("+00:00", "Z")
@@ -2285,9 +2404,11 @@ class ProfitabilityRebuild:
             },
         )
         lockbox_panel_fingerprints: dict[int, str] = {}
-        lockbox_signals: list[SignalEvent] = []
+        lockbox_signals_by_horizon: dict[int, list[SignalEvent]] = {
+            horizon: [] for horizon in development_eligible_horizons
+        }
         lockbox_bybit_evidence_by_horizon: dict[int, dict[str, object]] = {}
-        for horizon in HORIZONS_SEC:
+        for horizon in development_eligible_horizons:
             lockbox_parts: list[pd.DataFrame] = []
             max_wait_sec = max(30, min(300, horizon // 2))
             timeframe = HORIZON_TIMEFRAME[horizon]
@@ -2402,7 +2523,7 @@ class ProfitabilityRebuild:
                 final_models[horizon].predict(lockbox_panel),
                 horizon,
             )
-            lockbox_signals.extend(horizon_signals)
+            lockbox_signals_by_horizon[horizon].extend(horizon_signals)
             self.ledger.append_event(
                 self.trial_id,
                 "running",
@@ -2425,6 +2546,59 @@ class ProfitabilityRebuild:
             }
         )
 
+        horizon_lockbox_gates: dict[int, ProfitabilityGateResult] = {}
+        horizon_lockbox_reports: dict[int, dict[str, object]] = {}
+        for horizon in development_eligible_horizons:
+            horizon_signals = lockbox_signals_by_horizon[horizon]
+            horizon_report = backtest.run(horizon_signals, market)
+            horizon_stress = backtest.run(
+                horizon_signals, market, cost_multiplier=2.0
+            )
+            horizon_execution_evidence = _execution_release_evidence(
+                horizon_report
+            )
+            horizon_gate = evaluate_profitability_gate(
+                horizon_report.trades,
+                [
+                    fold
+                    for fold in walk_forward
+                    if int(fold["horizon_sec"]) == horizon
+                ],
+                initial_equity_usdt=horizon_report.initial_equity_usdt,
+                two_x_cost_net_return=horizon_stress.net_return,
+                mark_to_market_max_drawdown=horizon_report.max_drawdown,
+                mark_to_market_evidence_complete=horizon_report.mark_to_market_used,
+                execution_evidence_complete=bool(
+                    horizon_execution_evidence[
+                        "candidate_backtest_execution_evidence_complete"
+                    ]
+                ),
+                factor_ablation_complete=bool(
+                    factor_report["all_required_groups_evaluated"]
+                ),
+                thresholds=ProfitabilityThresholds(),
+            )
+            horizon_lockbox_gates[horizon] = horizon_gate
+            horizon_lockbox_reports[horizon] = {
+                "gate": horizon_gate.to_dict(),
+                "normal_cost": horizon_report.to_dict(include_trades=True),
+                "two_x_cost": horizon_stress.to_dict(include_trades=False),
+            }
+            self.ledger.append_event(
+                self.trial_id,
+                "running",
+                {
+                    "phase": "lockbox_horizon_gate_scored",
+                    "horizon_sec": horizon,
+                    "profitability_gate": horizon_gate.profitability_gate,
+                    "blockers": list(horizon_gate.blockers),
+                },
+            )
+        lockbox_signals = [
+            signal
+            for horizon in development_eligible_horizons
+            for signal in lockbox_signals_by_horizon[horizon]
+        ]
         lockbox_report = backtest.run(lockbox_signals, market)
         stressed_report = backtest.run(lockbox_signals, market, cost_multiplier=2.0)
         lockbox_execution_evidence = _execution_release_evidence(lockbox_report)
@@ -2435,7 +2609,7 @@ class ProfitabilityRebuild:
         )
         gate = evaluate_profitability_gate(
             lockbox_report.trades,
-            walk_forward,
+            eligible_walk_forward,
             initial_equity_usdt=lockbox_report.initial_equity_usdt,
             two_x_cost_net_return=stressed_report.net_return,
             mark_to_market_max_drawdown=lockbox_report.max_drawdown,
@@ -2445,6 +2619,9 @@ class ProfitabilityRebuild:
             ),
             factor_ablation_complete=bool(factor_report["all_required_groups_evaluated"]),
             thresholds=ProfitabilityThresholds(),
+        )
+        gate = _require_precommitted_horizon_gates(
+            gate, horizon_lockbox_gates
         )
         if not gate.passed:
             _archive_candidate_manifest(output, self.trial_id)
@@ -2466,6 +2643,16 @@ class ProfitabilityRebuild:
                     for horizon, evidence in lockbox_bybit_evidence_by_horizon.items()
                 },
                 "execution_evidence": lockbox_execution_evidence,
+                "development_eligible_horizons": list(
+                    development_eligible_horizons
+                ),
+                "candidate_horizon_selection_source": (
+                    "development_outer_oos_only_before_lockbox"
+                ),
+                "horizon_results": {
+                    str(horizon): report
+                    for horizon, report in horizon_lockbox_reports.items()
+                },
                 "final_development_selection": final_selection,
                 "result": lockbox_report.to_dict(include_trades=True),
             },
@@ -2516,13 +2703,34 @@ class ProfitabilityRebuild:
                 "model_family": "profitability_two_stage",
                 "release_stage": "candidate" if gate.passed else "rejected",
                 "profitability_gate": gate.profitability_gate,
-                "models": model_paths,
-                "model_sha256": model_sha256,
+                "models": {
+                    key: value
+                    for key, value in model_paths.items()
+                    if not gate.passed
+                    or int(key) in development_eligible_horizons
+                },
+                "model_sha256": {
+                    key: value
+                    for key, value in model_sha256.items()
+                    if not gate.passed
+                    or int(key) in development_eligible_horizons
+                },
                 "formal_feature_columns": {
                     str(horizon): list(columns)
                     for horizon, columns in model_feature_columns_by_horizon.items()
+                    if not gate.passed
+                    or horizon in development_eligible_horizons
                 },
                 "retained_factor_groups": list(retained_groups),
+                "approved_horizons": (
+                    list(development_eligible_horizons) if gate.passed else []
+                ),
+                "development_eligible_horizons": list(
+                    development_eligible_horizons
+                ),
+                "candidate_horizon_selection_source": (
+                    "development_outer_oos_only_before_lockbox"
+                ),
                 "lockbox_fingerprint": lockbox_fingerprint,
                 "lockbox_consumed": True,
                 "code_commit": self.config.code_commit,

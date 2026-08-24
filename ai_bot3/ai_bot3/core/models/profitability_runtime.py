@@ -423,6 +423,19 @@ def generate_profitability_alpha_prediction(
         hashes = bundle.get("model_sha256")
         if not isinstance(models, Mapping) or not isinstance(hashes, Mapping):
             raise ValueError("model paths or hashes are missing")
+        if bundle.get("release_stage") == "candidate":
+            approved_raw = bundle.get("approved_horizons")
+            if not isinstance(approved_raw, list) or not approved_raw:
+                raise ValueError("candidate bundle has no approved horizons")
+            approved_horizons = {int(value) for value in approved_raw}
+            if set(models) != {str(value) for value in approved_horizons}:
+                raise ValueError(
+                    "candidate bundle model set differs from approved horizons"
+                )
+            if horizon not in approved_horizons:
+                raise ValueError(
+                    "requested horizon is not approved by profitability evidence"
+                )
         relative = Path(str(models[str(horizon)]))
         if relative.is_absolute():
             raise ValueError("model path must be relative to its signed bundle")
