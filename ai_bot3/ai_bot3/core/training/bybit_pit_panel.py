@@ -127,12 +127,36 @@ class BybitPITFeatureSource:
     def maximum_invalidation_rowid(self) -> int:
         return self.snapshot_watermarks()[1]
 
+    def evidence_watermarks(self) -> tuple[int, int]:
+        """Freeze append-only capture-audit and cross-store import receipts."""
+
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN")
+            values: list[int] = []
+            for table in ("bybit_live_capture_audits", "bybit_pit_imports"):
+                exists = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,),
+                ).fetchone()
+                values.append(
+                    int(
+                        connection.execute(
+                            f"SELECT COALESCE(MAX(rowid),0) FROM {table}"
+                        ).fetchone()[0]
+                    )
+                    if exists
+                    else 0
+                )
+        return values[0], values[1]
+
     @staticmethod
     def _snapshot_digest(
         frame: pd.DataFrame,
         *,
         maximum_sequence: int,
         maximum_invalidation_rowid: int,
+        maximum_capture_audit_rowid: int,
+        maximum_pit_import_rowid: int,
     ) -> str:
         columns = [
             "sequence",
@@ -160,7 +184,9 @@ class BybitPITFeatureSource:
         digest.update(
             json.dumps(
                 {
+                    "maximum_capture_audit_rowid": maximum_capture_audit_rowid,
                     "maximum_invalidation_rowid": maximum_invalidation_rowid,
+                    "maximum_pit_import_rowid": maximum_pit_import_rowid,
                     "maximum_sequence": maximum_sequence,
                 },
                 sort_keys=True,
@@ -180,6 +206,8 @@ class BybitPITFeatureSource:
         *,
         maximum_sequence: int | None = None,
         maximum_invalidation_rowid: int | None = None,
+        maximum_capture_audit_rowid: int | None = None,
+        maximum_pit_import_rowid: int | None = None,
         minimum_decision_at: object | None = None,
         maximum_decision_at: object | None = None,
         symbols: Sequence[str] | None = None,
@@ -201,6 +229,12 @@ class BybitPITFeatureSource:
             raise ValueError(
                 "Bybit PIT observation and invalidation watermarks must be frozen together"
             )
+        if (maximum_capture_audit_rowid is None) != (
+            maximum_pit_import_rowid is None
+        ):
+            raise ValueError(
+                "Bybit audit and import receipt watermarks must be frozen together"
+            )
         symbol_clause = ""
         symbol_parameters: tuple[object, ...] = ()
         if requested_symbols:
@@ -208,6 +242,9 @@ class BybitPITFeatureSource:
             symbol_clause = f" AND o.symbol IN ({symbol_placeholders})"
             symbol_parameters = requested_symbols
         current_sequence, current_invalidation_rowid = self.snapshot_watermarks()
+        current_capture_audit_rowid, current_pit_import_rowid = (
+            self.evidence_watermarks()
+        )
         frozen_sequence = (
             current_sequence if maximum_sequence is None else int(maximum_sequence)
         )
@@ -216,10 +253,22 @@ class BybitPITFeatureSource:
             if maximum_invalidation_rowid is None
             else int(maximum_invalidation_rowid)
         )
+        frozen_capture_audit_rowid = (
+            current_capture_audit_rowid
+            if maximum_capture_audit_rowid is None
+            else int(maximum_capture_audit_rowid)
+        )
+        frozen_pit_import_rowid = (
+            current_pit_import_rowid
+            if maximum_pit_import_rowid is None
+            else int(maximum_pit_import_rowid)
+        )
         if frozen_sequence < 0:
             raise ValueError("Bybit PIT maximum_sequence cannot be negative")
         if frozen_invalidation_rowid < 0:
             raise ValueError("Bybit PIT maximum_invalidation_rowid cannot be negative")
+        if frozen_capture_audit_rowid < 0 or frozen_pit_import_rowid < 0:
+            raise ValueError("Bybit evidence receipt watermarks cannot be negative")
         decision_minimum = pd.to_datetime(
             minimum_decision_at, utc=True, errors="coerce"
         )
@@ -364,6 +413,8 @@ class BybitPITFeatureSource:
                 "feature_coverage": {},
                 "snapshot_maximum_sequence": frozen_sequence,
                 "snapshot_maximum_invalidation_rowid": frozen_invalidation_rowid,
+                "snapshot_maximum_capture_audit_rowid": frozen_capture_audit_rowid,
+                "snapshot_maximum_pit_import_rowid": frozen_pit_import_rowid,
                 "minimum_decision_at": sql_timestamp(decision_minimum),
                 "maximum_decision_at": sql_timestamp(decision_maximum),
                 "effective_available_at_minimum": available_minimum_text,
@@ -371,6 +422,8 @@ class BybitPITFeatureSource:
                     frame,
                     maximum_sequence=frozen_sequence,
                     maximum_invalidation_rowid=frozen_invalidation_rowid,
+                    maximum_capture_audit_rowid=frozen_capture_audit_rowid,
+                    maximum_pit_import_rowid=frozen_pit_import_rowid,
                 ),
                 "invalidated_observation_count": invalidated_observation_count,
             }
@@ -393,6 +446,8 @@ class BybitPITFeatureSource:
                 "rejected_source_contract_count": rejected_source_contract_count,
                 "snapshot_maximum_sequence": frozen_sequence,
                 "snapshot_maximum_invalidation_rowid": frozen_invalidation_rowid,
+                "snapshot_maximum_capture_audit_rowid": frozen_capture_audit_rowid,
+                "snapshot_maximum_pit_import_rowid": frozen_pit_import_rowid,
                 "minimum_decision_at": sql_timestamp(decision_minimum),
                 "maximum_decision_at": sql_timestamp(decision_maximum),
                 "effective_available_at_minimum": available_minimum_text,
@@ -400,6 +455,8 @@ class BybitPITFeatureSource:
                     frame,
                     maximum_sequence=frozen_sequence,
                     maximum_invalidation_rowid=frozen_invalidation_rowid,
+                    maximum_capture_audit_rowid=frozen_capture_audit_rowid,
+                    maximum_pit_import_rowid=frozen_pit_import_rowid,
                 ),
                 "invalidated_observation_count": invalidated_observation_count,
             }
@@ -555,8 +612,10 @@ class BybitPITFeatureSource:
                               symbols_json,topic_counts_json,event_type_counts_json,
                               interval_count,longest_interval_sec,manifest_sha256,status,error
                          FROM bybit_live_capture_audits
-                        WHERE status='completed'
+                        WHERE status='completed' AND rowid<=?
                         ORDER BY created_at,audit_id"""
+                    ,
+                    (frozen_capture_audit_rowid,),
                 ).fetchall()
                 for audit_row in audit_rows:
                     record = dict(audit_row)
@@ -592,8 +651,11 @@ class BybitPITFeatureSource:
                     """SELECT import_id,imported_at,source_database,source_audit_id,
                               selection_json,source_counts_json,inserted_counts_json,
                               manifest_sha256,status
-                         FROM bybit_pit_imports WHERE status='completed'
+                         FROM bybit_pit_imports
+                        WHERE status='completed' AND rowid<=?
                          ORDER BY imported_at,import_id"""
+                    ,
+                    (frozen_pit_import_rowid,),
                 ).fetchall():
                     record = dict(import_row)
                     for key in ("selection", "source_counts", "inserted_counts"):
@@ -665,6 +727,8 @@ class BybitPITFeatureSource:
             "pit_import_count": len(pit_imports),
             "snapshot_maximum_sequence": frozen_sequence,
             "snapshot_maximum_invalidation_rowid": frozen_invalidation_rowid,
+            "snapshot_maximum_capture_audit_rowid": frozen_capture_audit_rowid,
+            "snapshot_maximum_pit_import_rowid": frozen_pit_import_rowid,
             "minimum_decision_at": sql_timestamp(decision_minimum),
             "maximum_decision_at": sql_timestamp(decision_maximum),
             "effective_available_at_minimum": available_minimum_text,
@@ -672,6 +736,8 @@ class BybitPITFeatureSource:
                 frame,
                 maximum_sequence=frozen_sequence,
                 maximum_invalidation_rowid=frozen_invalidation_rowid,
+                maximum_capture_audit_rowid=frozen_capture_audit_rowid,
+                maximum_pit_import_rowid=frozen_pit_import_rowid,
             ),
             "pit_policy": "symbol-specific latest available_at at or before decision_at with registry staleness cutoff",
         }

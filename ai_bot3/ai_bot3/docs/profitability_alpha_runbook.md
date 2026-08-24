@@ -212,6 +212,8 @@ python scripts/merge_bybit_liquidation_capture.py `
 
 合并是幂等的：同一内容重复运行新增数为 0；同 ID 异内容立即失败。它不复制数 GB 无关 live orderbook/trades，也不删除或覆盖任一来源库。禁止在 archive/derivatives writer 仍写 destination 时运行。
 
+启动 profitability trial 时记录的 Bybit 快照必须同时包含 feature sequence、invalidation rowid、capture audit rowid 和 import receipt rowid。实验启动后新增的 audit/import 不得进入该 trial；需要使用新证据时必须形成新 trial ID。不要手工 UPDATE/DELETE raw、feature、invalidation、completed archive/API batch、API response、audit、interval 或 import 表；数据库 trigger 会失败关闭。
+
 ## 7. SQLite WAL 安全恢复
 
 ### 7.1 何时处理

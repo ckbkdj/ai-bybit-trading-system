@@ -248,6 +248,98 @@ class BybitPublicPITStore:
                     manifest_sha256 TEXT NOT NULL,
                     status TEXT NOT NULL
                 );
+                CREATE TRIGGER IF NOT EXISTS reject_bybit_raw_event_update
+                BEFORE UPDATE ON bybit_raw_public_events
+                BEGIN
+                    SELECT RAISE(ABORT,'Bybit raw events are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS reject_bybit_raw_event_delete
+                BEFORE DELETE ON bybit_raw_public_events
+                BEGIN
+                    SELECT RAISE(ABORT,'Bybit raw events are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS reject_bybit_feature_update
+                BEFORE UPDATE ON bybit_feature_observations
+                BEGIN
+                    SELECT RAISE(ABORT,'Bybit feature observations are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS reject_bybit_feature_delete
+                BEFORE DELETE ON bybit_feature_observations
+                BEGIN
+                    SELECT RAISE(ABORT,'Bybit feature observations are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS reject_bybit_invalidation_update
+                BEFORE UPDATE ON bybit_feature_invalidations
+                BEGIN
+                    SELECT RAISE(ABORT,'Bybit invalidations are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS reject_bybit_invalidation_delete
+                BEFORE DELETE ON bybit_feature_invalidations
+                BEGIN
+                    SELECT RAISE(ABORT,'Bybit invalidations are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS reject_completed_bybit_archive_update
+                BEFORE UPDATE ON bybit_historical_archive_files
+                WHEN OLD.status='completed'
+                BEGIN
+                    SELECT RAISE(ABORT,'completed Bybit archive evidence is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS reject_bybit_archive_delete
+                BEFORE DELETE ON bybit_historical_archive_files
+                BEGIN
+                    SELECT RAISE(ABORT,'Bybit archive evidence is append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS reject_completed_bybit_api_batch_update
+                BEFORE UPDATE ON bybit_historical_api_batches
+                WHEN OLD.status='completed'
+                BEGIN
+                    SELECT RAISE(ABORT,'completed Bybit API evidence is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS reject_bybit_api_batch_delete
+                BEFORE DELETE ON bybit_historical_api_batches
+                BEGIN
+                    SELECT RAISE(ABORT,'Bybit API evidence is append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS reject_bybit_api_response_update
+                BEFORE UPDATE ON bybit_historical_api_responses
+                BEGIN
+                    SELECT RAISE(ABORT,'Bybit API responses are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS reject_bybit_api_response_delete
+                BEFORE DELETE ON bybit_historical_api_responses
+                BEGIN
+                    SELECT RAISE(ABORT,'Bybit API responses are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS reject_bybit_capture_audit_update
+                BEFORE UPDATE ON bybit_live_capture_audits
+                BEGIN
+                    SELECT RAISE(ABORT,'Bybit capture audits are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS reject_bybit_capture_audit_delete
+                BEFORE DELETE ON bybit_live_capture_audits
+                BEGIN
+                    SELECT RAISE(ABORT,'Bybit capture audits are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS reject_bybit_capture_interval_update
+                BEFORE UPDATE ON bybit_live_capture_intervals
+                BEGIN
+                    SELECT RAISE(ABORT,'Bybit capture intervals are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS reject_bybit_capture_interval_delete
+                BEFORE DELETE ON bybit_live_capture_intervals
+                BEGIN
+                    SELECT RAISE(ABORT,'Bybit capture intervals are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS reject_bybit_pit_import_update
+                BEFORE UPDATE ON bybit_pit_imports
+                BEGIN
+                    SELECT RAISE(ABORT,'Bybit PIT imports are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS reject_bybit_pit_import_delete
+                BEFORE DELETE ON bybit_pit_imports
+                BEGIN
+                    SELECT RAISE(ABORT,'Bybit PIT imports are append-only');
+                END;
                 """
             )
             feature_columns = {
@@ -716,7 +808,8 @@ class BybitPublicPITStore:
                                ELSE bybit_historical_archive_files.feature_observation_count
                            END,
                            status=excluded.status,
-                           error=excluded.error""",
+                           error=excluded.error
+                       WHERE bybit_historical_archive_files.status <> 'completed'""",
                     (
                         archive_record["archive_id"],
                         archive_record["data_kind"],
@@ -744,33 +837,50 @@ class BybitPublicPITStore:
                 for response in api_response_records:
                     if str(response["batch_id"]) != str(api_batch_record["batch_id"]):
                         raise ValueError("API response references another batch")
+                    response_columns = (
+                        "response_id",
+                        "batch_id",
+                        "request_url",
+                        "requested_at",
+                        "received_at",
+                        "http_status",
+                        "content_length",
+                        "content_sha256",
+                        "rows_read",
+                        "ret_code",
+                    )
+                    response_values = (
+                        response["response_id"],
+                        response["batch_id"],
+                        response["request_url"],
+                        response["requested_at"],
+                        response["received_at"],
+                        int(response["http_status"]),
+                        int(response["content_length"]),
+                        response["content_sha256"],
+                        int(response["rows_read"]),
+                        int(response["ret_code"]),
+                    )
+                    prior_response = connection.execute(
+                        f"""SELECT {','.join(response_columns)}
+                              FROM bybit_historical_api_responses
+                             WHERE response_id=?""",
+                        (response["response_id"],),
+                    ).fetchone()
+                    if prior_response:
+                        if tuple(prior_response[column] for column in response_columns) != (
+                            response_values
+                        ):
+                            raise CaptureConflict(
+                                "historical API response id has different content"
+                            )
+                        continue
                     connection.execute(
                         """INSERT INTO bybit_historical_api_responses(
                                response_id,batch_id,request_url,requested_at,received_at,
                                http_status,content_length,content_sha256,rows_read,ret_code
-                           ) VALUES (?,?,?,?,?,?,?,?,?,?)
-                           ON CONFLICT(response_id) DO UPDATE SET
-                               batch_id=excluded.batch_id,
-                               request_url=excluded.request_url,
-                               requested_at=excluded.requested_at,
-                               received_at=excluded.received_at,
-                               http_status=excluded.http_status,
-                               content_length=excluded.content_length,
-                               content_sha256=excluded.content_sha256,
-                               rows_read=excluded.rows_read,
-                               ret_code=excluded.ret_code""",
-                        (
-                            response["response_id"],
-                            response["batch_id"],
-                            response["request_url"],
-                            response["requested_at"],
-                            response["received_at"],
-                            int(response["http_status"]),
-                            int(response["content_length"]),
-                            response["content_sha256"],
-                            int(response["rows_read"]),
-                            int(response["ret_code"]),
-                        ),
+                           ) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                        response_values,
                     )
                 connection.execute(
                     """INSERT INTO bybit_historical_api_batches(
@@ -791,7 +901,8 @@ class BybitPublicPITStore:
                            feature_observation_count=excluded.feature_observation_count,
                            request_manifest_sha256=excluded.request_manifest_sha256,
                            status=excluded.status,
-                           error=excluded.error""",
+                           error=excluded.error
+                       WHERE bybit_historical_api_batches.status <> 'completed'""",
                     (
                         api_batch_record["batch_id"],
                         api_batch_record["data_kind"],

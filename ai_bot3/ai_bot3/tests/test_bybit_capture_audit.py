@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from copy import deepcopy
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -123,6 +124,43 @@ def test_audited_liquidations_merge_append_only_and_unlock_continuity(tmp_path):
     assert len(history) == 10
     assert evidence["live_capture_audit_count"] == 1
     assert evidence["pit_import_count"] == 1
+    frozen_source = BybitPITFeatureSource(destination_path)
+    frozen_sequence, frozen_invalidation = frozen_source.snapshot_watermarks()
+    frozen_audit, frozen_import = frozen_source.evidence_watermarks()
+    destination_store = BybitPublicPITStore(destination_path)
+    second_audit = audit_live_capture(destination_store, maximum_gap_sec=89.0)
+    _, frozen_evidence = frozen_source.load(
+        ["liquidation_imbalance_5m"],
+        maximum_sequence=frozen_sequence,
+        maximum_invalidation_rowid=frozen_invalidation,
+        maximum_capture_audit_rowid=frozen_audit,
+        maximum_pit_import_rowid=frozen_import,
+        symbols=SYMBOLS,
+    )
+    _, current_evidence = frozen_source.load(
+        ["liquidation_imbalance_5m"], symbols=SYMBOLS
+    )
+    assert frozen_evidence["live_capture_audit_count"] == 1
+    assert current_evidence["live_capture_audit_count"] == 2
+    assert second_audit.audit_id not in {
+        item["audit_id"] for item in frozen_evidence["live_capture_audits"]
+    }
+    assert frozen_evidence["snapshot_sha256"] != current_evidence["snapshot_sha256"]
+
+    for statement in (
+        "UPDATE bybit_live_capture_audits SET status='failed'",
+        "DELETE FROM bybit_raw_public_events WHERE event_id='raw-0'",
+        "UPDATE bybit_feature_observations SET value=0",
+        "DELETE FROM bybit_pit_imports",
+    ):
+        try:
+            with destination_store.connect() as connection:
+                connection.execute(statement)
+        except sqlite3.IntegrityError as exc:
+            assert "append-only" in str(exc) or "immutable" in str(exc)
+        else:
+            raise AssertionError(f"immutable Bybit evidence accepted: {statement}")
+    destination_store.close()
     report = _evaluate_bybit_pit_ablation(
         {},
         {},

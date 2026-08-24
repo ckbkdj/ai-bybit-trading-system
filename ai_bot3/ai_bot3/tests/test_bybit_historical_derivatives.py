@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -235,3 +236,17 @@ def test_completed_historical_api_evidence_cannot_be_downgraded_by_late_failure(
         "feature_observation_count": completed.feature_observation_count,
         "response_count": completed.response_count,
     }
+    repeated = replay_funding_day(
+        store, symbol=SYMBOL, trading_date=DAY, requester=_fake_requester
+    )
+    assert repeated.feature_observation_count == 0
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        with store.connect() as connection:
+            connection.execute(
+                "UPDATE bybit_historical_api_batches SET status='failed'"
+            )
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        with store.connect() as connection:
+            connection.execute(
+                "UPDATE bybit_historical_api_responses SET rows_read=0"
+            )

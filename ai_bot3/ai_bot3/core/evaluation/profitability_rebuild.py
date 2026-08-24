@@ -1943,6 +1943,8 @@ class ProfitabilityRebuild:
         self.ledger = TrialLedger(config.trial_ledger_path)
         self.bybit_pit_snapshot_maximum_sequence = None
         self.bybit_pit_snapshot_maximum_invalidation_rowid = None
+        self.bybit_pit_snapshot_maximum_capture_audit_rowid = None
+        self.bybit_pit_snapshot_maximum_import_rowid = None
         if config.bybit_pit_store_path is not None:
             bybit_source = BybitPITFeatureSource(
                 config.bybit_pit_store_path
@@ -1951,6 +1953,10 @@ class ProfitabilityRebuild:
                 self.bybit_pit_snapshot_maximum_sequence,
                 self.bybit_pit_snapshot_maximum_invalidation_rowid,
             ) = bybit_source.snapshot_watermarks()
+            (
+                self.bybit_pit_snapshot_maximum_capture_audit_rowid,
+                self.bybit_pit_snapshot_maximum_import_rowid,
+            ) = bybit_source.evidence_watermarks()
         self.macro_pit_snapshot_maximum_sequence = None
         if config.macro_pit_store_path is not None:
             self.macro_pit_snapshot_maximum_sequence = MacroPITFeatureSource(
@@ -1990,6 +1996,12 @@ class ProfitabilityRebuild:
             "bybit_pit_snapshot_maximum_sequence": self.bybit_pit_snapshot_maximum_sequence,
             "bybit_pit_snapshot_maximum_invalidation_rowid": (
                 self.bybit_pit_snapshot_maximum_invalidation_rowid
+            ),
+            "bybit_pit_snapshot_maximum_capture_audit_rowid": (
+                self.bybit_pit_snapshot_maximum_capture_audit_rowid
+            ),
+            "bybit_pit_snapshot_maximum_import_rowid": (
+                self.bybit_pit_snapshot_maximum_import_rowid
             ),
             "macro_pit_store": (
                 str(config.macro_pit_store_path.resolve())
@@ -2087,6 +2099,12 @@ class ProfitabilityRebuild:
                     maximum_sequence=self.bybit_pit_snapshot_maximum_sequence,
                     maximum_invalidation_rowid=(
                         self.bybit_pit_snapshot_maximum_invalidation_rowid
+                    ),
+                    maximum_capture_audit_rowid=(
+                        self.bybit_pit_snapshot_maximum_capture_audit_rowid
+                    ),
+                    maximum_pit_import_rowid=(
+                        self.bybit_pit_snapshot_maximum_import_rowid
                     ),
                     minimum_decision_at=decision_minimum,
                     maximum_decision_at=development_decision_end,
@@ -2758,6 +2776,12 @@ class ProfitabilityRebuild:
         lockbox_bybit_maximum_invalidation_rowid = (
             self.bybit_pit_snapshot_maximum_invalidation_rowid
         )
+        lockbox_bybit_maximum_capture_audit_rowid = (
+            self.bybit_pit_snapshot_maximum_capture_audit_rowid
+        )
+        lockbox_bybit_maximum_import_rowid = (
+            self.bybit_pit_snapshot_maximum_import_rowid
+        )
         lockbox_bybit_snapshot: dict[str, object] = {
             "policy": "reuse_frozen_development_snapshot",
             "database": (
@@ -2767,6 +2791,10 @@ class ProfitabilityRebuild:
             "snapshot_maximum_invalidation_rowid": (
                 lockbox_bybit_maximum_invalidation_rowid
             ),
+            "snapshot_maximum_capture_audit_rowid": (
+                lockbox_bybit_maximum_capture_audit_rowid
+            ),
+            "snapshot_maximum_import_rowid": lockbox_bybit_maximum_import_rowid,
         }
         if self.config.lockbox_bybit_pit_store_path is not None:
             # This store is deliberately not instantiated, stat-ed, or queried
@@ -2779,12 +2807,22 @@ class ProfitabilityRebuild:
                 lockbox_bybit_maximum_sequence,
                 lockbox_bybit_maximum_invalidation_rowid,
             ) = lockbox_bybit_source.snapshot_watermarks()
+            (
+                lockbox_bybit_maximum_capture_audit_rowid,
+                lockbox_bybit_maximum_import_rowid,
+            ) = lockbox_bybit_source.evidence_watermarks()
             lockbox_bybit_snapshot = {
                 "policy": "separate_post_development_snapshot",
                 "database": str(lockbox_bybit_source.path),
                 "snapshot_maximum_sequence": lockbox_bybit_maximum_sequence,
                 "snapshot_maximum_invalidation_rowid": (
                     lockbox_bybit_maximum_invalidation_rowid
+                ),
+                "snapshot_maximum_capture_audit_rowid": (
+                    lockbox_bybit_maximum_capture_audit_rowid
+                ),
+                "snapshot_maximum_import_rowid": (
+                    lockbox_bybit_maximum_import_rowid
                 ),
             }
         kline_snapshot_sha256 = _sha256_file(self.config.feature_store_path)
@@ -2889,6 +2927,12 @@ class ProfitabilityRebuild:
                         maximum_sequence=lockbox_bybit_maximum_sequence,
                         maximum_invalidation_rowid=(
                             lockbox_bybit_maximum_invalidation_rowid
+                        ),
+                        maximum_capture_audit_rowid=(
+                            lockbox_bybit_maximum_capture_audit_rowid
+                        ),
+                        maximum_pit_import_rowid=(
+                            lockbox_bybit_maximum_import_rowid
                         ),
                         minimum_decision_at=lockbox_start_by_horizon[horizon],
                         maximum_decision_at=max(last_complete_by_symbol.values()),

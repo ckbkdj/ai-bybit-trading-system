@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import gzip
 import json
+import sqlite3
 import sys
 import zipfile
 from datetime import date, datetime, timedelta, timezone
@@ -254,3 +255,22 @@ def test_completed_archive_evidence_cannot_be_downgraded_by_late_failure(tmp_pat
         "rows_read": completed.rows_read,
         "feature_observation_count": completed.feature_observation_count,
     }
+    repeated = replay_orderbook_archive(
+        store,
+        archive,
+        symbol=SYMBOL,
+        trading_date=DAY,
+        source_url=completed.source_url,
+        fetched_at=FETCHED,
+        feature_emit_interval_sec=15,
+    )
+    assert repeated.feature_observation_count == 0
+    try:
+        with store.connect() as connection:
+            connection.execute(
+                "UPDATE bybit_historical_archive_files SET status='failed'"
+            )
+    except sqlite3.IntegrityError as exc:
+        assert "immutable" in str(exc)
+    else:
+        raise AssertionError("completed archive evidence accepted an update")
