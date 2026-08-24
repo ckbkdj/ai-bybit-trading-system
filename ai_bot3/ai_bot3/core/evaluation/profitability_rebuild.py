@@ -163,6 +163,55 @@ def _ablation_ledger_summary(result: Mapping[str, object]) -> dict[str, object]:
     }
 
 
+def _execution_release_evidence(
+    report: object,
+    *,
+    shadow_or_testnet_fill_receipt_count: int = 0,
+    queue_position_and_latency_calibration_complete: bool = False,
+) -> dict[str, object]:
+    """Separate candidate backtest evidence from the stricter live gate."""
+
+    official_pit_cost_inputs_complete = bool(
+        getattr(report, "execution_cost_evidence_complete", False)
+    )
+    receipts_complete = shadow_or_testnet_fill_receipt_count > 0
+    candidate_complete = official_pit_cost_inputs_complete
+    live_complete = bool(
+        candidate_complete
+        and receipts_complete
+        and queue_position_and_latency_calibration_complete
+    )
+    return {
+        "official_pit_cost_inputs_complete": official_pit_cost_inputs_complete,
+        "direct_execution_cost_trade_count": int(
+            getattr(report, "direct_execution_cost_trade_count", 0)
+        ),
+        "proxy_execution_cost_trade_count": int(
+            getattr(report, "proxy_execution_cost_trade_count", 0)
+        ),
+        "candidate_backtest_execution_evidence_complete": candidate_complete,
+        "shadow_or_testnet_fill_receipts_complete": receipts_complete,
+        "shadow_or_testnet_fill_receipt_count": int(
+            shadow_or_testnet_fill_receipt_count
+        ),
+        "queue_position_and_latency_calibration_complete": bool(
+            queue_position_and_latency_calibration_complete
+        ),
+        "live_execution_evidence_complete": live_complete,
+        "historical_archive_claim": (
+            "official PIT spread/depth/funding inputs; not realized own-order fills"
+        ),
+        "candidate_scope": (
+            "may open a sealed lockbox and produce candidate/shadow evidence only"
+        ),
+        "live_blocker": (
+            None
+            if live_complete
+            else "requires immutable OOS shadow/testnet fill receipts and queue/latency calibration"
+        ),
+    }
+
+
 def _utc_ms(value: int) -> datetime:
     return datetime.fromtimestamp(int(value) / 1000.0, timezone.utc)
 
@@ -1717,30 +1766,11 @@ class ProfitabilityRebuild:
         development_stress = backtest.run(
             development_signals, market, cost_multiplier=2.0
         )
-        execution_evidence = {
-            "official_pit_cost_inputs_complete": (
-                development_report.execution_cost_evidence_complete
-            ),
-            "direct_execution_cost_trade_count": (
-                development_report.direct_execution_cost_trade_count
-            ),
-            "proxy_execution_cost_trade_count": (
-                development_report.proxy_execution_cost_trade_count
-            ),
-            "shadow_or_testnet_fill_receipts_complete": False,
-            "shadow_or_testnet_fill_receipt_count": 0,
-            "queue_position_and_latency_calibration_complete": False,
-            "historical_archive_claim": (
-                "official PIT spread/depth/funding inputs; not realized own-order fills"
-            ),
-            "blocker": (
-                "requires immutable OOS shadow/testnet fill receipts and queue/latency calibration"
-            ),
-        }
-        execution_evidence_complete = bool(
-            execution_evidence["official_pit_cost_inputs_complete"]
-            and execution_evidence["shadow_or_testnet_fill_receipts_complete"]
-            and execution_evidence["queue_position_and_latency_calibration_complete"]
+        execution_evidence = _execution_release_evidence(development_report)
+        candidate_execution_evidence_complete = bool(
+            execution_evidence[
+                "candidate_backtest_execution_evidence_complete"
+            ]
         )
         development_gate = evaluate_development_gate(
             development_report.trades,
@@ -1749,7 +1779,7 @@ class ProfitabilityRebuild:
             two_x_cost_net_return=development_stress.net_return,
             mark_to_market_max_drawdown=development_report.max_drawdown,
             mark_to_market_evidence_complete=development_report.mark_to_market_used,
-            execution_evidence_complete=execution_evidence_complete,
+            execution_evidence_complete=candidate_execution_evidence_complete,
             factor_ablation_complete=bool(factor_report["all_required_groups_evaluated"]),
             thresholds=ProfitabilityThresholds(),
         )
@@ -1775,7 +1805,13 @@ class ProfitabilityRebuild:
             output / "execution_cost_report.json",
             {
                 "evaluation_scope": "development_oos",
-                "execution_evidence_complete": execution_evidence_complete,
+                "execution_evidence_complete": candidate_execution_evidence_complete,
+                "candidate_backtest_execution_evidence_complete": (
+                    candidate_execution_evidence_complete
+                ),
+                "live_execution_evidence_complete": bool(
+                    execution_evidence["live_execution_evidence_complete"]
+                ),
                 "execution_evidence": execution_evidence,
                 "normal_cost": development_report.to_dict(include_trades=False),
                 "two_x_cost": development_stress.to_dict(include_trades=False),
@@ -1794,7 +1830,7 @@ class ProfitabilityRebuild:
                     ),
                     "official historical public data is not realized own-order fill evidence",
                     "immutable OOS shadow/testnet receipts and queue/latency calibration are incomplete",
-                    "execution evidence cannot authorize opening a new lockbox",
+                    "candidate evidence never authorizes live execution; live remains separately fail-closed",
                 ],
             },
         )
@@ -2053,7 +2089,7 @@ class ProfitabilityRebuild:
             two_x_cost_net_return=stressed_report.net_return,
             mark_to_market_max_drawdown=lockbox_report.max_drawdown,
             mark_to_market_evidence_complete=lockbox_report.mark_to_market_used,
-            execution_evidence_complete=execution_evidence_complete,
+            execution_evidence_complete=candidate_execution_evidence_complete,
             factor_ablation_complete=bool(factor_report["all_required_groups_evaluated"]),
             thresholds=ProfitabilityThresholds(),
         )

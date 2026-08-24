@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 
@@ -13,6 +14,7 @@ sys.path.insert(0, str(ROOT))
 from core.evaluation.profitability_rebuild import (
     _ablation_execution_evidence,
     _ablation_signals_from_predictions,
+    _execution_release_evidence,
     _failed_ablation_execution_result,
 )
 from core.models.two_stage import TwoStagePrediction
@@ -120,3 +122,23 @@ def test_ablation_research_budget_measures_rankings_without_faking_deployable_ed
         start + timedelta(minutes=3 * 98),
         start + timedelta(minutes=3 * 99),
     }
+
+
+def test_candidate_execution_evidence_does_not_self_authorize_live():
+    report = SimpleNamespace(
+        execution_cost_evidence_complete=True,
+        direct_execution_cost_trade_count=40,
+        proxy_execution_cost_trade_count=0,
+    )
+
+    candidate = _execution_release_evidence(report)
+    live = _execution_release_evidence(
+        report,
+        shadow_or_testnet_fill_receipt_count=100,
+        queue_position_and_latency_calibration_complete=True,
+    )
+
+    assert candidate["candidate_backtest_execution_evidence_complete"] is True
+    assert candidate["live_execution_evidence_complete"] is False
+    assert candidate["live_blocker"]
+    assert live["live_execution_evidence_complete"] is True
