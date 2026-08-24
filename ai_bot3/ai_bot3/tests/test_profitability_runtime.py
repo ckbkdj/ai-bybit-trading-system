@@ -219,6 +219,39 @@ def test_rejected_shadow_bundle_runs_real_alpha_but_cannot_be_actionable(tmp_pat
     assert alpha["feature_evidence"]["feature_snapshot_sha256"]
 
 
+def test_bybit_trained_bundle_rejects_cross_venue_runtime_prices(tmp_path):
+    bundle = _bundle(tmp_path)
+    payload = json.loads(bundle.read_text(encoding="utf-8"))
+    payload["kline_source"] = "bybit"
+    bundle.write_text(json.dumps(payload), encoding="utf-8")
+    market = _market_frame()
+
+    mismatched = generate_profitability_alpha_prediction(
+        market,
+        symbol="BTCUSDT",
+        mode="scalping",
+        input_price_source="binance_futures",
+        model_bundle_path=bundle,
+    )
+    verified = generate_profitability_alpha_prediction(
+        market,
+        symbol="BTCUSDT",
+        mode="scalping",
+        input_price_source="bybit_linear_last_trade_kline",
+        model_bundle_path=bundle,
+    )
+
+    assert mismatched["status"] == "blocked"
+    assert "requires a fresh Bybit" in mismatched["reason"]
+    assert verified["status"] == "ok"
+    assert verified["feature_evidence"]["price_path"] == {
+        "status": "verified",
+        "training_kline_source": "bybit",
+        "runtime_price_source": "bybit_linear_last_trade_kline",
+        "same_venue": True,
+    }
+
+
 def _external_context(decision_at: datetime, *, status: str = "ok", age_days: int = 1):
     return {
         "status": status,

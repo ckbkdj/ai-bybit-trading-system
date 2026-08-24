@@ -370,6 +370,7 @@ def test_trial_identity_binds_walk_forward_and_lockbox_partition_config(tmp_path
     baseline_id = ProfitabilityRebuild(config()).trial_id
     assert ProfitabilityRebuild(config(walk_forward_folds=5)).trial_id != baseline_id
     assert ProfitabilityRebuild(config(lockbox_fraction=0.20)).trial_id != baseline_id
+    assert ProfitabilityRebuild(config(kline_source="bybit")).trial_id != baseline_id
 
 
 def test_label_decisions_do_not_treat_overlapping_execution_windows_as_independent():

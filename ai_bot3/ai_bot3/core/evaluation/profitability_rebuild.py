@@ -83,6 +83,7 @@ from core.training.flow_pit_panel import (
     FlowPITFeatureSource,
 )
 from core.training.pit_factor_panel import TradPanelHistorySource
+from core.providers.bybit_kline_history import verify_bybit_listing_evidence
 
 
 SYMBOLS: tuple[str, ...] = ("BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "1000PEPEUSDT")
@@ -223,12 +224,15 @@ class ProfitabilityRebuildConfig:
     verify_macro_raw_hashes: bool = True
     flow_pit_store_path: Path | None = None
     verify_flow_raw_hashes: bool = True
+    kline_source: str = "binance"
     max_bars_per_symbol: int = 200_000
     walk_forward_folds: int = 6
     lockbox_fraction: float = 0.15
     random_seed: int = 20260823
 
     def __post_init__(self) -> None:
+        if self.kline_source not in {"binance", "bybit"}:
+            raise ValueError("kline_source must be 'binance' or 'bybit'")
         if self.max_bars_per_symbol < 20_000:
             raise ValueError("max_bars_per_symbol is too small for required short-horizon coverage")
         if not 4 <= self.walk_forward_folds <= 8:
@@ -366,11 +370,19 @@ def _execution_release_evidence(
     official_pit_cost_inputs_complete = bool(
         getattr(report, "execution_cost_evidence_complete", False)
     )
+    observed_price_path_complete = bool(
+        getattr(
+            report,
+            "price_path_evidence_complete",
+            official_pit_cost_inputs_complete,
+        )
+    )
     simulation_complete = bool(getattr(report, "simulation_complete", False))
     risk_policy_compliant = bool(getattr(report, "risk_policy_compliant", False))
     receipts_complete = shadow_or_testnet_fill_receipt_count > 0
     candidate_complete = bool(
         official_pit_cost_inputs_complete
+        and observed_price_path_complete
         and simulation_complete
         and risk_policy_compliant
     )
@@ -381,6 +393,13 @@ def _execution_release_evidence(
     )
     return {
         "official_pit_cost_inputs_complete": official_pit_cost_inputs_complete,
+        "observed_price_path_complete": observed_price_path_complete,
+        "observed_price_path_trade_count": int(
+            getattr(report, "observed_price_path_trade_count", 0)
+        ),
+        "proxy_price_path_trade_count": int(
+            getattr(report, "proxy_price_path_trade_count", 0)
+        ),
         "simulation_complete": simulation_complete,
         "unresolved_position_count": int(
             getattr(report, "unresolved_position_count", 0)
@@ -428,6 +447,7 @@ def _execution_release_evidence(
             name
             for name, passed in (
                 ("official_pit_cost_inputs_incomplete", official_pit_cost_inputs_complete),
+                ("observed_price_path_incomplete", observed_price_path_complete),
                 ("execution_simulation_incomplete", simulation_complete),
                 ("capital_risk_budget_breached", risk_policy_compliant),
             )
@@ -496,10 +516,14 @@ def _archive_candidate_manifest(output_dir: Path, run_id: str) -> str | None:
 class KlinePanelSource:
     """Read immutable exchange bars without mutating the production feature store."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, source: str = "binance") -> None:
         self.path = Path(path)
         if not self.path.exists():
             raise FileNotFoundError(self.path)
+        normalized_source = str(source).strip().lower()
+        if normalized_source not in {"binance", "bybit"}:
+            raise ValueError("kline source must be 'binance' or 'bybit'")
+        self.source = normalized_source
 
     @staticmethod
     def _attach_times(frame: pd.DataFrame, timeframe: str) -> pd.DataFrame:
@@ -523,16 +547,20 @@ class KlinePanelSource:
               FROM (
                     SELECT symbol,timeframe,source,open_time,close_time,open,high,low,close,volume,fetched_at
                       FROM raw_kline
-                     WHERE symbol=? AND timeframe=? AND source='binance'
+                     WHERE symbol=? AND timeframe=? AND source=?
                      ORDER BY open_time DESC
                      LIMIT ?
               )
              ORDER BY open_time
         """
         with closing(sqlite3.connect(uri, uri=True)) as connection:
-            frame = pd.read_sql_query(query, connection, params=(symbol, timeframe, int(limit)))
+            frame = pd.read_sql_query(
+                query,
+                connection,
+                params=(symbol, timeframe, self.source, int(limit)),
+            )
         if frame.empty:
-            raise ValueError(f"no bars for {symbol} {timeframe}")
+            raise ValueError(f"no {self.source} bars for {symbol} {timeframe}")
         for column in ("open", "high", "low", "close", "volume"):
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
         frame = frame.dropna(subset=["open", "high", "low", "close", "volume"])
@@ -552,7 +580,7 @@ class KlinePanelSource:
               FROM (
                     SELECT symbol,timeframe,source,open_time,close_time
                       FROM raw_kline
-                     WHERE symbol=? AND timeframe=? AND source='binance'
+                     WHERE symbol=? AND timeframe=? AND source=?
                      ORDER BY open_time DESC
                      LIMIT ?
               )
@@ -562,10 +590,10 @@ class KlinePanelSource:
             frame = pd.read_sql_query(
                 query,
                 connection,
-                params=(symbol, timeframe, int(limit)),
+                params=(symbol, timeframe, self.source, int(limit)),
             )
         if frame.empty:
-            raise ValueError(f"no bars for {symbol} {timeframe}")
+            raise ValueError(f"no {self.source} bars for {symbol} {timeframe}")
         return self._attach_times(frame, timeframe).reset_index(drop=True)
 
     def load_before(
@@ -591,7 +619,7 @@ class KlinePanelSource:
               FROM (
                     SELECT symbol,timeframe,source,open_time,close_time,open,high,low,close,volume,fetched_at
                       FROM raw_kline
-                     WHERE symbol=? AND timeframe=? AND source='binance'
+                     WHERE symbol=? AND timeframe=? AND source=?
                        AND (
                             close_time
                             + CASE
@@ -611,6 +639,7 @@ class KlinePanelSource:
                 params=(
                     symbol,
                     timeframe,
+                    self.source,
                     interval_ms,
                     cutoff_ms,
                     int(limit),
@@ -618,7 +647,7 @@ class KlinePanelSource:
             )
         if frame.empty:
             raise ValueError(
-                f"no bars for {symbol} {timeframe} before the PIT boundary"
+                f"no {self.source} bars for {symbol} {timeframe} before the PIT boundary"
             )
         for column in ("open", "high", "low", "close", "volume"):
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
@@ -628,6 +657,8 @@ class KlinePanelSource:
     def listing_evidence(
         self, symbol: str, timeframe: str
     ) -> dict[str, object] | None:
+        if self.source == "bybit":
+            return verify_bybit_listing_evidence(self.path, symbol, timeframe)
         uri = f"file:{self.path.resolve().as_posix()}?mode=ro"
         with closing(sqlite3.connect(uri, uri=True)) as connection:
             exists = connection.execute(
@@ -765,15 +796,17 @@ def audit_source_coverage(
             listing_evidence.get("listing_start_utc"), utc=True, errors="coerce"
         )
         earliest_open_time_ms = listing_evidence.get("earliest_open_time_ms")
-        official_archive = str(listing_evidence.get("first_archive_url") or "").startswith(
+        official_binance_archive = str(
+            listing_evidence.get("first_archive_url") or ""
+        ).startswith(
             "https://data.binance.vision/data/futures/um/monthly/klines/"
         )
-        listing_verified = bool(
+        binance_listing_verified = bool(
             listing_evidence.get("status") == "VERIFIED_SINCE_LISTING"
             and int(listing_evidence.get("prior_month_http_status", 0)) == 404
             and listing_evidence.get("first_archive_checksum_verified") in {1, True}
             and listing_evidence.get("raw_receipt_reverified") is True
-            and official_archive
+            and official_binance_archive
             and not pd.isna(listing_start)
             and earliest_open_time_ms is not None
             and abs(
@@ -783,14 +816,39 @@ def audit_source_coverage(
             <= 1_000.0
             and abs((pd.Timestamp(first) - listing_start).total_seconds()) <= 1.0
         )
-        if listing_verified:
+        official_bybit_instrument = str(
+            listing_evidence.get("official_instrument_url") or ""
+        ).startswith(
+            "https://api.bybit.com/v5/market/instruments-info?category=linear&symbol="
+        )
+        bybit_launch_verified = bool(
+            listing_evidence.get("status") == "VERIFIED_SINCE_LAUNCH"
+            and listing_evidence.get("source") == "bybit"
+            and listing_evidence.get("raw_receipt_reverified") is True
+            and int(listing_evidence.get("immutable_trigger_count", 0)) == 8
+            and official_bybit_instrument
+            and listing_evidence.get("launch_time_ms") is not None
+            and not pd.isna(listing_start)
+            and earliest_open_time_ms is not None
+            and abs(
+                float(earliest_open_time_ms)
+                - pd.Timestamp(first).timestamp() * 1000.0
+            )
+            <= 1_000.0
+            and abs((pd.Timestamp(first) - listing_start).total_seconds()) <= 1.0
+        )
+        if binance_listing_verified or bybit_launch_verified:
             since_listing_days = max(
                 0.0,
                 float((last - listing_start).total_seconds() / 86_400.0),
             )
             effective_minimum = min(fixed_minimum, since_listing_days)
             base["minimum_coverage_days"] = effective_minimum
-            base["coverage_policy"] = "fixed_floor_or_verified_since_listing"
+            base["coverage_policy"] = (
+                "fixed_floor_or_verified_since_launch"
+                if bybit_launch_verified
+                else "fixed_floor_or_verified_since_listing"
+            )
             base["listing_exception_applied"] = effective_minimum < fixed_minimum
     ordered = ordered.sort_values("open_at").reset_index(drop=True)
     durations = (
@@ -1278,6 +1336,11 @@ def _run_production_replay(
                     raw,
                     symbol=symbol,
                     mode=mode_by_horizon[horizon],
+                    input_price_source=(
+                        "bybit_linear_last_trade_kline"
+                        if source.source == "bybit"
+                        else "binance_futures"
+                    ),
                     latest_decision_at=decision_at,
                     external_panel_context=external_context,
                     bybit_pit_store_path=bybit_pit_store_path,
@@ -1400,6 +1463,12 @@ _engineer_features = engineer_profitability_features
 def _market_bars(frame: pd.DataFrame) -> list[MarketBar]:
     bars: list[MarketBar] = []
     for row in frame.itertuples(index=False):
+        raw_price_source = str(getattr(row, "source", "unknown_proxy")).lower()
+        price_source = (
+            f"{raw_price_source}_last_trade_kline"
+            if raw_price_source in {"bybit", "binance"}
+            else raw_price_source
+        )
         range_bps = max(1.0, float((row.high - row.low) / row.close * 10_000.0))
         # These are deliberately conservative OHLCV-derived proxies.  They are
         # never marked as direct execution evidence in the profitability gate.
@@ -1422,6 +1491,8 @@ def _market_bars(frame: pd.DataFrame) -> list[MarketBar]:
                 depth_usdt=depth_usdt,
                 volatility_bps=volatility_bps,
                 funding_bps=0.0,
+                price_source=price_source,
+                price_observed=raw_price_source in {"bybit", "binance"},
             )
         )
     return bars
@@ -3077,7 +3148,10 @@ def _evaluate_bybit_pit_ablation(
 class ProfitabilityRebuild:
     def __init__(self, config: ProfitabilityRebuildConfig) -> None:
         self.config = config
-        self.source = KlinePanelSource(config.feature_store_path)
+        self.source = KlinePanelSource(
+            config.feature_store_path,
+            source=config.kline_source,
+        )
         self.ledger = TrialLedger(config.trial_ledger_path)
         self.bybit_pit_snapshot_maximum_sequence = None
         self.bybit_pit_snapshot_maximum_invalidation_rowid = None
@@ -3122,6 +3196,7 @@ class ProfitabilityRebuild:
         run_payload = {
             "code_commit": config.code_commit,
             "feature_store": self.feature_store_identity,
+            "kline_source": config.kline_source,
             "trad_panel_root": (
                 str(config.trad_panel_root.resolve()) if config.trad_panel_root else None
             ),
@@ -3176,7 +3251,10 @@ class ProfitabilityRebuild:
         market: dict[str, Sequence[MarketBar]] = {}
         output = self.config.output_dir
         source_evidence: dict[str, object] = {
-            "kline_feature_store": dict(self.feature_store_identity)
+            "kline_feature_store": {
+                **dict(self.feature_store_identity),
+                "source": self.config.kline_source,
+            }
         }
         coverage_audits: dict[str, dict[str, object]] = {}
         preflight_unique_times_by_horizon: dict[int, pd.Series] = {}
@@ -3248,6 +3326,41 @@ class ProfitabilityRebuild:
                 "kline coverage preflight failed for: "
                 + ", ".join(failed_coverage_series)
             )
+        verified_bybit_price_series = 0
+        for audit in coverage_audits.values():
+            evidence = audit.get("listing_evidence")
+            if not isinstance(evidence, Mapping):
+                continue
+            if (
+                evidence.get("source") == "bybit"
+                and evidence.get("status")
+                in {"VERIFIED_WINDOW", "VERIFIED_SINCE_LAUNCH"}
+                and evidence.get("raw_receipt_reverified") is True
+                and int(evidence.get("immutable_trigger_count", 0)) == 8
+            ):
+                verified_bybit_price_series += 1
+        expected_price_series = len(SYMBOLS) * len(HORIZONS_SEC)
+        same_venue_price_evidence = {
+            "passed": bool(
+                self.config.kline_source == "bybit"
+                and verified_bybit_price_series == expected_price_series
+            ),
+            "status": (
+                "PASSED"
+                if self.config.kline_source == "bybit"
+                and verified_bybit_price_series == expected_price_series
+                else "FAILED"
+            ),
+            "complete": verified_bybit_price_series == expected_price_series,
+            "venue": "bybit",
+            "price_definition": "official Bybit last-trade kline OHLCV",
+            "configured_kline_source": self.config.kline_source,
+            "observed_sample_count": verified_bybit_price_series,
+            "expected_sample_count": expected_price_series,
+            "failed_sample_count": expected_price_series - verified_bybit_price_series,
+            "binance_role": "reference_baseline_only_not_release_execution_evidence",
+        }
+        source_evidence["same_venue_price_evidence"] = same_venue_price_evidence
         bybit_source: BybitPITFeatureSource | None = None
         bybit_evidence_by_horizon: dict[int, dict[str, object]] = {}
         bybit_names: tuple[str, ...] = ()
@@ -4014,6 +4127,11 @@ class ProfitabilityRebuild:
             calibration_coverage_evidence=development_calibration_evidence,
             thresholds=ProfitabilityThresholds(),
         )
+        development_gate = _require_development_evidence(
+            development_gate,
+            check_name="bybit_same_venue_price_path",
+            evidence=same_venue_price_evidence,
+        )
         development_nested_cv_evidence = nested_cv_evidence(walk_forward)
         development_signal_funnel_evidence = signal_funnel_evidence(
             eligible_walk_forward,
@@ -4261,6 +4379,8 @@ class ProfitabilityRebuild:
             "schema_version": "profitability-model-bundle.v2",
             "trial_id": self.trial_id,
             "model_family": "profitability_two_stage",
+            "kline_source": self.config.kline_source,
+            "price_venue": self.config.kline_source,
             "release_stage": "rejected",
             "profitability_gate": "FAILED",
             "models": model_paths,
@@ -5095,6 +5215,11 @@ class ProfitabilityRebuild:
             check_name="production_replay_artifact_integrity",
             passed_check=replay_artifact_integrity,
         )
+        gate = _require_candidate_evidence(
+            gate,
+            check_name="bybit_same_venue_price_path",
+            passed_check=bool(same_venue_price_evidence["passed"]),
+        )
         write_profitability_report(output / "profitability_report.json", gate)
         final_model_paths = candidate_model_paths if gate.passed else model_paths
         final_model_hashes = candidate_model_hashes if gate.passed else model_sha256
@@ -5102,6 +5227,8 @@ class ProfitabilityRebuild:
                 "schema_version": "profitability-model-bundle.v2",
                 "trial_id": self.trial_id,
                 "model_family": "profitability_two_stage",
+                "kline_source": self.config.kline_source,
+                "price_venue": self.config.kline_source,
                 "release_stage": "candidate" if gate.passed else "rejected",
                 "profitability_gate": gate.profitability_gate,
                 "models": final_model_paths,

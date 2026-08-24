@@ -9,6 +9,7 @@ from pathlib import Path
 import asyncio
 import ccxt.async_support as ccxt
 import logging
+import math
 import pandas as pd
 import sqlite3
 import time
@@ -19,6 +20,14 @@ from .market_context import build_market_feature_snapshot
 from .providers.trad_panel_provider import TradPanelProvider
 
 BINANCE = "https://fapi.binance.com"
+BYBIT_PUBLIC = "https://api.bybit.com"
+_BYBIT_KLINE_INTERVALS: Dict[str, str] = {
+    "3m": "3",
+    "15m": "15",
+    "2h": "120",
+    "4h": "240",
+    "1d": "D",
+}
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
@@ -174,6 +183,133 @@ class DataFetcher:
         with closing(sqlite3.connect(self._db(sym))) as c:
             df.to_sql(self._table(tf), c, if_exists="replace", index=False)
             c.commit()
+
+    async def get_bybit_ohlcv(self, sym: str, tf: str, limit: int) -> pd.DataFrame:
+        """Fetch completed Bybit last-trade candles for the profitability Alpha.
+
+        This path deliberately has no cross-venue or stale-cache fallback.  The
+        legacy Binance frame remains available to the old display model, while
+        a Bybit-trained candidate is blocked whenever this independent request
+        cannot provide a fresh, continuous grid.
+        """
+
+        normalized = str(sym).strip().upper()
+        if tf not in _BYBIT_KLINE_INTERVALS:
+            raise MarketDataUnavailable(
+                normalized,
+                tf,
+                source="bybit_linear_last_trade_kline",
+                status="unsupported_timeframe",
+                reason=f"unsupported Bybit profitability timeframe: {tf}",
+            )
+        requested_limit = min(1_000, max(49, int(limit)))
+        payload = await self.http.get(
+            f"{BYBIT_PUBLIC}/v5/market/kline",
+            params={
+                "category": "linear",
+                "symbol": normalized,
+                "interval": _BYBIT_KLINE_INTERVALS[tf],
+                "limit": requested_limit,
+            },
+            retry=4,
+        )
+        try:
+            result = payload["result"]
+            rows = result["list"]
+            if (
+                int(payload.get("retCode", -1)) != 0
+                or result.get("category") != "linear"
+                or result.get("symbol") != normalized
+                or not isinstance(rows, list)
+            ):
+                raise ValueError("Bybit kline identity contract failed")
+            interval_ms = _timeframe_ms(tf)
+            now_ms = int(time.time() * 1_000)
+            parsed: dict[int, tuple[float, float, float, float, float]] = {}
+            for raw in rows:
+                if not isinstance(raw, list) or len(raw) < 7:
+                    raise ValueError("Bybit kline row is truncated")
+                open_ms = int(raw[0])
+                if open_ms + interval_ms > now_ms:
+                    continue
+                values = tuple(float(raw[index]) for index in (1, 2, 3, 4, 5))
+                open_price, high, low, close, volume = values
+                if (
+                    open_ms % interval_ms
+                    or not all(math.isfinite(value) for value in values)
+                    or min(open_price, high, low, close) <= 0
+                    or volume < 0
+                    or high < max(open_price, close)
+                    or low > min(open_price, close)
+                ):
+                    raise ValueError("Bybit kline OHLCV contract failed")
+                if open_ms in parsed and parsed[open_ms] != values:
+                    raise ValueError("Bybit kline response conflicts at one open")
+                parsed[open_ms] = values
+        except (KeyError, TypeError, ValueError) as exc:
+            raise MarketDataUnavailable(
+                normalized,
+                tf,
+                source="bybit_linear_last_trade_kline",
+                status="invalid_response",
+                reason=f"{type(exc).__name__}: {exc}",
+            ) from exc
+        times = sorted(parsed)
+        if len(times) < 49:
+            raise MarketDataUnavailable(
+                normalized,
+                tf,
+                source="bybit_linear_last_trade_kline",
+                status="insufficient_history",
+                reason=f"only {len(times)} completed candles were returned",
+            )
+        if any(later - earlier != interval_ms for earlier, later in zip(times, times[1:])):
+            raise MarketDataUnavailable(
+                normalized,
+                tf,
+                source="bybit_linear_last_trade_kline",
+                status="discontinuous",
+                reason="Bybit runtime candle grid contains a gap or overlap",
+            )
+        latest_open = pd.Timestamp(times[-1], unit="ms")
+        latest_close = latest_open + pd.Timedelta(milliseconds=interval_ms)
+        age = pd.Timestamp.now(tz="UTC").tz_localize(None) - latest_close
+        if age > _max_kline_age(tf):
+            raise MarketDataUnavailable(
+                normalized,
+                tf,
+                source="bybit_linear_last_trade_kline",
+                status="stale",
+                reason=f"latest completed Bybit close is older than {_max_kline_age(tf)}",
+                latest_ts=latest_open.isoformat(),
+            )
+        frame = pd.DataFrame(
+            [
+                {
+                    "ts": pd.Timestamp(open_ms, unit="ms"),
+                    "close_at": pd.Timestamp(open_ms + interval_ms, unit="ms", tz="UTC"),
+                    "open": parsed[open_ms][0],
+                    "high": parsed[open_ms][1],
+                    "low": parsed[open_ms][2],
+                    "close": parsed[open_ms][3],
+                    "volume": parsed[open_ms][4],
+                }
+                for open_ms in times[-requested_limit:]
+            ]
+        )
+        frame.attrs.update(
+            {
+                "data_source": "bybit_linear_last_trade_kline",
+                "source_status": "ok",
+                "latest_kline_ts": latest_open.isoformat(),
+                "fetched_at": datetime.now(timezone.utc).isoformat(),
+                "latest_fetch_ok": True,
+                "new_candles": len(frame),
+                "timeframe": tf,
+                "symbol": normalized,
+            }
+        )
+        return frame
 
     # ---------- Binance OHLCV ----------
     async def get_ohlcv(self, sym, tf, limit):

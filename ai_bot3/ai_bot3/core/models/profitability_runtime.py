@@ -468,6 +468,7 @@ def generate_profitability_alpha_prediction(
     *,
     symbol: str,
     mode: str,
+    input_price_source: str | None = None,
     latest_decision_at: Any | None = None,
     external_panel_context: Mapping[str, Any] | None = None,
     bybit_pit_store_path: Path | None = None,
@@ -499,6 +500,12 @@ def generate_profitability_alpha_prediction(
             raise ValueError("unsupported profitability model bundle schema")
         if bundle.get("model_family") != "profitability_two_stage":
             raise ValueError("profitability model family mismatch")
+        bundle_kline_source = str(bundle.get("kline_source") or "legacy_unspecified")
+        runtime_price_source = str(
+            input_price_source
+            or getattr(frame, "attrs", {}).get("data_source")
+            or "missing"
+        )
         models = bundle.get("models")
         hashes = bundle.get("model_sha256")
         if not isinstance(models, Mapping) or not isinstance(hashes, Mapping):
@@ -516,6 +523,16 @@ def generate_profitability_alpha_prediction(
                 raise ValueError(
                     "requested horizon is not approved by profitability evidence"
                 )
+            if bundle_kline_source != "bybit":
+                raise ValueError(
+                    "candidate bundle lacks a signed Bybit same-venue price source"
+                )
+        if bundle_kline_source == "bybit" and runtime_price_source != (
+            "bybit_linear_last_trade_kline"
+        ):
+            raise ValueError(
+                "Bybit-trained Alpha requires a fresh Bybit last-trade kline frame"
+            )
         relative = Path(str(models[str(horizon)]))
         if relative.is_absolute():
             raise ValueError("model path must be relative to its signed bundle")
@@ -566,6 +583,15 @@ def generate_profitability_alpha_prediction(
             ),
             pit_snapshot_watermarks=pit_snapshot_watermarks,
         )
+        feature_evidence["price_path"] = {
+            "status": "verified",
+            "training_kline_source": bundle_kline_source,
+            "runtime_price_source": runtime_price_source,
+            "same_venue": bool(
+                bundle_kline_source == "bybit"
+                and runtime_price_source == "bybit_linear_last_trade_kline"
+            ),
+        }
         predictions = model.predict(rows)
 
         report_path = profitability_report_path or (

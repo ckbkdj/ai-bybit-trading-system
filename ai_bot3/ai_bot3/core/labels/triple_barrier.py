@@ -47,6 +47,8 @@ class MarketBar:
     depth_usdt: float | None = None
     volatility_bps: float | None = None
     funding_bps: float = 0.0
+    price_source: str = "unknown_proxy"
+    price_observed: bool = False
     spread_source: str = "ohlcv_proxy"
     depth_source: str = "ohlcv_proxy"
     funding_source: str = "zero_proxy"
@@ -79,9 +81,14 @@ class MarketBar:
             raise ValueError("volume cannot be negative")
         if not all(
             str(value).strip()
-            for value in (self.spread_source, self.depth_source, self.funding_source)
+            for value in (
+                self.price_source,
+                self.spread_source,
+                self.depth_source,
+                self.funding_source,
+            )
         ):
-            raise ValueError("execution cost provenance sources cannot be empty")
+            raise ValueError("market provenance sources cannot be empty")
         if self.close_spread_source is not None and not self.close_spread_source.strip():
             raise ValueError("close spread provenance source cannot be empty")
         if self.close_depth_source is not None and not self.close_depth_source.strip():
@@ -180,6 +187,8 @@ class TripleBarrierLabel:
     pit_valid: bool
     outcome_complete: bool
     execution_cost_evidence_complete: bool
+    price_path_evidence_complete: bool
+    price_path_source: str
     entry_spread_source: str
     entry_depth_source: str
     exit_spread_source: str
@@ -466,6 +475,15 @@ def build_triple_barrier_label(
     ) * abs(funding_return)
     net_return = gross_return - fee_return - slippage_return - funding_return
     funding_path = [bar for bar in path if bar.close_time <= exit_bar.close_time]
+    price_path = [
+        bar
+        for bar in ordered
+        if bar.close_time >= entry_fill_at and bar.close_time <= exit_bar.close_time
+    ]
+    price_sources = sorted({bar.price_source for bar in price_path})
+    price_path_evidence_complete = bool(
+        price_path and all(bar.price_observed for bar in price_path)
+    )
     exit_spread_observed = (
         exit_bar.close_spread_observed
         if exit_bar.close_spread_observed is not None
@@ -518,6 +536,10 @@ def build_triple_barrier_label(
         pit_valid=True,
         outcome_complete=True,
         execution_cost_evidence_complete=execution_cost_evidence_complete,
+        price_path_evidence_complete=price_path_evidence_complete,
+        price_path_source=(
+            "+".join(price_sources) if price_sources else "unobserved"
+        ),
         entry_spread_source=entry_bar.spread_source,
         entry_depth_source=entry_bar.depth_source,
         exit_spread_source=exit_bar.close_spread_source or "unobserved_at_close",
@@ -566,6 +588,8 @@ def _empty_label(
         pit_valid=True,
         outcome_complete=True,
         execution_cost_evidence_complete=False,
+        price_path_evidence_complete=False,
+        price_path_source="unfilled",
         entry_spread_source="unfilled",
         entry_depth_source="unfilled",
         exit_spread_source="unfilled",
@@ -592,6 +616,8 @@ def _incomplete_filled_label(
     """Preserve a known fill without inventing a zero-return exit."""
 
     funding_sources = sorted({bar.funding_source for bar in path})
+    price_path = [entry_bar, *[bar for bar in path if bar is not entry_bar]]
+    price_sources = sorted({bar.price_source for bar in price_path})
     label_id = hashlib.sha256(
         f"{spec.symbol}|{spec.side}|{_utc(spec.signal_at).isoformat()}|"
         f"{entry_fill_at.isoformat()}|NO_EXIT_OBSERVATION".encode()
@@ -626,6 +652,12 @@ def _incomplete_filled_label(
         pit_valid=True,
         outcome_complete=False,
         execution_cost_evidence_complete=False,
+        price_path_evidence_complete=bool(
+            price_path and all(bar.price_observed for bar in price_path)
+        ),
+        price_path_source=(
+            "+".join(price_sources) if price_sources else "unobserved"
+        ),
         entry_spread_source=entry_bar.spread_source,
         entry_depth_source=entry_bar.depth_source,
         exit_spread_source="unobserved",

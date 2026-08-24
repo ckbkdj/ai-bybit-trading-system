@@ -452,12 +452,23 @@ def run_keras_inference_in_process(prepared_data: Dict[str, Any]) -> Dict[str, A
     except Exception as exc:
         result["brain_prediction"] = {"status": "error", "direction": "flat", "actionable": False, "error": str(exc)}
     result["alpha_prediction"] = generate_profitability_alpha_prediction(
-        prepared_data.get("brain_df") if prepared_data.get("brain_df") is not None else pd.DataFrame(),
+        (
+            prepared_data.get("alpha_price_frame")
+            if prepared_data.get("alpha_price_frame") is not None
+            else pd.DataFrame()
+        ),
         symbol=sym,
         mode=mode,
-        latest_decision_at=prepared_data.get("latest_kline_ts"),
+        input_price_source=prepared_data.get("alpha_price_source"),
         external_panel_context=prepared_data.get("external_panel_context"),
     )
+    if (
+        result["alpha_prediction"].get("status") != "ok"
+        and prepared_data.get("alpha_price_error")
+    ):
+        result["alpha_prediction"]["price_source_error"] = prepared_data.get(
+            "alpha_price_error"
+        )
     # Brain remains visible as a rejected comparison baseline.  Only the new
     # profitability Alpha may mark a production result actionable.
     result["trade_actionable"] = bool(result["alpha_prediction"].get("actionable"))
@@ -624,6 +635,25 @@ class InferencerDataPreparer:
         if df.empty or len(df) < self.window:
             return None
 
+        alpha_price_frame = pd.DataFrame()
+        alpha_price_error: str | None = None
+        if os.environ.get("AI_BOT_PROFITABILITY_MODEL_BUNDLE"):
+            try:
+                alpha_price_frame = await asyncio.wait_for(
+                    self.fetcher.get_bybit_ohlcv(
+                        self.sym,
+                        self.tf_code,
+                        max(self.fetch_limit, 360),
+                    ),
+                    timeout=OHLCV_FETCH_TIMEOUT,
+                )
+            except Exception as exc:
+                alpha_price_error = f"{type(exc).__name__}: {exc}"
+                self.log.error(
+                    "Bybit Alpha 行情不可用；旧模型仅展示，新 Alpha 失败关闭: %s",
+                    alpha_price_error,
+                )
+
         try:
             with open(self.scaler_path, "rb") as f:
                 bundle = pickle.load(f)
@@ -729,6 +759,9 @@ class InferencerDataPreparer:
             "mode": self.mode,
             "cfg": self.cfg,
             "brain_df": df.tail(max(self.window + 32, 360)).copy(),
+            "alpha_price_frame": alpha_price_frame.tail(1_000).copy(),
+            "alpha_price_source": alpha_price_frame.attrs.get("data_source"),
+            "alpha_price_error": alpha_price_error,
             "model_path_str": str(self.model_path),
             "scaler_path_str": str(self.scaler_path),
             "X_seq": X_seq,

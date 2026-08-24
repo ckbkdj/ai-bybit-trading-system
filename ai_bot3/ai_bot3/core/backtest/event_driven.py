@@ -109,6 +109,8 @@ class TradeRecord:
     pretrade_risk_loss_bps: float
     market_key: str
     execution_cost_evidence_complete: bool
+    price_path_evidence_complete: bool
+    price_path_source: str
     entry_spread_source: str
     entry_depth_source: str
     exit_spread_source: str
@@ -157,6 +159,9 @@ class EventDrivenReport:
     execution_cost_evidence_complete: bool
     direct_execution_cost_trade_count: int
     proxy_execution_cost_trade_count: int
+    price_path_evidence_complete: bool
+    observed_price_path_trade_count: int
+    proxy_price_path_trade_count: int
     simulation_complete: bool
     unresolved_position_count: int
     risk_policy_compliant: bool
@@ -703,6 +708,8 @@ class EventDrivenBacktest:
                 pretrade_risk_loss_bps=pretrade_risk_loss_bps,
                 market_key=signal.market_key or signal.symbol.upper(),
                 execution_cost_evidence_complete=label.execution_cost_evidence_complete,
+                price_path_evidence_complete=label.price_path_evidence_complete,
+                price_path_source=label.price_path_source,
                 entry_spread_source=label.entry_spread_source,
                 entry_depth_source=label.entry_depth_source,
                 exit_spread_source=label.exit_spread_source,
@@ -779,6 +786,15 @@ class EventDrivenBacktest:
             ),
             proxy_execution_cost_trade_count=sum(
                 not trade.execution_cost_evidence_complete for trade in trades
+            ),
+            price_path_evidence_complete=bool(trades)
+            and unresolved_position_count == 0
+            and all(trade.price_path_evidence_complete for trade in trades),
+            observed_price_path_trade_count=sum(
+                trade.price_path_evidence_complete for trade in trades
+            ),
+            proxy_price_path_trade_count=sum(
+                not trade.price_path_evidence_complete for trade in trades
             ),
             simulation_complete=unresolved_position_count == 0,
             unresolved_position_count=unresolved_position_count,

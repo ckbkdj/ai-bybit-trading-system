@@ -215,6 +215,21 @@ class ResultManager:
             return False
         if float(alpha.get("lower_bound_net_edge_bps") or 0.0) <= 0:
             return False
+        feature_evidence = alpha.get("feature_evidence")
+        price_path = (
+            feature_evidence.get("price_path")
+            if isinstance(feature_evidence, dict)
+            else None
+        )
+        if (
+            not isinstance(price_path, dict)
+            or price_path.get("status") != "verified"
+            or price_path.get("training_kline_source") != "bybit"
+            or price_path.get("runtime_price_source")
+            != "bybit_linear_last_trade_kline"
+            or price_path.get("same_venue") is not True
+        ):
+            return False
         if not self.profitability_authorized or not self.profitability_manifest:
             return False
         if str(alpha.get("release_id")) != str(self.profitability_manifest.get("release_id")):

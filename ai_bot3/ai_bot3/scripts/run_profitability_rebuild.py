@@ -39,7 +39,16 @@ def main() -> int:
     parser.add_argument(
         "--feature-store",
         type=Path,
-        default=ROOT / "data" / "kline_feature_store.rebuilt.20260822.sqlite3",
+        default=ROOT / "data" / "kline_feature_store.profitability-v3-bybit.sqlite3",
+    )
+    parser.add_argument(
+        "--kline-source",
+        choices=("bybit", "binance"),
+        default="bybit",
+        help=(
+            "formal release requires bybit; binance remains a rejected reference "
+            "baseline and cannot open the lockbox"
+        ),
     )
     parser.add_argument(
         "--output-dir", type=Path, default=ROOT / "model_results" / "evaluation"
@@ -110,6 +119,7 @@ def main() -> int:
         lockbox_bybit_pit_store_path=args.lockbox_bybit_pit_store,
         macro_pit_store_path=args.macro_pit_store,
         flow_pit_store_path=args.flow_pit_store,
+        kline_source=args.kline_source,
         max_bars_per_symbol=args.max_bars_per_symbol,
         walk_forward_folds=args.walk_forward_folds,
     )

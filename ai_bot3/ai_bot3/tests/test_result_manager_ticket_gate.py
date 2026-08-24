@@ -270,6 +270,14 @@ def _authorized_alpha(manifest: dict, release_id: str = "sr_result_gate_test_001
         "expected_mae_bps": 50.0,
         "expected_mfe_bps": 120.0,
         "lower_bound_net_edge_bps": 40.0,
+        "feature_evidence": {
+            "price_path": {
+                "status": "verified",
+                "training_kline_source": "bybit",
+                "runtime_price_source": "bybit_linear_last_trade_kline",
+                "same_venue": True,
+            }
+        },
         "return_quantiles_bps": {
             "p10": 80.0,
             "p25": 90.0,
