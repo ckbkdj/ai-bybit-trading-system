@@ -224,8 +224,29 @@ def _slippage_bps(
     return max(0.0, base * config.slippage_stress_multiplier)
 
 
-def _fill_probability(spec: EntrySpec, bar: MarketBar) -> float:
-    notional = spec.reference_price * spec.quantity
+def _market_entry_reference(
+    spec: EntrySpec,
+    bar: MarketBar,
+    activation: datetime,
+) -> tuple[float, datetime]:
+    if spec.order_type == "LIMIT":
+        assert spec.limit_price is not None
+        return float(spec.limit_price), bar.close_time
+    if bar.open_time >= activation:
+        # No market observation exists between activation and this later bar.
+        # The next tradable reference is its open, never the stale signal mark.
+        return float(bar.open), bar.open_time
+    return float(spec.reference_price), activation
+
+
+def _fill_probability(
+    spec: EntrySpec,
+    bar: MarketBar,
+    *,
+    activation: datetime,
+) -> float:
+    entry_reference, _ = _market_entry_reference(spec, bar, activation)
+    notional = entry_reference * spec.quantity
     depth = bar.depth_usdt
     if depth is None:
         depth_component = 0.5
@@ -257,7 +278,7 @@ def _entry_bar(spec: EntrySpec, bars: Sequence[MarketBar], config: TripleBarrier
             # straddling bar happened after activation and before cancellation.
             # Treat that ambiguity as no fill instead of leaking the full bar.
             continue
-        probability = _fill_probability(spec, bar)
+        probability = _fill_probability(spec, bar, activation=activation)
         if probability > 0:
             return bar, probability
     return None, 0.0
@@ -300,7 +321,13 @@ def build_triple_barrier_label(
         available = _timeout_available_at(spec, ordered)
         return _empty_label(spec, available, "ENTRY_TIMEOUT")
 
-    notional = spec.reference_price * spec.quantity
+    activation = _utc(spec.signal_at) + timedelta(milliseconds=cfg.latency_ms)
+    entry_reference, entry_fill_at = _market_entry_reference(
+        spec,
+        entry_bar,
+        activation,
+    )
+    notional = entry_reference * spec.quantity
     if entry_bar.depth_usdt is None:
         liquidity_fraction = cfg.missing_depth_fill_fraction
     else:
@@ -311,13 +338,9 @@ def build_triple_barrier_label(
         return _empty_label(spec, entry_bar.available_at, "UNFILLED")
 
     direction = 1.0 if spec.side == "BUY" else -1.0
-    activation = _utc(spec.signal_at) + timedelta(milliseconds=cfg.latency_ms)
-    # A market decision already carries a PIT-safe reference price.  Reusing a
-    # candle open from before a mid-bar activation would be lookahead/mispricing.
-    entry_reference = spec.limit_price if spec.order_type == "LIMIT" else spec.reference_price
-    # A limit touch has no event timestamp in OHLC data.  It is only established
-    # when the completed bar becomes known, so its fill time is conservative.
-    entry_fill_at = entry_bar.close_time if spec.order_type == "LIMIT" else activation
+    # A market decision already carries a PIT-safe reference price when the
+    # activation falls inside the observed bar.  A later bar open replaces it
+    # after a data gap.  Limit touch time remains conservative at bar close.
     entry_slippage_bps = _slippage_bps(entry_bar, notional * fill_fraction, cfg)
     entry_fill = entry_reference * (1.0 + direction * entry_slippage_bps / 10_000.0)
     take_profit = entry_fill * (1.0 + direction * spec.take_profit_bps / 10_000.0)

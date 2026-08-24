@@ -191,6 +191,7 @@ FOMC 采集不能用会议日历日期猜测 14:00，也不能把 minutes、impl
 - maker/taker fee、spread、动态 slippage、funding；
 - fill probability、partial fill、order timeout；
 - latency、cancel/fill race；
+- 市场单 activation 若落在数据断档中，必须等待下一根可交易 bar 并按其 open 计入跳空；禁止沿用断档前的信号价格伪造成交；
 - stop/take-profit 的盘中路径和 max holding；
 - 单仓、总仓和杠杆约束；
 - 每个市场观测点对所有持仓 mark-to-market，计算真实盘中组合 drawdown。

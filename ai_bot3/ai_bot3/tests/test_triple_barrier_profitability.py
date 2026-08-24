@@ -315,6 +315,51 @@ def test_stop_market_uses_adverse_gap_open_not_ideal_trigger_price():
     assert label.net_return is not None and label.net_return < -0.04
 
 
+def test_market_entry_after_a_data_gap_uses_next_open_not_stale_signal_price():
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    signal_at = start + timedelta(minutes=1)
+    gap_open = start + timedelta(minutes=5)
+    gap_bar = MarketBar(
+        symbol="BTCUSDT",
+        open_time=gap_open,
+        close_time=gap_open + timedelta(minutes=1),
+        available_at=gap_open + timedelta(minutes=1),
+        open=120.0,
+        high=121.0,
+        low=119.0,
+        close=120.0,
+    )
+    spec = EntrySpec(
+        symbol="BTCUSDT",
+        side="BUY",
+        signal_at=signal_at,
+        reference_price=100.0,
+        quantity=1.0,
+        take_profit_bps=10_000.0,
+        stop_loss_bps=10_000.0,
+        max_holding_sec=60,
+        max_wait_sec=300,
+    )
+
+    label = build_triple_barrier_label(
+        spec,
+        [gap_bar],
+        TripleBarrierConfig(
+            maker_fee_bps=0.0,
+            taker_fee_bps=0.0,
+            base_slippage_bps=0.0,
+            volatility_slippage_multiplier=0.0,
+            impact_bps_at_full_depth=0.0,
+            default_spread_bps=0.0,
+            latency_ms=250,
+        ),
+    )
+
+    assert label.entry_fill_at == gap_open
+    assert label.entry_reference_price == 120.0
+    assert label.gross_return == pytest.approx(0.0)
+
+
 @pytest.mark.parametrize(
     ("side", "expected_mae", "expected_mfe"),
     [("BUY", 0.50, 0.50), ("SELL", 0.50, 0.50)],
