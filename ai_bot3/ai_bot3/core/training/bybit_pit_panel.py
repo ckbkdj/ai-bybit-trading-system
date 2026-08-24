@@ -118,6 +118,9 @@ class BybitPITFeatureSource:
         names: Sequence[str],
         *,
         maximum_sequence: int | None = None,
+        minimum_decision_at: object | None = None,
+        maximum_decision_at: object | None = None,
+        symbols: Sequence[str] | None = None,
     ) -> tuple[pd.DataFrame, dict[str, object]]:
         requested = tuple(dict.fromkeys(str(name) for name in names))
         if not requested:
@@ -127,6 +130,17 @@ class BybitPITFeatureSource:
             if name not in BYBIT_FEATURE_SOURCE_CONTRACTS:
                 raise ValueError(f"Bybit PIT feature has no source contract: {name}")
         placeholders = ",".join("?" for _ in requested)
+        requested_symbols = tuple(
+            dict.fromkeys(str(symbol).strip().upper() for symbol in (symbols or ()))
+        )
+        if symbols is not None and not requested_symbols:
+            raise ValueError("Bybit PIT symbol filter cannot be empty")
+        symbol_clause = ""
+        symbol_parameters: tuple[object, ...] = ()
+        if requested_symbols:
+            symbol_placeholders = ",".join("?" for _ in requested_symbols)
+            symbol_clause = f" AND o.symbol IN ({symbol_placeholders})"
+            symbol_parameters = requested_symbols
         frozen_sequence = (
             self.maximum_sequence()
             if maximum_sequence is None
@@ -134,6 +148,45 @@ class BybitPITFeatureSource:
         )
         if frozen_sequence < 0:
             raise ValueError("Bybit PIT maximum_sequence cannot be negative")
+        decision_minimum = pd.to_datetime(
+            minimum_decision_at, utc=True, errors="coerce"
+        )
+        decision_maximum = pd.to_datetime(
+            maximum_decision_at, utc=True, errors="coerce"
+        )
+        if minimum_decision_at is not None and pd.isna(decision_minimum):
+            raise ValueError("Bybit PIT minimum decision timestamp is invalid")
+        if maximum_decision_at is not None and pd.isna(decision_maximum):
+            raise ValueError("Bybit PIT maximum decision timestamp is invalid")
+        if (
+            minimum_decision_at is not None
+            and maximum_decision_at is not None
+            and decision_minimum > decision_maximum
+        ):
+            raise ValueError("Bybit PIT decision timestamp bounds are reversed")
+        available_minimum = None
+        if minimum_decision_at is not None:
+            maximum_age_sec = max(
+                self.registry.require(name).maximum_age_sec for name in requested
+            )
+            available_minimum = decision_minimum - pd.Timedelta(seconds=maximum_age_sec)
+
+        def sql_timestamp(value: object | None) -> str | None:
+            if value is None or pd.isna(value):
+                return None
+            return pd.Timestamp(value).isoformat().replace("+00:00", "Z")
+
+        available_minimum_text = sql_timestamp(available_minimum)
+        available_maximum_text = sql_timestamp(decision_maximum)
+        time_clauses: list[str] = []
+        time_parameters: list[object] = []
+        if available_minimum_text is not None:
+            time_clauses.append("o.available_at>=?")
+            time_parameters.append(available_minimum_text)
+        if available_maximum_text is not None:
+            time_clauses.append("o.available_at<=?")
+            time_parameters.append(available_maximum_text)
+        time_clause = "" if not time_clauses else " AND " + " AND ".join(time_clauses)
         with closing(self._connect()) as connection:
             table = connection.execute(
                 """SELECT 1 FROM sqlite_master
@@ -165,7 +218,7 @@ class BybitPITFeatureSource:
                      WHERE type='table' AND name='bybit_feature_invalidations'"""
             ).fetchone()
             invalidation_clause = (
-                "AND observation_id NOT IN (SELECT observation_id FROM bybit_feature_invalidations)"
+                "AND o.observation_id NOT IN (SELECT observation_id FROM bybit_feature_invalidations)"
                 if invalidation_table
                 else ""
             )
@@ -174,10 +227,15 @@ class BybitPITFeatureSource:
                     connection.execute(
                         f"""SELECT COUNT(*)
                                FROM bybit_feature_invalidations i
-                               JOIN bybit_feature_observations o
+                              JOIN bybit_feature_observations o
                                  ON o.observation_id=i.observation_id
-                              WHERE o.name IN ({placeholders}) AND o.sequence<=?""",
-                        requested + (frozen_sequence,),
+                              WHERE o.name IN ({placeholders}) AND o.sequence<=?
+                                    {symbol_clause}
+                                    {time_clause}""",
+                        requested
+                        + (frozen_sequence,)
+                        + symbol_parameters
+                        + tuple(time_parameters),
                     ).fetchone()[0]
                 )
                 if invalidation_table
@@ -188,22 +246,47 @@ class BybitPITFeatureSource:
                             available_at,ingested_at,source,quality,
                             {provenance_expression},{archive_expression},
                             {api_batch_expression}
-                       FROM bybit_feature_observations
-                       WHERE name IN ({placeholders}) AND sequence<=?
+                       FROM bybit_feature_observations o
+                       WHERE o.name IN ({placeholders}) AND o.sequence<=?
+                             {symbol_clause}
+                             {time_clause}
                              {invalidation_clause}
                       ORDER BY symbol,name,available_at,sequence""",
-                requested + (frozen_sequence,),
+                requested
+                + (frozen_sequence,)
+                + symbol_parameters
+                + tuple(time_parameters),
             ).fetchall()
-        frame = pd.DataFrame([dict(row) for row in rows])
+        observation_columns = [
+            "sequence",
+            "observation_id",
+            "symbol",
+            "name",
+            "value",
+            "unit",
+            "event_time",
+            "available_at",
+            "ingested_at",
+            "source",
+            "quality",
+            "provenance_kind",
+            "archive_id",
+            "api_batch_id",
+        ]
+        frame = pd.DataFrame([dict(row) for row in rows], columns=observation_columns)
         if frame.empty:
             return frame, {
                 "source": "bybit.public.pit",
                 "database": str(self.path),
                 "requested_features": list(requested),
+                "requested_symbols": list(requested_symbols),
                 "observation_count": 0,
                 "symbol_count": 0,
                 "feature_coverage": {},
                 "snapshot_maximum_sequence": frozen_sequence,
+                "minimum_decision_at": sql_timestamp(decision_minimum),
+                "maximum_decision_at": sql_timestamp(decision_maximum),
+                "effective_available_at_minimum": available_minimum_text,
                 "snapshot_sha256": hashlib.sha256(b"").hexdigest(),
                 "invalidated_observation_count": invalidated_observation_count,
             }
@@ -219,11 +302,15 @@ class BybitPITFeatureSource:
                 "source": "bybit.public.pit",
                 "database": str(self.path),
                 "requested_features": list(requested),
+                "requested_symbols": list(requested_symbols),
                 "observation_count": 0,
                 "symbol_count": 0,
                 "feature_coverage": {},
                 "rejected_source_contract_count": rejected_source_contract_count,
                 "snapshot_maximum_sequence": frozen_sequence,
+                "minimum_decision_at": sql_timestamp(decision_minimum),
+                "maximum_decision_at": sql_timestamp(decision_maximum),
+                "effective_available_at_minimum": available_minimum_text,
                 "snapshot_sha256": hashlib.sha256(b"").hexdigest(),
                 "invalidated_observation_count": invalidated_observation_count,
             }
@@ -376,6 +463,7 @@ class BybitPITFeatureSource:
             "source": "bybit.public.pit",
             "database": str(self.path),
             "requested_features": list(requested),
+            "requested_symbols": list(requested_symbols),
             "observation_count": len(frame),
             "symbol_count": int(frame["symbol"].nunique()),
             "feature_coverage": coverage,
@@ -406,6 +494,9 @@ class BybitPITFeatureSource:
                 else None
             ),
             "snapshot_maximum_sequence": frozen_sequence,
+            "minimum_decision_at": sql_timestamp(decision_minimum),
+            "maximum_decision_at": sql_timestamp(decision_maximum),
+            "effective_available_at_minimum": available_minimum_text,
             "snapshot_sha256": self._snapshot_digest(frame),
             "pit_policy": "symbol-specific latest available_at at or before decision_at with registry staleness cutoff",
         }

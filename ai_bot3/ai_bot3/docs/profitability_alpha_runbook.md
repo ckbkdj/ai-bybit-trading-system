@@ -236,7 +236,17 @@ python scripts/run_profitability_rebuild.py `
 
 每个 trial 必须在 `data/research_trials.sqlite3` 中保留 running、阶段事件和最终 rejected/candidate 记录。不要删除失败 trial。
 
-大样本训练失败时先读取 ledger 的 `pipeline_error`。编码器应只构造一次特征矩阵并逐列原地标准化；ridge、direction 和 meta 优化不得为截距额外复制整块矩阵。已用失败现场同形状的 85,128×40 float64 矩阵做回归验证。该验证只证明内存路径可执行，不是盈利证据。
+大样本训练失败时先读取 ledger 的 `pipeline_error`。编码器应只构造一次特征矩阵并逐列原地标准化；ridge、direction 和 meta 优化不得为截距额外复制整块矩阵。Bybit loader 还必须先冻结 sequence，再按 development 决策窗和各因子最大陈旧期在 SQL 层裁剪；禁止为一个早于现有盘口历史的开发窗把千万级全库载入内存。已用失败现场同形状的 85,128×40 float64 矩阵做回归验证。该验证只证明内存路径可执行，不是盈利证据。
+
+生产 shadow 推理若模型签名包含对应因子，必须同时配置：
+
+```powershell
+$env:BYBIT_PUBLIC_PIT_STORE='D:\Money\ai_bot3\ai_bot3\data\bybit_public_pit.sqlite3'
+$env:MACRO_PIT_STORE='D:\Money\ai_bot3\ai_bot3\data\macro_pit.sqlite3'
+$env:FLOW_PIT_STORE='D:\Money\ai_bot3\ai_bot3\data\flow_pit.sqlite3'
+```
+
+runtime 会校验模型和 bundle 哈希、逐列 staleness、`available_at <= decision_at`、原始响应长度/SHA 和 candidate manifest。任一条件不满足都只输出 `NO_TRADE`，不得由 Brain 或默认值补位。
 
 ## 9. 报告阅读顺序
 

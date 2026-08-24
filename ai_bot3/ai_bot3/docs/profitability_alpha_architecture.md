@@ -59,7 +59,7 @@ flowchart TD
 | 层 | 主要模块 | 只负责什么 | 不允许做什么 |
 |---|---|---|---|
 | 原始数据 | `core/providers/*` | 抓取、解析、哈希、PIT 时间和 append-only 证据 | 训练、调参、生成交易信号 |
-| PIT 接入 | `core/training/bybit_pit_panel.py`、`macro_pit_panel.py`、`flow_pit_panel.py`、`pit_factor_panel.py` | 冻结 sequence/SHA，按决策时间 as-of join，执行 staleness 和来源契约 | 广播当前值到历史、填造缺失因子 |
+| PIT 接入 | `core/training/bybit_pit_panel.py`、`macro_pit_panel.py`、`flow_pit_panel.py`、`pit_factor_panel.py` | 冻结 sequence/SHA，按决策时间 as-of join，执行 staleness 和来源契约；Bybit 训练快照先按 development 决策窗裁剪 | 广播当前值到历史、整库载入无关未来观测、填造缺失因子 |
 | 标签 | `core/labels/triple_barrier.py` | entry fill、TP/SL、max holding、费用、MAE/MFE、partial fill、exit reason | close-to-close 冒充成交结果 |
 | 数据集 | `core/training/pooled_panel.py` | pooled panel、因果 regime、purge、embargo、sealed lockbox | 使用全样本定义 regime、物化封存 lockbox 标签 |
 | 选模 | `core/training/nested_walk_forward.py` | inner OOS 选参，outer OOS 只评分一次 | 用 outer OOS 调参 |
@@ -67,7 +67,7 @@ flowchart TD
 | 回测 | `core/backtest/event_driven.py` | 手续费、点差、动态滑点、funding、partial fill、timeout、latency、路径、MTM | 省略成本、只算收盘收益 |
 | 门禁 | `core/evaluation/profitability_gate.py` | development/lockbox 盈利、回撤、稳定性、集中度和压力测试 | 降低门槛迁就模型 |
 | 发布 | `core/release/*` | 绑定模型、报告、commit、lockbox fingerprint | 未过门禁生成 candidate/live |
-| 生产推理 | `core/models/profitability_runtime.py`、`core/result_manager.py` | 验证 release manifest 后产生并消费 `alpha_prediction` | Brain baseline 独立出票 |
+| 生产推理 | `core/models/profitability_runtime.py`、`core/result_manager.py` | 按签名 feature contract 读取 trad、Bybit、macro、flow 的最新严格 PIT 值，验证 release manifest 后产生并消费 `alpha_prediction` | 缺特征时降级填造、Brain baseline 独立出票 |
 | 交易安全 | 原 hardening 交易模块 | cancel/REPLACE、hedge、kill switch、双开关 | 被研究代码绕过 |
 
 ## 4. 固定周期契约
@@ -151,6 +151,7 @@ FOMC 采集不能用会议日历日期猜测 14:00，也不能把 minutes、impl
 7. 所有实验进入 trial ledger，失败实验也保留。
 8. 因子只有在完整组、足量真实 OOS trades、费用后稳定改善时才能 retained。
 9. 盈利门禁不按单笔交易做独立同分布 bootstrap；先按 UTC 日聚合组合净 PnL、补齐无交易日，再对日簇做 moving-block bootstrap。少于 20 个日簇或任一交易缺少 UTC 时间戳时失败关闭。
+10. Bybit 大库只读取 `[最早 development 决策 - 因子最大陈旧期, development 截止]` 且不超过 trial 冻结 sequence 的观测；新 lockbox 只有 development 通过后才建立独立时间窗快照。
 
 ## 7. 事件回测和回撤
 
@@ -202,6 +203,7 @@ stateDiagram-v2
 - PIT loader 不认识交易模块；
 - model 不直接写订单；
 - release manifest 是研究与生产推理之间的版本化接口；
+- runtime 依据模型签名列决定是否必须读取 Bybit、macro 和 flow PIT 仓，缺仓、过期、未来时间或原始响应哈希不一致都会返回 `NO_TRADE`；
 - `ResultManager` 只消费通过 manifest 校验的 `alpha_prediction`。
 
 仍需继续降低的耦合：

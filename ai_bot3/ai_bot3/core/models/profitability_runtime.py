@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -20,6 +21,8 @@ from core.features.registry import default_registry
 from core.models.two_stage import TwoStageAlphaModel
 from core.release.profitability_release import verify_candidate_authorization
 from core.training.bybit_pit_panel import BybitPITFeatureSource
+from core.training.flow_pit_panel import FLOW_FEATURE_CONTRACTS, FlowPITFeatureSource
+from core.training.macro_pit_panel import MACRO_FEATURE_CONTRACTS, MacroPITFeatureSource
 from core.training.pooled_panel import causal_regime_labels
 
 
@@ -131,6 +134,86 @@ def _external_values(
     return values, evidence
 
 
+@lru_cache(maxsize=16)
+def _verified_pit_history(
+    source_kind: str,
+    store_path: str,
+    names: tuple[str, ...],
+    maximum_sequence: int,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    """Verify immutable raw evidence once for each append-only store snapshot."""
+
+    path = Path(store_path)
+    if source_kind == "macro":
+        source = MacroPITFeatureSource(path)
+    elif source_kind == "flow":
+        source = FlowPITFeatureSource(path)
+    else:  # pragma: no cover - internal programming error
+        raise ValueError(f"unsupported PIT source kind: {source_kind}")
+    return source.load(names, maximum_sequence=maximum_sequence)
+
+
+def _latest_global_pit_values(
+    source_kind: str,
+    store_path: Path,
+    names: list[str],
+    *,
+    decision_at: datetime,
+) -> tuple[dict[str, float], dict[str, object]]:
+    """Resolve one strict as-of macro/flow row from a frozen verified snapshot."""
+
+    path = Path(store_path).expanduser().resolve()
+    if source_kind == "macro":
+        source = MacroPITFeatureSource(path)
+    elif source_kind == "flow":
+        source = FlowPITFeatureSource(path)
+    else:  # pragma: no cover - internal programming error
+        raise ValueError(f"unsupported PIT source kind: {source_kind}")
+    requested = tuple(dict.fromkeys(names))
+    maximum_sequence = source.maximum_sequence()
+    history, snapshot = _verified_pit_history(
+        source_kind,
+        str(path),
+        requested,
+        maximum_sequence,
+    )
+    joined = source.join(
+        pd.DataFrame({"decision_at": [pd.Timestamp(decision_at)]}),
+        names=requested,
+        history=history,
+    )
+    values: dict[str, float] = {}
+    availability: dict[str, str] = {}
+    missing: list[str] = []
+    for name in requested:
+        value = pd.to_numeric(joined.loc[0, name], errors="coerce")
+        available_at = pd.to_datetime(
+            joined.loc[0, f"{name}__available_at"], utc=True, errors="coerce"
+        )
+        if pd.isna(value) or pd.isna(available_at):
+            missing.append(name)
+            continue
+        values[name] = float(value)
+        availability[name] = available_at.isoformat().replace("+00:00", "Z")
+    if missing:
+        raise ValueError(
+            f"fresh {source_kind} PIT features unavailable: {sorted(missing)}"
+        )
+    return values, {
+        "status": "verified",
+        "source": snapshot.get("source"),
+        "database": str(path),
+        "requested_features": list(requested),
+        "available_at": availability,
+        "snapshot_maximum_sequence": maximum_sequence,
+        "snapshot_sha256": snapshot.get("snapshot_sha256"),
+        "response_count": snapshot.get("response_count"),
+        "raw_response_hashes_verified": snapshot.get(
+            "raw_response_hashes_verified"
+        ),
+    }
+
+
 def build_current_feature_rows(
     frame: pd.DataFrame,
     *,
@@ -140,6 +223,8 @@ def build_current_feature_rows(
     latest_decision_at: Any | None = None,
     external_panel_context: Mapping[str, Any] | None = None,
     bybit_pit_store_path: Path | None = None,
+    macro_pit_store_path: Path | None = None,
+    flow_pit_store_path: Path | None = None,
 ) -> tuple[pd.DataFrame, dict[str, object]]:
     if len(frame) < 49:
         raise ValueError("at least 49 chronological bars are required for alpha inference")
@@ -156,6 +241,34 @@ def build_current_feature_rows(
     external, external_evidence = _external_values(
         external_panel_context, decision_at=decision_at
     )
+    required_macro_features = [
+        column for column in model_feature_columns if column in MACRO_FEATURE_CONTRACTS
+    ]
+    macro_values: dict[str, float] = {}
+    macro_evidence: dict[str, object] = {"status": "not_required"}
+    if required_macro_features:
+        if macro_pit_store_path is None:
+            raise ValueError("macro PIT store is required by the signed feature contract")
+        macro_values, macro_evidence = _latest_global_pit_values(
+            "macro",
+            macro_pit_store_path,
+            required_macro_features,
+            decision_at=decision_at,
+        )
+    required_flow_features = [
+        column for column in model_feature_columns if column in FLOW_FEATURE_CONTRACTS
+    ]
+    flow_values: dict[str, float] = {}
+    flow_evidence: dict[str, object] = {"status": "not_required"}
+    if required_flow_features:
+        if flow_pit_store_path is None:
+            raise ValueError("flow PIT store is required by the signed feature contract")
+        flow_values, flow_evidence = _latest_global_pit_values(
+            "flow",
+            flow_pit_store_path,
+            required_flow_features,
+            decision_at=decision_at,
+        )
     required_bybit_features = []
     registry = default_registry()
     for column in model_feature_columns:
@@ -199,6 +312,8 @@ def build_current_feature_rows(
         }
     )
     base.update(external)
+    base.update(macro_values)
+    base.update(flow_values)
     base.update(bybit_values)
     missing = [
         column
@@ -227,6 +342,8 @@ def build_current_feature_rows(
         "decision_at": _iso(decision_at),
         "feature_snapshot_sha256": snapshot_hash,
         "external_panel": external_evidence,
+        "macro_pit": macro_evidence,
+        "flow_pit": flow_evidence,
         "bybit_public_pit": bybit_evidence,
     }
 
@@ -239,6 +356,8 @@ def generate_profitability_alpha_prediction(
     latest_decision_at: Any | None = None,
     external_panel_context: Mapping[str, Any] | None = None,
     bybit_pit_store_path: Path | None = None,
+    macro_pit_store_path: Path | None = None,
+    flow_pit_store_path: Path | None = None,
     model_bundle_path: Path | None = None,
     profitability_report_path: Path | None = None,
     candidate_manifest_path: Path | None = None,
@@ -297,6 +416,22 @@ def generate_profitability_alpha_prediction(
                 or (
                     Path(os.environ["BYBIT_PUBLIC_PIT_STORE"])
                     if os.environ.get("BYBIT_PUBLIC_PIT_STORE")
+                    else None
+                )
+            ),
+            macro_pit_store_path=(
+                macro_pit_store_path
+                or (
+                    Path(os.environ["MACRO_PIT_STORE"])
+                    if os.environ.get("MACRO_PIT_STORE")
+                    else None
+                )
+            ),
+            flow_pit_store_path=(
+                flow_pit_store_path
+                or (
+                    Path(os.environ["FLOW_PIT_STORE"])
+                    if os.environ.get("FLOW_PIT_STORE")
                     else None
                 )
             ),

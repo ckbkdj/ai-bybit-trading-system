@@ -163,6 +163,39 @@ def test_bybit_training_snapshot_is_frozen_at_append_only_sequence(tmp_path):
     assert len(evidence["snapshot_sha256"]) == 64
 
 
+def test_bybit_training_snapshot_is_bounded_to_decision_window(tmp_path):
+    database = tmp_path / "bybit.sqlite3"
+    store = BybitPublicPITStore(database)
+    ingestor = BybitPublicPITIngestor(store, session_id="bounded-window")
+    old_time = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    current_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    ingestor.ingest(
+        _snapshot("BTCUSDT", old_time, 8),
+        received_at=old_time + timedelta(milliseconds=250),
+    )
+    ingestor.ingest(
+        _snapshot("BTCUSDT", current_time, 12),
+        received_at=current_time + timedelta(milliseconds=250),
+    )
+    decision_at = current_time + timedelta(seconds=20)
+
+    history, evidence = BybitPITFeatureSource(database).load(
+        ["orderbook_depth_usdt_l5"],
+        minimum_decision_at=decision_at,
+        maximum_decision_at=decision_at,
+        symbols=("BTCUSDT",),
+    )
+
+    assert len(history) == 1
+    assert history.iloc[0]["event_time"] == pd.Timestamp(current_time)
+    assert evidence["minimum_decision_at"] == decision_at.isoformat().replace(
+        "+00:00", "Z"
+    )
+    assert evidence["maximum_decision_at"] == evidence["minimum_decision_at"]
+    assert evidence["requested_symbols"] == ["BTCUSDT"]
+    assert evidence["effective_available_at_minimum"] < evidence["minimum_decision_at"]
+
+
 def test_bybit_loader_accepts_mixed_iso_precision_without_coercing_valid_time(tmp_path):
     database = tmp_path / "bybit.sqlite3"
     store = BybitPublicPITStore(database)
