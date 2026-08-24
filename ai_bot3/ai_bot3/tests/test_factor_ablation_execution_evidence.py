@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT))
 
 from core.evaluation.profitability_rebuild import (
     _ablation_execution_evidence,
+    _ablation_score_threshold,
     _ablation_signals_from_predictions,
     _execution_release_evidence,
     _failed_ablation_execution_result,
@@ -192,8 +193,47 @@ def test_ablation_research_budget_measures_rankings_without_faking_deployable_ed
                 )
             )
 
+    frame = pd.DataFrame(rows)
+    threshold = _ablation_score_threshold(frame, predictions)
+    # Doubling the outer-OOS interval with low-score future decisions must not
+    # change a cutoff that was fixed on the calibration/training interval.
+    for decision in range(100, 200):
+        decision_at = start + timedelta(minutes=3 * decision)
+        for side in ("BUY", "SELL"):
+            rows.append(
+                {
+                    "symbol": "BTCUSDT",
+                    "decision_at": decision_at,
+                    "available_at": decision_at,
+                    "side": side,
+                    "reference_price": 100.0,
+                    "take_profit_bps": 100.0,
+                    "stop_loss_bps": 75.0,
+                    "regime": "neutral",
+                }
+            )
+            predictions.append(
+                TwoStagePrediction(
+                    p_down=0.2 if side == "BUY" else 0.6,
+                    p_flat=0.2,
+                    p_up=0.6 if side == "BUY" else 0.2,
+                    expected_net_return=-1.0,
+                    return_p10=-1.0,
+                    return_p50=-1.0,
+                    return_p90=-1.0,
+                    expected_mae=0.001,
+                    expected_mfe=0.001,
+                    uncertainty=0.5,
+                    meta_trade_probability=0.2,
+                    lower_bound_net_edge=-0.001,
+                    decision="NO_TRADE",
+                )
+            )
     signals = _ablation_signals_from_predictions(
-        pd.DataFrame(rows), predictions, horizon_sec=180
+        pd.DataFrame(rows),
+        predictions,
+        horizon_sec=180,
+        minimum_score=threshold,
     )
 
     assert len(signals) == 2

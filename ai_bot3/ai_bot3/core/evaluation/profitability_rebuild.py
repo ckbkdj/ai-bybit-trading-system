@@ -108,6 +108,7 @@ LONG_FACTOR_GROUPS: Mapping[str, tuple[str, ...]] = {
 }
 MINIMUM_ABLATION_OOS_TRADES = 30
 MINIMUM_ABLATION_TRADED_FOLDS = 2
+MINIMUM_SHORT_FACTOR_HISTORY_DAYS = 180.0
 ABLATION_RESEARCH_SELECTION_FRACTION = 0.02
 ABLATION_RESEARCH_TAIL_PENALTY = 0.50
 BYBIT_EXECUTION_EVIDENCE_FEATURES = tuple(
@@ -597,16 +598,18 @@ def _ablation_signals_from_predictions(
     frame: pd.DataFrame,
     predictions: Sequence[TwoStagePrediction],
     horizon_sec: int,
+    *,
+    minimum_score: float,
 ) -> list[SignalEvent]:
-    """Create a fixed-budget OOS research portfolio without relaxing release gates.
+    """Apply a training-calibrated research threshold without relaxing release gates.
 
     A factor can improve ranking while every candidate still has a negative
     deployable expectancy lower bound.  Reusing the production TRADE gate in
     that situation makes the ablation degenerate to zero observations.  This
-    policy ranks paired BUY/SELL alternatives using predictions only, selects
-    a pre-committed fraction, and then charges the normal event-driven costs
-    and portfolio risk limits.  Its signals retain their true (possibly
-    negative) lower bound and are never eligible for release or ticketing.
+    The caller must calibrate ``minimum_score`` before the outer OOS interval.
+    The OOS score distribution is never used to decide how many signals to
+    retain. Signals keep their true (possibly negative) lower bound and remain
+    ineligible for release or ticketing.
     """
 
     if len(frame) != len(predictions):
@@ -637,11 +640,7 @@ def _ablation_signals_from_predictions(
             ranked.append(max(paired, key=lambda item: (item[0], item[1])))
     if not ranked:
         return []
-    selected_count = max(
-        1,
-        int(math.ceil(len(ranked) * ABLATION_RESEARCH_SELECTION_FRACTION)),
-    )
-    selected = sorted(ranked, key=lambda item: (-item[0], item[1]))[:selected_count]
+    selected = [item for item in ranked if item[0] >= minimum_score]
     signals: list[SignalEvent] = []
     for score, stable_key, row, prediction in selected:
         token = hashlib.sha256(
@@ -667,6 +666,46 @@ def _ablation_signals_from_predictions(
             )
         )
     return signals
+
+
+def _ablation_score_threshold(
+    calibration_frame: pd.DataFrame,
+    predictions: Sequence[TwoStagePrediction],
+) -> float:
+    """Pre-commit a score cutoff using outer-training predictions only."""
+
+    if len(calibration_frame) != len(predictions):
+        raise ValueError("prediction and calibration frame lengths differ")
+    candidates = calibration_frame.copy().reset_index(drop=True)
+    candidates["_prediction"] = list(predictions)
+    scores: list[float] = []
+    for _, group in candidates.groupby(["symbol", "decision_at"], sort=True):
+        paired: list[float] = []
+        for _, row in group.iterrows():
+            prediction = row["_prediction"]
+            direction_ok = (
+                row["side"] == "BUY" and prediction.p_up >= prediction.p_down
+            ) or (
+                row["side"] == "SELL" and prediction.p_down >= prediction.p_up
+            )
+            if direction_ok:
+                paired.append(
+                    float(
+                        prediction.expected_net_return
+                        - ABLATION_RESEARCH_TAIL_PENALTY * prediction.expected_mae
+                    )
+                )
+        if paired:
+            scores.append(max(paired))
+    if not scores:
+        raise ValueError("ablation calibration produced no direction-consistent scores")
+    return float(
+        np.quantile(
+            np.asarray(scores, dtype=float),
+            1.0 - ABLATION_RESEARCH_SELECTION_FRACTION,
+            method="higher",
+        )
+    )
 
 
 def _factor_ablation_report(
@@ -706,6 +745,9 @@ def _factor_ablation_report(
             "scope": "factor_ablation_only_not_release_eligible",
             "ranking": "predicted_net_return_minus_fixed_tail_penalty_times_predicted_mae",
             "selection_fraction": ABLATION_RESEARCH_SELECTION_FRACTION,
+            "threshold_calibration": (
+                "outer_train_predictions_only_fixed_before_outer_oos"
+            ),
             "tail_penalty": ABLATION_RESEARCH_TAIL_PENALTY,
             "production_lower_bound_gate_relaxed": False,
             "research_backtest_accepts_negative_edge_for_measurement": True,
@@ -912,13 +954,27 @@ def _evaluate_legacy_technical_ablation(
             augmented_selection = selector.select_and_fit(
                 eligible_train, FEATURE_COLUMNS + tuple(columns)
             )
+            baseline_threshold = _ablation_score_threshold(
+                eligible_train,
+                baseline_selection.model.predict(eligible_train),
+            )
+            augmented_threshold = _ablation_score_threshold(
+                eligible_train,
+                augmented_selection.model.predict(eligible_train),
+            )
             baseline_predictions = baseline_selection.model.predict(eligible_test)
             augmented_predictions = augmented_selection.model.predict(eligible_test)
             baseline_signals = _ablation_signals_from_predictions(
-                eligible_test, baseline_predictions, horizon
+                eligible_test,
+                baseline_predictions,
+                horizon,
+                minimum_score=baseline_threshold,
             )
             augmented_signals = _ablation_signals_from_predictions(
-                eligible_test, augmented_predictions, horizon
+                eligible_test,
+                augmented_predictions,
+                horizon,
+                minimum_score=augmented_threshold,
             )
             baseline_report = backtest.run(baseline_signals, market)
             augmented_report = backtest.run(augmented_signals, market)
@@ -938,6 +994,7 @@ def _evaluate_legacy_technical_ablation(
                     "train_rows": len(eligible_train),
                     "test_rows": len(eligible_test),
                     "baseline_signals": len(baseline_signals),
+                    "baseline_outer_train_score_threshold": baseline_threshold,
                     "baseline_trades": len(baseline_report.trades),
                     "baseline_net_return": baseline_report.net_return,
                     "baseline_execution": baseline_metrics,
@@ -947,6 +1004,7 @@ def _evaluate_legacy_technical_ablation(
                         meta_threshold=baseline_selection.selected_config.meta_trade_probability,
                     ),
                     "augmented_signals": len(augmented_signals),
+                    "augmented_outer_train_score_threshold": augmented_threshold,
                     "augmented_trades": len(augmented_report.trades),
                     "augmented_net_return": augmented_report.net_return,
                     "augmented_execution": augmented_metrics,
@@ -1094,13 +1152,27 @@ def _evaluate_long_factor_ablation(
                 augmented_selection = selector.select_and_fit(
                     eligible_train, FEATURE_COLUMNS + tuple(columns)
                 )
+                baseline_threshold = _ablation_score_threshold(
+                    eligible_train,
+                    baseline_selection.model.predict(eligible_train),
+                )
+                augmented_threshold = _ablation_score_threshold(
+                    eligible_train,
+                    augmented_selection.model.predict(eligible_train),
+                )
                 baseline_predictions = baseline_selection.model.predict(eligible_test)
                 augmented_predictions = augmented_selection.model.predict(eligible_test)
                 baseline_signals = _ablation_signals_from_predictions(
-                    eligible_test, baseline_predictions, horizon
+                    eligible_test,
+                    baseline_predictions,
+                    horizon,
+                    minimum_score=baseline_threshold,
                 )
                 augmented_signals = _ablation_signals_from_predictions(
-                    eligible_test, augmented_predictions, horizon
+                    eligible_test,
+                    augmented_predictions,
+                    horizon,
+                    minimum_score=augmented_threshold,
                 )
                 baseline_report = backtest.run(baseline_signals, market)
                 augmented_report = backtest.run(augmented_signals, market)
@@ -1130,11 +1202,13 @@ def _evaluate_long_factor_ablation(
                         "train_rows": len(eligible_train),
                         "test_rows": len(eligible_test),
                         "baseline_signals": len(baseline_signals),
+                        "baseline_outer_train_score_threshold": baseline_threshold,
                         "baseline_trades": len(baseline_report.trades),
                         "baseline_net_return": baseline_report.net_return,
                         "baseline_execution": baseline_metrics,
                         "baseline_prediction_gate": baseline_gate_diagnostics,
                         "augmented_signals": len(augmented_signals),
+                        "augmented_outer_train_score_threshold": augmented_threshold,
                         "augmented_trades": len(augmented_report.trades),
                         "augmented_net_return": augmented_report.net_return,
                         "augmented_execution": augmented_metrics,
@@ -1225,7 +1299,7 @@ def _evaluate_bybit_pit_ablation(
     source_evidence: Mapping[str, object],
     *,
     factor_groups: Mapping[str, tuple[str, ...]] = SHORT_FACTOR_GROUPS,
-    minimum_history_days: float = 30.0,
+    minimum_history_days: float = MINIMUM_SHORT_FACTOR_HISTORY_DAYS,
 ) -> dict[str, dict[str, object]]:
     """Ablate real short-horizon features only after sufficient PIT history exists."""
 
@@ -1300,13 +1374,27 @@ def _evaluate_bybit_pit_ablation(
                 augmented_selection = selector.select_and_fit(
                     eligible_train, FEATURE_COLUMNS + tuple(columns)
                 )
+                baseline_threshold = _ablation_score_threshold(
+                    eligible_train,
+                    baseline_selection.model.predict(eligible_train),
+                )
+                augmented_threshold = _ablation_score_threshold(
+                    eligible_train,
+                    augmented_selection.model.predict(eligible_train),
+                )
                 baseline_predictions = baseline_selection.model.predict(eligible_test)
                 augmented_predictions = augmented_selection.model.predict(eligible_test)
                 baseline_signals = _ablation_signals_from_predictions(
-                    eligible_test, baseline_predictions, horizon
+                    eligible_test,
+                    baseline_predictions,
+                    horizon,
+                    minimum_score=baseline_threshold,
                 )
                 augmented_signals = _ablation_signals_from_predictions(
-                    eligible_test, augmented_predictions, horizon
+                    eligible_test,
+                    augmented_predictions,
+                    horizon,
+                    minimum_score=augmented_threshold,
                 )
                 baseline_report = backtest.run(baseline_signals, market)
                 augmented_report = backtest.run(augmented_signals, market)
@@ -1326,6 +1414,7 @@ def _evaluate_bybit_pit_ablation(
                         "train_rows": len(eligible_train),
                         "test_rows": len(eligible_test),
                         "baseline_signals": len(baseline_signals),
+                        "baseline_outer_train_score_threshold": baseline_threshold,
                         "baseline_trades": len(baseline_report.trades),
                         "baseline_net_return": baseline_report.net_return,
                         "baseline_execution": baseline_metrics,
@@ -1335,6 +1424,7 @@ def _evaluate_bybit_pit_ablation(
                             meta_threshold=baseline_selection.selected_config.meta_trade_probability,
                         ),
                         "augmented_signals": len(augmented_signals),
+                        "augmented_outer_train_score_threshold": augmented_threshold,
                         "augmented_trades": len(augmented_report.trades),
                         "augmented_net_return": augmented_report.net_return,
                         "augmented_execution": augmented_metrics,

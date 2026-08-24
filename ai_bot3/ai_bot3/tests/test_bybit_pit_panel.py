@@ -105,6 +105,10 @@ def test_symbol_partitioned_bybit_history_joins_only_fresh_available_values(tmp_
         item["oos_ablation_status"] == "COLLECTING_INSUFFICIENT_PIT_HISTORY"
         for item in report.values()
     )
+    assert all(
+        item["minimum_required_history_days"] == 180.0
+        for item in report.values()
+    )
 
 
 def test_ofi_source_contract_keeps_legacy_trade_semantics_for_audit_only(tmp_path):
