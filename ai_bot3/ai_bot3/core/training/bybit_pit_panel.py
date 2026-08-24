@@ -66,10 +66,11 @@ class BybitPITFeatureSource:
         connection.row_factory = sqlite3.Row
         return connection
 
-    def maximum_sequence(self) -> int:
-        """Freeze an append-only observation boundary for one experiment."""
+    def snapshot_watermarks(self) -> tuple[int, int]:
+        """Freeze observation and invalidation journals in one SQLite snapshot."""
 
         with closing(self._connect()) as connection:
+            connection.execute("BEGIN")
             table = connection.execute(
                 """SELECT 1 FROM sqlite_master
                      WHERE type='table' AND name='bybit_feature_observations'"""
@@ -79,10 +80,32 @@ class BybitPITFeatureSource:
             row = connection.execute(
                 "SELECT COALESCE(MAX(sequence),0) FROM bybit_feature_observations"
             ).fetchone()
-        return int(row[0])
+            invalidation_table = connection.execute(
+                """SELECT 1 FROM sqlite_master
+                     WHERE type='table' AND name='bybit_feature_invalidations'"""
+            ).fetchone()
+            invalidation_row = (
+                connection.execute(
+                    "SELECT COALESCE(MAX(rowid),0) FROM bybit_feature_invalidations"
+                ).fetchone()
+                if invalidation_table
+                else (0,)
+            )
+        return int(row[0]), int(invalidation_row[0])
+
+    def maximum_sequence(self) -> int:
+        return self.snapshot_watermarks()[0]
+
+    def maximum_invalidation_rowid(self) -> int:
+        return self.snapshot_watermarks()[1]
 
     @staticmethod
-    def _snapshot_digest(frame: pd.DataFrame) -> str:
+    def _snapshot_digest(
+        frame: pd.DataFrame,
+        *,
+        maximum_sequence: int,
+        maximum_invalidation_rowid: int,
+    ) -> str:
         columns = [
             "sequence",
             "observation_id",
@@ -107,6 +130,16 @@ class BybitPITFeatureSource:
             json.dumps(columns, separators=(",", ":")).encode("utf-8")
         )
         digest.update(
+            json.dumps(
+                {
+                    "maximum_invalidation_rowid": maximum_invalidation_rowid,
+                    "maximum_sequence": maximum_sequence,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        digest.update(
             pd.util.hash_pandas_object(payload, index=False, categorize=True)
             .to_numpy(dtype="uint64")
             .tobytes()
@@ -118,6 +151,7 @@ class BybitPITFeatureSource:
         names: Sequence[str],
         *,
         maximum_sequence: int | None = None,
+        maximum_invalidation_rowid: int | None = None,
         minimum_decision_at: object | None = None,
         maximum_decision_at: object | None = None,
         symbols: Sequence[str] | None = None,
@@ -135,19 +169,29 @@ class BybitPITFeatureSource:
         )
         if symbols is not None and not requested_symbols:
             raise ValueError("Bybit PIT symbol filter cannot be empty")
+        if (maximum_sequence is None) != (maximum_invalidation_rowid is None):
+            raise ValueError(
+                "Bybit PIT observation and invalidation watermarks must be frozen together"
+            )
         symbol_clause = ""
         symbol_parameters: tuple[object, ...] = ()
         if requested_symbols:
             symbol_placeholders = ",".join("?" for _ in requested_symbols)
             symbol_clause = f" AND o.symbol IN ({symbol_placeholders})"
             symbol_parameters = requested_symbols
+        current_sequence, current_invalidation_rowid = self.snapshot_watermarks()
         frozen_sequence = (
-            self.maximum_sequence()
-            if maximum_sequence is None
-            else int(maximum_sequence)
+            current_sequence if maximum_sequence is None else int(maximum_sequence)
+        )
+        frozen_invalidation_rowid = (
+            current_invalidation_rowid
+            if maximum_invalidation_rowid is None
+            else int(maximum_invalidation_rowid)
         )
         if frozen_sequence < 0:
             raise ValueError("Bybit PIT maximum_sequence cannot be negative")
+        if frozen_invalidation_rowid < 0:
+            raise ValueError("Bybit PIT maximum_invalidation_rowid cannot be negative")
         decision_minimum = pd.to_datetime(
             minimum_decision_at, utc=True, errors="coerce"
         )
@@ -218,9 +262,13 @@ class BybitPITFeatureSource:
                      WHERE type='table' AND name='bybit_feature_invalidations'"""
             ).fetchone()
             invalidation_clause = (
-                "AND o.observation_id NOT IN (SELECT observation_id FROM bybit_feature_invalidations)"
+                "AND o.observation_id NOT IN (SELECT observation_id "
+                "FROM bybit_feature_invalidations WHERE rowid<=?)"
                 if invalidation_table
                 else ""
+            )
+            invalidation_parameters: tuple[object, ...] = (
+                (frozen_invalidation_rowid,) if invalidation_table else ()
             )
             invalidated_observation_count = (
                 int(
@@ -229,10 +277,12 @@ class BybitPITFeatureSource:
                                FROM bybit_feature_invalidations i
                               JOIN bybit_feature_observations o
                                  ON o.observation_id=i.observation_id
-                              WHERE o.name IN ({placeholders}) AND o.sequence<=?
+                              WHERE i.rowid<=? AND o.name IN ({placeholders})
+                                    AND o.sequence<=?
                                     {symbol_clause}
                                     {time_clause}""",
-                        requested
+                        (frozen_invalidation_rowid,)
+                        + requested
                         + (frozen_sequence,)
                         + symbol_parameters
                         + tuple(time_parameters),
@@ -255,7 +305,8 @@ class BybitPITFeatureSource:
                 requested
                 + (frozen_sequence,)
                 + symbol_parameters
-                + tuple(time_parameters),
+                + tuple(time_parameters)
+                + invalidation_parameters,
             ).fetchall()
         observation_columns = [
             "sequence",
@@ -284,10 +335,15 @@ class BybitPITFeatureSource:
                 "symbol_count": 0,
                 "feature_coverage": {},
                 "snapshot_maximum_sequence": frozen_sequence,
+                "snapshot_maximum_invalidation_rowid": frozen_invalidation_rowid,
                 "minimum_decision_at": sql_timestamp(decision_minimum),
                 "maximum_decision_at": sql_timestamp(decision_maximum),
                 "effective_available_at_minimum": available_minimum_text,
-                "snapshot_sha256": hashlib.sha256(b"").hexdigest(),
+                "snapshot_sha256": self._snapshot_digest(
+                    frame,
+                    maximum_sequence=frozen_sequence,
+                    maximum_invalidation_rowid=frozen_invalidation_rowid,
+                ),
                 "invalidated_observation_count": invalidated_observation_count,
             }
         accepted_source = frame.apply(
@@ -308,10 +364,15 @@ class BybitPITFeatureSource:
                 "feature_coverage": {},
                 "rejected_source_contract_count": rejected_source_contract_count,
                 "snapshot_maximum_sequence": frozen_sequence,
+                "snapshot_maximum_invalidation_rowid": frozen_invalidation_rowid,
                 "minimum_decision_at": sql_timestamp(decision_minimum),
                 "maximum_decision_at": sql_timestamp(decision_maximum),
                 "effective_available_at_minimum": available_minimum_text,
-                "snapshot_sha256": hashlib.sha256(b"").hexdigest(),
+                "snapshot_sha256": self._snapshot_digest(
+                    frame,
+                    maximum_sequence=frozen_sequence,
+                    maximum_invalidation_rowid=frozen_invalidation_rowid,
+                ),
                 "invalidated_observation_count": invalidated_observation_count,
             }
         for column in ("event_time", "available_at", "ingested_at"):
@@ -494,10 +555,15 @@ class BybitPITFeatureSource:
                 else None
             ),
             "snapshot_maximum_sequence": frozen_sequence,
+            "snapshot_maximum_invalidation_rowid": frozen_invalidation_rowid,
             "minimum_decision_at": sql_timestamp(decision_minimum),
             "maximum_decision_at": sql_timestamp(decision_maximum),
             "effective_available_at_minimum": available_minimum_text,
-            "snapshot_sha256": self._snapshot_digest(frame),
+            "snapshot_sha256": self._snapshot_digest(
+                frame,
+                maximum_sequence=frozen_sequence,
+                maximum_invalidation_rowid=frozen_invalidation_rowid,
+            ),
             "pit_policy": "symbol-specific latest available_at at or before decision_at with registry staleness cutoff",
         }
 
@@ -563,6 +629,12 @@ class BybitPITFeatureSource:
         values: dict[str, float] = {}
         available: dict[str, str] = {}
         with closing(self._connect()) as connection:
+            connection.execute("BEGIN")
+            snapshot_maximum_sequence = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(sequence),0) FROM bybit_feature_observations"
+                ).fetchone()[0]
+            )
             invalidation_table = connection.execute(
                 """SELECT 1 FROM sqlite_master
                      WHERE type='table' AND name='bybit_feature_invalidations'"""
@@ -571,6 +643,15 @@ class BybitPITFeatureSource:
                 "AND observation_id NOT IN (SELECT observation_id FROM bybit_feature_invalidations)"
                 if invalidation_table
                 else ""
+            )
+            snapshot_maximum_invalidation_rowid = (
+                int(
+                    connection.execute(
+                        "SELECT COALESCE(MAX(rowid),0) FROM bybit_feature_invalidations"
+                    ).fetchone()[0]
+                )
+                if invalidation_table
+                else 0
             )
             for name in names:
                 definition = self.registry.require(name)
@@ -618,6 +699,10 @@ class BybitPITFeatureSource:
             "requested_features": list(names),
             "available_features": sorted(values),
             "feature_available_at": available,
+            "snapshot_maximum_sequence": snapshot_maximum_sequence,
+            "snapshot_maximum_invalidation_rowid": (
+                snapshot_maximum_invalidation_rowid
+            ),
         }
 
 

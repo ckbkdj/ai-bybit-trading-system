@@ -1413,10 +1413,15 @@ class ProfitabilityRebuild:
         self.source = KlinePanelSource(config.feature_store_path)
         self.ledger = TrialLedger(config.trial_ledger_path)
         self.bybit_pit_snapshot_maximum_sequence = None
+        self.bybit_pit_snapshot_maximum_invalidation_rowid = None
         if config.bybit_pit_store_path is not None:
-            self.bybit_pit_snapshot_maximum_sequence = BybitPITFeatureSource(
+            bybit_source = BybitPITFeatureSource(
                 config.bybit_pit_store_path
-            ).maximum_sequence()
+            )
+            (
+                self.bybit_pit_snapshot_maximum_sequence,
+                self.bybit_pit_snapshot_maximum_invalidation_rowid,
+            ) = bybit_source.snapshot_watermarks()
         self.macro_pit_snapshot_maximum_sequence = None
         if config.macro_pit_store_path is not None:
             self.macro_pit_snapshot_maximum_sequence = MacroPITFeatureSource(
@@ -1454,6 +1459,9 @@ class ProfitabilityRebuild:
                 else None
             ),
             "bybit_pit_snapshot_maximum_sequence": self.bybit_pit_snapshot_maximum_sequence,
+            "bybit_pit_snapshot_maximum_invalidation_rowid": (
+                self.bybit_pit_snapshot_maximum_invalidation_rowid
+            ),
             "macro_pit_store": (
                 str(config.macro_pit_store_path.resolve())
                 if config.macro_pit_store_path
@@ -1548,6 +1556,9 @@ class ProfitabilityRebuild:
                 bybit_history, horizon_evidence = bybit_source.load(
                     requested_bybit_names,
                     maximum_sequence=self.bybit_pit_snapshot_maximum_sequence,
+                    maximum_invalidation_rowid=(
+                        self.bybit_pit_snapshot_maximum_invalidation_rowid
+                    ),
                     minimum_decision_at=decision_minimum,
                     maximum_decision_at=development_decision_end,
                     symbols=SYMBOLS,
@@ -2084,12 +2095,18 @@ class ProfitabilityRebuild:
             )
         lockbox_bybit_source = bybit_source
         lockbox_bybit_maximum_sequence = self.bybit_pit_snapshot_maximum_sequence
+        lockbox_bybit_maximum_invalidation_rowid = (
+            self.bybit_pit_snapshot_maximum_invalidation_rowid
+        )
         lockbox_bybit_snapshot: dict[str, object] = {
             "policy": "reuse_frozen_development_snapshot",
             "database": (
                 str(bybit_source.path) if bybit_source is not None else None
             ),
             "snapshot_maximum_sequence": lockbox_bybit_maximum_sequence,
+            "snapshot_maximum_invalidation_rowid": (
+                lockbox_bybit_maximum_invalidation_rowid
+            ),
         }
         if self.config.lockbox_bybit_pit_store_path is not None:
             # This store is deliberately not instantiated, stat-ed, or queried
@@ -2098,13 +2115,17 @@ class ProfitabilityRebuild:
             lockbox_bybit_source = BybitPITFeatureSource(
                 self.config.lockbox_bybit_pit_store_path
             )
-            lockbox_bybit_maximum_sequence = (
-                lockbox_bybit_source.maximum_sequence()
-            )
+            (
+                lockbox_bybit_maximum_sequence,
+                lockbox_bybit_maximum_invalidation_rowid,
+            ) = lockbox_bybit_source.snapshot_watermarks()
             lockbox_bybit_snapshot = {
                 "policy": "separate_post_development_snapshot",
                 "database": str(lockbox_bybit_source.path),
                 "snapshot_maximum_sequence": lockbox_bybit_maximum_sequence,
+                "snapshot_maximum_invalidation_rowid": (
+                    lockbox_bybit_maximum_invalidation_rowid
+                ),
             }
         kline_snapshot_sha256 = _sha256_file(self.config.feature_store_path)
         post_hash_feature_store_stat = self.config.feature_store_path.stat()
@@ -2204,6 +2225,9 @@ class ProfitabilityRebuild:
                     lockbox_bybit_source.load(
                         requested_bybit_names,
                         maximum_sequence=lockbox_bybit_maximum_sequence,
+                        maximum_invalidation_rowid=(
+                            lockbox_bybit_maximum_invalidation_rowid
+                        ),
                         minimum_decision_at=lockbox_start_by_horizon[horizon],
                         maximum_decision_at=max(last_complete_by_symbol.values()),
                         symbols=SYMBOLS,

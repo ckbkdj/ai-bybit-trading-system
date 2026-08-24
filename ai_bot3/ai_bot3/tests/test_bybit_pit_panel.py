@@ -136,7 +136,9 @@ def test_ofi_source_contract_keeps_legacy_trade_semantics_for_audit_only(tmp_pat
     assert latest["ofi_1m"] == 0.0
 
 
-def test_bybit_training_snapshot_is_frozen_at_append_only_sequence(tmp_path):
+def test_bybit_training_snapshot_freezes_observation_and_invalidation_journals(
+    tmp_path,
+):
     database = tmp_path / "bybit.sqlite3"
     store = BybitPublicPITStore(database)
     ingestor = BybitPublicPITIngestor(store, session_id="frozen-sequence")
@@ -146,20 +148,49 @@ def test_bybit_training_snapshot_is_frozen_at_append_only_sequence(tmp_path):
         received_at=first_time + timedelta(milliseconds=250),
     )
     source = BybitPITFeatureSource(database)
-    frozen_sequence = source.maximum_sequence()
+    frozen_sequence, frozen_invalidation_rowid = source.snapshot_watermarks()
+    with store.connect() as connection:
+        first_observation_id = connection.execute(
+            """SELECT observation_id FROM bybit_feature_observations
+                 WHERE name='orderbook_depth_usdt_l5' ORDER BY sequence LIMIT 1"""
+        ).fetchone()[0]
     second_time = first_time + timedelta(minutes=1)
     ingestor.ingest(
         _snapshot("BTCUSDT", second_time, 12),
         received_at=second_time + timedelta(milliseconds=250),
     )
+    with store.connect() as connection:
+        connection.execute(
+            """INSERT INTO bybit_feature_invalidations(
+                   observation_id,invalidated_at,reason,correction_version
+               ) VALUES (?,?,?,?)""",
+            (
+                first_observation_id,
+                second_time.isoformat(),
+                "test correction after experiment snapshot",
+                "test-v2",
+            ),
+        )
+        connection.commit()
 
     frozen, evidence = source.load(
-        ["orderbook_depth_usdt_l5"], maximum_sequence=frozen_sequence
+        ["orderbook_depth_usdt_l5"],
+        maximum_sequence=frozen_sequence,
+        maximum_invalidation_rowid=frozen_invalidation_rowid,
     )
-    current, _ = source.load(["orderbook_depth_usdt_l5"])
+    current, current_evidence = source.load(["orderbook_depth_usdt_l5"])
     assert len(frozen) == 1
-    assert len(current) == 2
+    assert len(current) == 1
+    assert frozen.iloc[0]["value"] != current.iloc[0]["value"]
     assert evidence["snapshot_maximum_sequence"] == frozen_sequence
+    assert (
+        evidence["snapshot_maximum_invalidation_rowid"]
+        == frozen_invalidation_rowid
+    )
+    assert (
+        current_evidence["snapshot_maximum_invalidation_rowid"]
+        > frozen_invalidation_rowid
+    )
     assert len(evidence["snapshot_sha256"]) == 64
 
 
