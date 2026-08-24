@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
@@ -128,6 +129,18 @@ def test_official_derivative_history_is_hashed_and_pit_joinable(tmp_path: Path) 
     assert all(
         len(item["content_sha256"]) == 64
         for item in evidence["historical_api_responses"]
+    )
+    with store.connect() as connection:
+        raw_responses = connection.execute(
+            """SELECT content_blob,content_length,content_sha256
+                 FROM bybit_historical_api_responses"""
+        ).fetchall()
+    assert len(raw_responses) == 7
+    assert all(
+        len(row["content_blob"]) == row["content_length"]
+        and hashlib.sha256(row["content_blob"]).hexdigest()
+        == row["content_sha256"]
+        for row in raw_responses
     )
     assert not (
         (history["event_time"] > history["available_at"])

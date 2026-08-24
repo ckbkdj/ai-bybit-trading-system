@@ -96,6 +96,7 @@ class APIResponseEvidence:
     http_status: int
     content_length: int
     content_sha256: str
+    content_blob: bytes
     rows_read: int
     ret_code: int
 
@@ -199,6 +200,7 @@ def _fetch(
         http_status=response.http_status,
         content_length=len(response.body),
         content_sha256=content_sha256,
+        content_blob=response.body,
         rows_read=len(rows),
         ret_code=ret_code,
     )

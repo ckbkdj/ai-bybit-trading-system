@@ -201,6 +201,7 @@ class BybitPublicPITStore:
                     http_status INTEGER NOT NULL,
                     content_length INTEGER NOT NULL,
                     content_sha256 TEXT NOT NULL,
+                    content_blob BLOB NOT NULL,
                     rows_read INTEGER NOT NULL,
                     ret_code INTEGER NOT NULL,
                     UNIQUE(batch_id,request_url)
@@ -374,6 +375,17 @@ class BybitPublicPITStore:
                 connection.execute(
                     """ALTER TABLE bybit_live_capture_audits
                        ADD COLUMN liquidation_feature_count INTEGER NOT NULL DEFAULT 0"""
+                )
+            api_response_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(bybit_historical_api_responses)"
+                ).fetchall()
+            }
+            if "content_blob" not in api_response_columns:
+                connection.execute(
+                    """ALTER TABLE bybit_historical_api_responses
+                       ADD COLUMN content_blob BLOB"""
                 )
             migration_id = "invalidate-bybit-liquidation-side-v1"
             migration_applied = connection.execute(
@@ -862,9 +874,17 @@ class BybitPublicPITStore:
                         "http_status",
                         "content_length",
                         "content_sha256",
+                        "content_blob",
                         "rows_read",
                         "ret_code",
                     )
+                    content_blob = bytes(response["content_blob"])
+                    if (
+                        len(content_blob) != int(response["content_length"])
+                        or hashlib.sha256(content_blob).hexdigest()
+                        != str(response["content_sha256"])
+                    ):
+                        raise ValueError("historical API response body hash mismatch")
                     response_values = (
                         response["response_id"],
                         response["batch_id"],
@@ -874,6 +894,7 @@ class BybitPublicPITStore:
                         int(response["http_status"]),
                         int(response["content_length"]),
                         response["content_sha256"],
+                        content_blob,
                         int(response["rows_read"]),
                         int(response["ret_code"]),
                     )
@@ -894,8 +915,9 @@ class BybitPublicPITStore:
                     connection.execute(
                         """INSERT INTO bybit_historical_api_responses(
                                response_id,batch_id,request_url,requested_at,received_at,
-                               http_status,content_length,content_sha256,rows_read,ret_code
-                           ) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                               http_status,content_length,content_sha256,content_blob,
+                               rows_read,ret_code
+                           ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                         response_values,
                     )
                 connection.execute(

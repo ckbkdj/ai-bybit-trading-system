@@ -7,6 +7,7 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 from typing import Mapping, Sequence
+from urllib.parse import urlparse
 
 import pandas as pd
 
@@ -44,6 +45,33 @@ BYBIT_FEATURE_ALLOWED_SOURCES: Mapping[str, tuple[str, ...]] = {
         "bybit.public.ticker",
         "bybit.public.open_interest_history",
     ),
+}
+
+BYBIT_ARCHIVE_FEATURE_DATA_KINDS: Mapping[str, str] = {
+    "orderbook_spread_bps": "orderbook",
+    "bybit_orderbook_delta_l5": "orderbook",
+    "orderbook_imbalance_l5": "orderbook",
+    "ofi_1m": "orderbook",
+    "orderbook_depth_usdt_l5": "orderbook",
+    "microprice_deviation_bps": "orderbook",
+    "fill_probability": "orderbook",
+    "expected_slippage_bps": "orderbook",
+    "public_trade_imbalance_1m": "trades",
+    "aggressive_cvd_1m": "trades",
+}
+BYBIT_API_FEATURE_DATA_KINDS: Mapping[str, str] = {
+    "funding_rate": "funding",
+    "open_interest_change_1h": "open_interest",
+    "perpetual_basis_bps": "basis",
+}
+BYBIT_ARCHIVE_HOSTS: Mapping[str, str] = {
+    "orderbook": "quote-saver.bycsi.com",
+    "trades": "public.bybit.com",
+}
+BYBIT_API_PATHS: Mapping[str, tuple[str, ...]] = {
+    "funding": ("/v5/market/funding/history",),
+    "open_interest": ("/v5/market/open-interest",),
+    "basis": ("/v5/market/mark-price-kline", "/v5/market/index-price-kline"),
 }
 
 
@@ -118,6 +146,53 @@ def _expected_pit_import_id(record: Mapping[str, object]) -> str:
         ).encode("utf-8")
     ).hexdigest()[:48]
     return f"bpi_{token}"
+
+
+def _expected_archive_id(record: Mapping[str, object]) -> str:
+    token = hashlib.sha256(
+        (
+            f"{record['data_kind']}|{record['market']}|{record['symbol']}|"
+            f"{record['trading_date']}|{record['source_url']}"
+        ).encode()
+    ).hexdigest()[:48]
+    return f"ba_{token}"
+
+
+def _expected_api_batch_id(record: Mapping[str, object]) -> str:
+    token = hashlib.sha256(
+        (
+            f"{record['data_kind']}|{record['market']}|{record['symbol']}|"
+            f"{record['trading_date']}"
+        ).encode()
+    ).hexdigest()[:48]
+    return f"bh_{token}"
+
+
+def _expected_api_response_id(record: Mapping[str, object]) -> str:
+    token = hashlib.sha256(
+        (
+            f"{record['batch_id']}|{record['request_url']}|"
+            f"{record['content_sha256']}"
+        ).encode()
+    ).hexdigest()[:48]
+    return f"br_{token}"
+
+
+def _api_manifest_sha256(responses: Sequence[Mapping[str, object]]) -> str:
+    manifest = [
+        {
+            "request_url": item["request_url"],
+            "content_sha256": item["content_sha256"],
+            "rows_read": int(item["rows_read"]),
+            "ret_code": int(item["ret_code"]),
+        }
+        for item in sorted(responses, key=lambda item: str(item["request_url"]))
+    ]
+    return hashlib.sha256(
+        json.dumps(
+            manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 class BybitPITFeatureSource:
@@ -609,6 +684,35 @@ class BybitPITFeatureSource:
                 raise RuntimeError("historical archive feature references an incomplete file")
             for archive_id, group in archive_frame.groupby("archive_id", sort=True):
                 record = by_id[str(archive_id)]
+                data_kind = str(record["data_kind"])
+                expected_data_kinds = {
+                    BYBIT_ARCHIVE_FEATURE_DATA_KINDS.get(str(name))
+                    for name in group["name"].astype(str)
+                }
+                if None in expected_data_kinds or expected_data_kinds != {data_kind}:
+                    raise RuntimeError("historical archive feature/data-kind mismatch")
+                parsed_url = urlparse(str(record["source_url"]))
+                expected_host = BYBIT_ARCHIVE_HOSTS.get(data_kind)
+                expected_path_prefix = (
+                    f"/orderbook/linear/{record['symbol']}/"
+                    if data_kind == "orderbook"
+                    else f"/trading/{record['symbol']}/"
+                )
+                if (
+                    str(record["market"]) != "linear"
+                    or str(record["archive_id"]) != _expected_archive_id(record)
+                    or expected_host is None
+                    or parsed_url.scheme != "https"
+                    or parsed_url.hostname != expected_host
+                    or not parsed_url.path.startswith(expected_path_prefix)
+                    or parsed_url.username is not None
+                    or parsed_url.password is not None
+                    or not _is_sha256(record["content_sha256"])
+                    or int(record["content_length"]) <= 0
+                    or int(record["rows_read"]) <= 0
+                    or int(record["feature_observation_count"]) <= 0
+                ):
+                    raise RuntimeError("historical archive provenance contract failed")
                 if set(group["symbol"].astype(str)) != {str(record["symbol"])}:
                     raise RuntimeError("historical archive feature symbol provenance mismatch")
                 event_dates = set(group["event_time"].dt.date.astype(str))
@@ -638,7 +742,7 @@ class BybitPITFeatureSource:
                 response_rows = connection.execute(
                     f"""SELECT response_id,batch_id,request_url,requested_at,
                                 received_at,http_status,content_length,
-                                content_sha256,rows_read,ret_code
+                                content_sha256,content_blob,rows_read,ret_code
                            FROM bybit_historical_api_responses
                           WHERE batch_id IN ({api_placeholders})
                           ORDER BY batch_id,response_id""",
@@ -653,6 +757,13 @@ class BybitPITFeatureSource:
                 responses_by_batch.setdefault(str(record["batch_id"]), []).append(record)
             for batch_id, group in api_frame.groupby("api_batch_id", sort=True):
                 record = api_by_id[str(batch_id)]
+                data_kind = str(record["data_kind"])
+                expected_data_kinds = {
+                    BYBIT_API_FEATURE_DATA_KINDS.get(str(name))
+                    for name in group["name"].astype(str)
+                }
+                if None in expected_data_kinds or expected_data_kinds != {data_kind}:
+                    raise RuntimeError("historical API feature/data-kind mismatch")
                 if str(record["status"]) != "completed":
                     raise RuntimeError("historical API feature references an incomplete batch")
                 if set(group["symbol"].astype(str)) != {str(record["symbol"])}:
@@ -670,6 +781,39 @@ class BybitPITFeatureSource:
                     for response in responses
                 ):
                     raise RuntimeError("historical API batch contains a failed response")
+                allowed_paths = BYBIT_API_PATHS.get(data_kind, ())
+                if (
+                    str(record["market"]) != "linear"
+                    or str(record["batch_id"]) != _expected_api_batch_id(record)
+                    or str(record["endpoint_group"]) == ""
+                    or int(record["rows_read"]) <= 0
+                    or int(record["feature_observation_count"]) <= 0
+                    or not _is_sha256(record["request_manifest_sha256"])
+                    or _api_manifest_sha256(responses)
+                    != str(record["request_manifest_sha256"])
+                ):
+                    raise RuntimeError("historical API batch provenance contract failed")
+                for response in responses:
+                    parsed_url = urlparse(str(response["request_url"]))
+                    content_blob = response.get("content_blob")
+                    if (
+                        str(response["response_id"])
+                        != _expected_api_response_id(response)
+                        or parsed_url.scheme != "https"
+                        or parsed_url.hostname != "api.bybit.com"
+                        or parsed_url.path not in allowed_paths
+                        or parsed_url.username is not None
+                        or parsed_url.password is not None
+                        or int(response["content_length"]) <= 0
+                        or not isinstance(content_blob, bytes)
+                        or len(content_blob) != int(response["content_length"])
+                        or hashlib.sha256(content_blob).hexdigest()
+                        != str(response["content_sha256"])
+                        or int(response["rows_read"]) < 0
+                        or not _is_sha256(response["content_sha256"])
+                    ):
+                        raise RuntimeError("historical API response provenance failed")
+                    response.pop("content_blob", None)
                 api_provenance.append(record)
                 api_response_provenance.extend(responses)
         expected_units = {

@@ -183,6 +183,8 @@ python scripts/backfill_bybit_historical_archive.py `
 - 任何 ret_code、HTTP、分页或 chronology 失败都会使 batch failed；
 - liquidation 不从 OHLCV/REST 伪造。
 
+每个 REST response 还必须在 `bybit_historical_api_responses.content_blob` 留存原始正文；store 写入和 PIT loader 都会重算 length/SHA，并复算 response ID 与 batch request manifest。旧记录若只有 SHA、没有正文，不得进入正式训练，必须重新回填。
+
 ### 6.1 连续性审计与爆仓证据交接
 
 `feature_coverage.start/end` 只说明首末观测跨度，不能证明中间没有断流。正式短周期消融还必须满足：

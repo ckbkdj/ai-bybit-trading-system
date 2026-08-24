@@ -261,3 +261,50 @@ def test_bybit_loader_accepts_mixed_iso_precision_without_coercing_valid_time(tm
     assert len(history) == 2
     assert evidence["observation_count"] == 2
     assert history[["event_time", "available_at", "ingested_at"]].notna().all().all()
+
+
+def test_archive_manifest_cannot_back_a_feature_from_another_data_kind(tmp_path):
+    database = tmp_path / "wrong-kind.sqlite3"
+    store = BybitPublicPITStore(database)
+    event_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    store.append_feature_batch(
+        (
+            {
+                "event_id": "wrong-kind-orderbook",
+                "symbol": "BTCUSDT",
+                "name": "orderbook_spread_bps",
+                "value": 2.0,
+                "unit": "bps",
+                "event_time": event_time,
+                "available_at": event_time + timedelta(seconds=1),
+                "ingested_at": event_time + timedelta(days=1),
+                "source": "bybit.public.orderbook",
+                "quality": 1.0,
+            },
+        ),
+        archive_record={
+            "archive_id": "wrong-kind",
+            "data_kind": "trades",
+            "market": "linear",
+            "symbol": "BTCUSDT",
+            "trading_date": "2026-01-01",
+            "source_url": (
+                "https://public.bybit.com/trading/BTCUSDT/"
+                "BTCUSDT2026-01-01.csv.gz"
+            ),
+            "fetched_at": "2026-01-02T00:00:00Z",
+            "content_length": 100,
+            "content_sha256": "0" * 64,
+            "member_name": "BTCUSDT2026-01-01.csv.gz",
+            "member_size": 100,
+            "first_event_time": "2026-01-01T00:00:00Z",
+            "last_event_time": "2026-01-01T23:59:59Z",
+            "rows_read": 1,
+        },
+    )
+    try:
+        BybitPITFeatureSource(database).load(["orderbook_spread_bps"])
+    except RuntimeError as exc:
+        assert "feature/data-kind mismatch" in str(exc)
+    else:
+        raise AssertionError("a trades manifest backed an orderbook feature")
