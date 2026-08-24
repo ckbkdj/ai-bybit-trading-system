@@ -20,6 +20,7 @@ from core.providers.bybit_historical_archive import (
     replay_trade_archive,
     trade_archive_url,
 )
+from core.providers.bybit_archive_audit import audit_historical_archive_window
 from core.providers.bybit_public_pit import BybitPublicPITStore
 DEFAULT_SYMBOLS = (
     "BTCUSDT",
@@ -95,12 +96,13 @@ def main() -> int:
         re.fullmatch(r"[A-Z0-9]{2,24}USDT", value) is None for value in symbols
     ):
         parser.error("symbols must be explicit uppercase USDT contracts")
-    work = [
+    requested_work = [
         (kind, symbol, day)
         for day in _dates(args.start, args.end)
         for symbol in symbols
         for kind in args.kinds
     ]
+    work = requested_work
     if args.max_files is not None:
         if args.max_files <= 0:
             parser.error("max-files must be positive")
@@ -184,6 +186,25 @@ def main() -> int:
     finally:
         store.close()
 
+    audit_store = BybitPublicPITStore(args.database, busy_timeout_sec=300.0)
+    try:
+        audit = audit_historical_archive_window(
+            audit_store,
+            start=args.start,
+            end=args.end,
+            symbols=symbols,
+            data_kinds=args.kinds,
+        )
+    finally:
+        audit_store.close()
+    complete = bool(audit["complete"]) and failures == 0
+    if complete:
+        status = "PASS"
+    elif int(audit["integrity_violation_count"]) > 0:
+        status = "FAILED_INTEGRITY"
+    else:
+        status = "FAILED_INCOMPLETE"
+
     report = {
         "schema_version": "bybit-historical-archive-backfill.v1",
         "started_at": started_at.isoformat().replace("+00:00", "Z"),
@@ -192,9 +213,12 @@ def main() -> int:
         "symbols": list(symbols),
         "start": args.start.isoformat(),
         "end": args.end.isoformat(),
-        "requested_file_count": len(work),
+        "requested_file_count": len(requested_work),
+        "selected_file_count": len(work),
+        "max_files_reached": len(work) < len(requested_work),
         "failure_count": failures,
-        "status": "PASS" if failures == 0 else "FAILED_PARTIAL",
+        "status": status,
+        "coverage_audit": audit,
         "report": str(args.report.resolve()),
         "pit_semantics": {
             "event_time": "exchange cts/ts from the official archive",
@@ -228,7 +252,7 @@ def main() -> int:
             indent=2,
         )
     )
-    return 0 if failures == 0 else 1
+    return 0 if complete else 2
 
 
 if __name__ == "__main__":

@@ -164,6 +164,8 @@ python scripts/backfill_bybit_historical_archive.py `
 
 脚本会跳过 `status=completed` 的 append-only manifest；失败项必须保留并在单进程重试，不能把 failed 改成 completed。
 
+脚本结束时会重新审计完整的 `start/end × symbols × kinds` 请求矩阵，并核对确定性 archive ID、精确官方 URL、下载 SHA 收据、member/rows/feature count、因子组、PIT chronology 和 UTC 日期绑定。`--max-files` 只用于限制一次断点运行的下载量；其余日期未在数据库中完成时必须输出 `FAILED_INCOMPLETE` 和非零退出码。默认下载后删除压缩源文件以控制磁盘占用，只有显式传入 `--keep-archives` 才保留原压缩包；没有保留原文件时，审计结论只能表述为“下载 SHA 收据与派生 PIT 链接完整”，不能声称重新哈希了已删除的源包。
+
 合格条件：
 
 - 日期数 × 5 symbols × 2 kinds 全部 completed；

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import gzip
+import hashlib
 import json
 import sqlite3
 import sys
@@ -24,8 +25,10 @@ from core.providers.bybit_historical_archive import (
     replay_trade_archive,
     trade_archive_url,
 )
+from core.providers.bybit_archive_audit import audit_historical_archive_window
 from core.providers.bybit_public_pit import BybitPublicPITStore
 from core.training.bybit_pit_panel import BybitPITFeatureSource
+from scripts import backfill_bybit_historical_archive as backfill_script
 
 
 DAY = date(2026, 1, 1)
@@ -166,6 +169,137 @@ def test_official_trade_replay_builds_real_rolling_cvd_with_archive_provenance(t
     assert len(history) == 6
     assert history["source"].unique().tolist() == ["bybit.public.trades"]
     assert history["value"].abs().sum() > 0
+
+
+def test_trade_archive_rejects_exact_next_day_boundary_atomically(tmp_path):
+    archive = tmp_path / "next-day.csv.gz"
+    with gzip.open(archive, "wt", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(
+            stream,
+            fieldnames=(
+                "timestamp",
+                "symbol",
+                "side",
+                "size",
+                "price",
+                "tickDirection",
+                "trdMatchID",
+            ),
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "timestamp": (START + timedelta(days=1)).timestamp(),
+                "symbol": SYMBOL,
+                "side": "Buy",
+                "size": 1,
+                "price": 100,
+                "tickDirection": "PlusTick",
+                "trdMatchID": "next-day",
+            }
+        )
+    store = BybitPublicPITStore(tmp_path / "next-day.sqlite3")
+    try:
+        replay_trade_archive(
+            store,
+            archive,
+            symbol=SYMBOL,
+            trading_date=DAY,
+            source_url=trade_archive_url(SYMBOL, DAY),
+            fetched_at=FETCHED,
+        )
+    except ValueError as exc:
+        assert "another UTC trading date" in str(exc)
+    else:
+        raise AssertionError("next-day trade was accepted into the prior UTC day")
+    with store.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM bybit_feature_observations"
+        ).fetchone()[0] == 0
+
+
+def test_archive_audit_requires_the_exact_requested_window(tmp_path):
+    database = tmp_path / "audit.sqlite3"
+    archive = tmp_path / "book.zip"
+    _orderbook_zip(archive)
+    store = BybitPublicPITStore(database)
+    replay_orderbook_archive(
+        store,
+        archive,
+        symbol=SYMBOL,
+        trading_date=DAY,
+        source_url=orderbook_archive_url(SYMBOL, DAY),
+        fetched_at=FETCHED,
+        feature_emit_interval_sec=15,
+    )
+
+    complete = audit_historical_archive_window(
+        store,
+        start=DAY,
+        end=DAY,
+        symbols=[SYMBOL],
+        data_kinds=["orderbook"],
+    )
+    assert complete["status"] == "VERIFIED_COMPLETE"
+    assert complete["completed_files"] == 1
+
+    incomplete = audit_historical_archive_window(
+        store,
+        start=DAY,
+        end=DAY + timedelta(days=1),
+        symbols=[SYMBOL],
+        data_kinds=["orderbook"],
+    )
+    assert incomplete["status"] == "FAILED"
+    assert incomplete["missing_files"] == 1
+    assert incomplete["series"][0]["missing_date_ranges"] == [
+        {"start": "2026-01-02", "end": "2026-01-02", "days": 1}
+    ]
+
+
+def test_archive_max_files_cannot_report_partial_window_as_pass(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "partial.sqlite3"
+    report = tmp_path / "partial-report.json"
+    cache = tmp_path / "cache"
+
+    def fake_download(_url, target, *, maximum_bytes):
+        assert maximum_bytes > 0
+        _orderbook_zip(target)
+        content = target.read_bytes()
+        return len(content), hashlib.sha256(content).hexdigest(), FETCHED
+
+    monkeypatch.setattr(backfill_script, "download_official_archive", fake_download)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "backfill_bybit_historical_archive.py",
+            "--start",
+            DAY.isoformat(),
+            "--end",
+            (DAY + timedelta(days=1)).isoformat(),
+            "--symbols",
+            SYMBOL,
+            "--kinds",
+            "orderbook",
+            "--database",
+            str(database),
+            "--cache-dir",
+            str(cache),
+            "--report",
+            str(report),
+            "--max-files",
+            "1",
+        ],
+    )
+    assert backfill_script.main() == 2
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    assert payload["status"] == "FAILED_INCOMPLETE"
+    assert payload["requested_file_count"] == 2
+    assert payload["selected_file_count"] == 1
+    assert payload["coverage_audit"]["missing_files"] == 1
 
 
 def test_archive_downloader_rejects_non_allowlisted_hosts_before_network(tmp_path):

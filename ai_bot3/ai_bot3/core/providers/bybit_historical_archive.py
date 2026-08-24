@@ -689,7 +689,8 @@ def replay_trade_archive(
         if row_symbol != normalized:
             raise ValueError("trade archive payload symbol mismatch")
         event_time = datetime.fromtimestamp(float(row["timestamp"]), timezone.utc)
-        _event_in_archive_day(event_time, trading_date)
+        if not _event_in_archive_day(event_time, trading_date):
+            raise ValueError("trade archive row belongs to another UTC trading date")
         if last_event is not None and event_time < last_event:
             raise ValueError("trade archive event time regressed")
         available_at = event_time + timedelta(milliseconds=assumed_feed_latency_ms)
