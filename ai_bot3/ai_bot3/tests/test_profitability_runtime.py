@@ -14,7 +14,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from core.features.profitability_technical import TECHNICAL_FEATURE_COLUMNS
-from core.models.profitability_runtime import generate_profitability_alpha_prediction
+from core.models.profitability_runtime import (
+    generate_profitability_alpha_prediction,
+    price_frame_cutoff,
+)
 from core.models.two_stage import TwoStageAlphaModel, TwoStageConfig
 from core.training.bybit_pit_panel import BybitPITFeatureSource
 from core.providers.bybit_public_pit import BybitPublicPITStore
@@ -86,6 +89,16 @@ def _market_frame(start: datetime | None = None) -> pd.DataFrame:
         rows,
         index=pd.date_range(start, periods=len(rows), freq="3min"),
     )
+
+
+def test_price_frame_cutoff_uses_the_alpha_timestamp_contract():
+    market = _market_frame()
+    close_times = pd.date_range(
+        "2026-02-01T00:03:00Z", periods=len(market), freq="3min"
+    )
+    market["close_at"] = close_times
+
+    assert price_frame_cutoff(market) == close_times[-1].to_pydatetime()
 
 
 def _runtime_macro_store(tmp_path: Path, decision_at: datetime) -> Path:

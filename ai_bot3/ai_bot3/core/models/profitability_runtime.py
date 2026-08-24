@@ -104,6 +104,15 @@ def _decision_times(frame: pd.DataFrame, latest_decision_at: Any | None) -> pd.S
     return values
 
 
+def price_frame_cutoff(frame: pd.DataFrame) -> datetime:
+    """Return the same final observed timestamp used by Alpha validation."""
+
+    values = _decision_times(frame, None)
+    if values.empty:
+        raise ValueError("alpha inference frame has no decision timestamps")
+    return values.iloc[-1].to_pydatetime().astimezone(timezone.utc)
+
+
 def _validate_price_frame(
     frame: pd.DataFrame,
     *,
@@ -760,5 +769,6 @@ __all__ = (
     "MAX_EXTERNAL_PANEL_AGE",
     "build_current_feature_rows",
     "generate_profitability_alpha_prediction",
+    "price_frame_cutoff",
     "select_directional_prediction",
 )

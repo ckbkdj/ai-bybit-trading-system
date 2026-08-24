@@ -47,7 +47,10 @@ from .kline_feature_store import (
     select_persisted_features,
 )
 from .model_monitoring import factor_group_scores, scaled_feature_ood_score, source_is_reliable
-from .models.profitability_runtime import generate_profitability_alpha_prediction
+from .models.profitability_runtime import (
+    generate_profitability_alpha_prediction,
+    price_frame_cutoff,
+)
 
 
 def _now_iso() -> str:
@@ -734,13 +737,13 @@ class InferencerDataPreparer:
             self.log.warning("模型训练元数据不可读，LSTM 仅作为未验证展示输出: %s", exc)
 
         try:
-            panel_as_of = df.index[-1]
-            if df.attrs.get("latest_kline_ts"):
-                panel_as_of = pd.to_datetime(
-                    df.attrs.get("latest_kline_ts"), utc=True, errors="raise"
-                ).to_pydatetime()
-            elif isinstance(panel_as_of, pd.Timestamp):
-                panel_as_of = panel_as_of.to_pydatetime()
+            # The external PIT panel must be queried at the exact cutoff used
+            # by the new Alpha.  The legacy Binance frame may close at a
+            # different instant and is only a display/baseline input here.
+            panel_price_frame = (
+                alpha_price_frame if not alpha_price_frame.empty else df
+            )
+            panel_as_of = price_frame_cutoff(panel_price_frame)
             external_panel_context = self.fetcher.get_external_panel_context(
                 as_of=panel_as_of
             )

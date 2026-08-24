@@ -199,6 +199,7 @@ FOMC 采集不能用会议日历日期猜测 14:00，也不能把 minutes、impl
 23. `ResultManager` 不能只信任 Alpha 自报的 `candidate_freshness_verified=true`。出票边界必须再次要求下界净 edge、价格年龄和最大允许年龄都是有限数，实际 age 不超过按周期固定的上限，且 bar count/interval 可严格解析；`NaN`、无穷值、畸形结构或擅自放大的 freshness 上限都必须失败关闭而不是抛异常或出票。
 24. 候选预测必须先完成 release/manifest/价格证据授权，再进入候选 release 的 active forecast book。未授权或畸形 Alpha 可保留为观测 forecast，但必须使用隔离的 rejected lineage，不能在后一条合法预测到来时参与多周期组合。获授权 forecast 的 exchange、data cutoff、feature age 与 OperationTicket reference price 必须来自同一份已复核的 Bybit Alpha price path，不能回退旧 Brain 的 Binance K 线或 Coinglass 展示价。
 25. 获授权 Alpha 的 data quality、calibration status、market regime 与 range guard 必须来自新两级模型的运行时证据，不能继承旧 LSTM/Brain 的 completeness、scaler OOD 或市场状态。新模型输入必须在它自身保存的标准化空间计算 range guard；分数非有限或超过组合门限时，在写入候选 active book 前失败关闭。
+26. 外部宏观面板的 production as-of 必须使用新 Alpha 的 Bybit 价格 frame 最后一条真实观测时间，不能使用旧 Binance frame 的截止时间。盈利报告、全部证据哈希和 candidate manifest 也不能只在进程启动时验证；每次候选出票前都必须重新核验，运行期间文件被替换或破坏时立即撤销内存中的授权并失败关闭。
 
 ## 7. 事件回测和回撤
 

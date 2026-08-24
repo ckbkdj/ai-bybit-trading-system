@@ -215,17 +215,34 @@ class ResultManager:
         self.candidate_release_manifest_path = (
             Path(manifest_path_value) if manifest_path_value else None
         )
-        self.profitability_authorized, self.profitability_authorization_reason = (
-            verify_candidate_authorization(
-                self.profitability_report_path,
-                self.candidate_release_manifest_path,
-            )
-        )
+        self.profitability_authorized = False
+        self.profitability_authorization_reason = "not_verified"
         self.profitability_manifest = None
-        if self.profitability_authorized and self.candidate_release_manifest_path:
-            self.profitability_manifest = json.loads(
-                self.candidate_release_manifest_path.read_text(encoding="utf-8")
-            )
+        self._refresh_profitability_authorization()
+
+    def _refresh_profitability_authorization(self) -> bool:
+        """Revalidate mutable release evidence before every candidate ticket."""
+
+        authorized, reason = verify_candidate_authorization(
+            self.profitability_report_path,
+            self.candidate_release_manifest_path,
+        )
+        manifest = None
+        if authorized and self.candidate_release_manifest_path is not None:
+            try:
+                loaded = json.loads(
+                    self.candidate_release_manifest_path.read_text(encoding="utf-8")
+                )
+                if not isinstance(loaded, dict):
+                    raise ValueError("candidate manifest must be a JSON object")
+                manifest = loaded
+            except Exception:
+                authorized = False
+                reason = "profitability_release_json_invalid"
+        self.profitability_authorized = authorized
+        self.profitability_authorization_reason = reason
+        self.profitability_manifest = manifest
+        return authorized
 
     def _brain_authorized_for_ticket(
         self, prediction: Dict[str, Any], mode: str
@@ -339,7 +356,10 @@ class ResultManager:
             )
         ):
             return False
-        if not self.profitability_authorized or not self.profitability_manifest:
+        if (
+            not self._refresh_profitability_authorization()
+            or not self.profitability_manifest
+        ):
             return False
         if str(alpha.get("release_id")) != str(self.profitability_manifest.get("release_id")):
             return False

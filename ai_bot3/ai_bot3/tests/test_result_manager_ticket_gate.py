@@ -567,6 +567,45 @@ def test_candidate_ticket_rejects_malformed_edge_or_runtime_price_contract():
             assert len(active) == 1
 
 
+def test_candidate_ticket_revalidates_release_evidence_after_startup():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        db = root / "control.sqlite3"
+        report, manifest_path, manifest = _profitability_release(root)
+        manager = ResultManager(
+            root / "results",
+            control_plane_db=db,
+            tickets_enabled=True,
+            required_brain_release_stage="candidate",
+            strategy_release_bundle=_bundle("candidate"),
+            profitability_report_path=report,
+            candidate_release_manifest_path=manifest_path,
+        )
+        assert manager.profitability_authorized is True
+
+        changed = json.loads(report.read_text(encoding="utf-8"))
+        changed["candidate_count"] = 0
+        report.write_text(json.dumps(changed), encoding="utf-8")
+
+        near = _prediction("rejected")
+        near["alpha_prediction"] = _authorized_alpha(manifest, horizon_sec=180)
+        far = _prediction("rejected")
+        far["alpha_prediction"] = _authorized_alpha(manifest, horizon_sec=900)
+        asyncio.run(manager.save_result("BTCUSDT", "scalping", near))
+        asyncio.run(manager.save_result("BTCUSDT", "mid_short", far))
+
+        assert _counts(db) == (2, 0)
+        assert manager.profitability_authorized is False
+        assert (
+            manager.profitability_authorization_reason
+            == "profitability_candidate_counts_invalid"
+        )
+        assert manager.control_plane.active_forecasts(
+            "BTCUSDT",
+            strategy_release_id=manager.strategy_release_bundle.strategy_release_id,
+        ) == []
+
+
 def test_prediction_file_is_atomic_and_read_does_not_refresh_its_age():
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
