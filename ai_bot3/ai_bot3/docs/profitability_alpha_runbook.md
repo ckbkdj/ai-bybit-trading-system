@@ -286,12 +286,20 @@ moving-block bootstrap 的 95% 下界不大于零，都不得通过。
 
 官方历史盘口可以替换 OHLCV spread/depth 代理，但不能独自满足后两项。
 
+此外必须检查 `walk_forward_report.json.direct_execution_release_datasets`：
+
+- `selection_policy` 必须为 `full_maximum_execution_window_direct_before_outcome_filtering`；
+- `selection_columns` 只能包含 `execution_window_evidence_complete`，不得读取 `net_return`、MAE/MFE 或 exit reason 来选样本；
+- `release_walk_forward_ready=true` 后，该周期才允许进入正式 walk-forward 和因子消融；
+- direct 样本不足必须显示 blocker 并保持 rejected，禁止回退到 OHLCV 代理成本凑交易数。
+
 ## 10. 因子消融验收
 
 每个 baseline/augmented arm 至少满足代码中预先锁定的 OOS trade/fold 下限。只有以下条件同时满足才 retained：
 
 - 完整因子组没有 missing required factor；
 - 相同 purged outer folds；
+- folds 必须来自完整最大执行窗口均有直接成本证据的 release dataset；
 - 相同成本、风险和事件回测；
 - baseline 和 augmented 都有足量真实交易；
 - 费用后平均改善、正改善 fold 比例和最差 fold 退化都过门槛。

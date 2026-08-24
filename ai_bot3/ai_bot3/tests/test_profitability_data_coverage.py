@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -17,11 +18,13 @@ from core.evaluation.profitability_rebuild import (
     ProfitabilityRebuild,
     ProfitabilityRebuildConfig,
     _engineer_features,
+    _build_direct_release_dataset,
     _bybit_names_for_horizon,
     _market_bars,
     _panel_rows,
     validate_source_coverage,
 )
+from core.training.pooled_panel import PooledPanelBuilder
 
 
 def _frame(days: int) -> pd.DataFrame:
@@ -131,6 +134,100 @@ def test_label_decisions_do_not_treat_overlapping_execution_windows_as_independe
     for decision_at in decision_times:
         alternatives = [row for row in labels if row["decision_at"] == decision_at]
         assert {row["side"] for row in alternatives} == {"BUY", "SELL"}
+        assert {
+            row["execution_window_evidence_complete"] for row in alternatives
+        } == {False}
+
+
+def test_direct_execution_window_is_bound_before_buy_sell_outcomes_are_inspected():
+    start = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    frame = pd.DataFrame(
+        [
+            {
+                "symbol": "BTCUSDT",
+                "open_at": start + timedelta(seconds=180 * index),
+                "close_at": start + timedelta(seconds=180 * index + 179),
+                "open": 100.0 + index * 0.01,
+                "high": (100.0 + index * 0.01) * 1.002,
+                "low": (100.0 + index * 0.01) * 0.998,
+                "close": (100.0 + index * 0.01) * 1.0001,
+                "volume": 1_000.0,
+            }
+            for index in range(120)
+        ]
+    )
+    enriched = _engineer_features(frame)
+    direct_bars = tuple(
+        replace(
+            bar,
+            spread_bps=1.5,
+            depth_usdt=1_000_000.0,
+            funding_bps=0.01,
+            spread_source="bybit_orderbook_pit",
+            depth_source="bybit_orderbook_pit",
+            funding_source="bybit_funding_pit",
+            spread_observed=True,
+            depth_observed=True,
+            funding_observed=True,
+        )
+        for bar in _market_bars(enriched)
+    )
+    labels = _panel_rows(enriched, 180, direct_bars)
+
+    assert labels
+    assert {row["execution_window_evidence_complete"] for row in labels} == {True}
+    assert {row["execution_cost_evidence_complete"] for row in labels} == {True}
+    for decision_at in {row["decision_at"] for row in labels}:
+        alternatives = [row for row in labels if row["decision_at"] == decision_at]
+        assert {row["side"] for row in alternatives} == {"BUY", "SELL"}
+        assert {
+            row["execution_window_evidence_complete"] for row in alternatives
+        } == {True}
+
+
+def test_release_walk_forward_excludes_proxy_rows_before_splitting():
+    start = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    rows = []
+    for index in range(160):
+        decision_at = start + timedelta(minutes=5 * index)
+        for symbol in ("BTCUSDT", "ETHUSDT"):
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "horizon_sec": 180,
+                    "decision_at": decision_at,
+                    "available_at": decision_at,
+                    "label_available_at": decision_at + timedelta(seconds=180),
+                    "liquidity": 1_000_000.0,
+                    "volatility": 0.01,
+                    "session": "asia",
+                    "regime": "normal",
+                    "net_return": 0.001 if index % 3 else -0.002,
+                    "mae": 0.001,
+                    "mfe": 0.002,
+                    "execution_window_evidence_complete": index % 2 == 0,
+                }
+            )
+    panel = pd.DataFrame(rows)
+    dataset, evidence = _build_direct_release_dataset(
+        PooledPanelBuilder(
+            minimum_train_rows=40,
+            minimum_test_rows=10,
+            maximum_folds=2,
+        ),
+        panel,
+        180,
+        lockbox_start=start + timedelta(days=1),
+    )
+
+    assert dataset is not None
+    assert dataset.development["execution_window_evidence_complete"].all()
+    assert set(dataset.development["net_return"] > 0) == {False, True}
+    assert evidence["selection_columns"] == [
+        "execution_window_evidence_complete"
+    ]
+    assert evidence["outcome_dependent_selection"] is False
+    assert evidence["direct_window_rows"] == 160
 
 
 def test_development_label_materialization_stops_before_sealed_lockbox_path():

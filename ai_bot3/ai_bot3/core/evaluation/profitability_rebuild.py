@@ -40,6 +40,7 @@ from core.risk.capital_preservation import CapitalPreservationConfig, policy_rep
 from core.training.pooled_panel import (
     HORIZON_TIMEFRAME,
     HORIZONS_SEC,
+    HorizonDataset,
     PooledPanelBuilder,
     causal_regime_labels,
     dataset_manifest,
@@ -494,6 +495,32 @@ def _panel_frame(
         while path_end < len(bars) and bars[path_end].open_time <= path_end_time:
             path_end += 1
         path = bars[index + 1 : path_end]
+        path_cursor = signal_at
+        maximum_execution_window_observed = False
+        for path_bar in path:
+            # Consecutive candles may meet at the same instant or have a
+            # sub-second exchange boundary. A larger hole means the maximum
+            # execution window is not fully observable, even if an early TP/SL
+            # happened before the missing interval.
+            if path_bar.open_time > path_cursor + timedelta(seconds=1):
+                break
+            path_cursor = max(path_cursor, path_bar.available_at)
+            if path_cursor >= path_end_time:
+                maximum_execution_window_observed = True
+                break
+        # Release evidence is selected before labels/outcomes are inspected.
+        # Requiring the entire maximum execution window prevents a profitable
+        # early exit from being more likely to enter the evidence-complete
+        # sample than a losing/max-hold path.
+        execution_window_evidence_complete = (
+            maximum_execution_window_observed
+            and all(
+                bar.spread_observed
+                and bar.depth_observed
+                and bar.funding_observed
+                for bar in path
+            )
+        )
         labels = {}
         for side in ("BUY", "SELL"):
             labels[side] = build_triple_barrier_label(
@@ -553,6 +580,20 @@ def _panel_frame(
                 "partial_fill": label.partial_fill,
                 "exit_reason": label.exit_reason,
                 "path_observations": label.path_observations,
+                "maximum_execution_window_observed": (
+                    maximum_execution_window_observed
+                ),
+                "execution_window_evidence_complete": (
+                    execution_window_evidence_complete
+                ),
+                "execution_cost_evidence_complete": (
+                    label.execution_cost_evidence_complete
+                ),
+                "entry_spread_source": label.entry_spread_source,
+                "entry_depth_source": label.entry_depth_source,
+                "exit_spread_source": label.exit_spread_source,
+                "exit_depth_source": label.exit_depth_source,
+                "funding_source": label.funding_source,
                 "stop_loss_bps": stop_bps,
                 "take_profit_bps": take_profit_bps,
             }
@@ -578,6 +619,59 @@ def _panel_rows(
         decision_at_or_after=decision_at_or_after,
         decision_before=decision_before,
     ).to_dict(orient="records")
+
+
+def _build_direct_release_dataset(
+    splitter: PooledPanelBuilder,
+    panel: pd.DataFrame,
+    horizon_sec: int,
+    *,
+    lockbox_start: object,
+) -> tuple[HorizonDataset | None, dict[str, object]]:
+    """Build release folds from outcome-independent direct-cost evidence only.
+
+    ``execution_window_evidence_complete`` is computed from the full maximum
+    execution window before Triple Barrier outcomes are inspected. Keeping the
+    filtering here prevents later callers from selecting rows by realized
+    exit, return, MAE or MFE.
+    """
+
+    evidence_column = "execution_window_evidence_complete"
+    if evidence_column not in panel.columns:
+        raise ValueError(f"release panel is missing {evidence_column}")
+    direct_mask = panel[evidence_column].fillna(False).astype(bool)
+    direct_panel = panel.loc[direct_mask].reset_index(drop=True)
+    evidence: dict[str, object] = {
+        "selection_policy": (
+            "full_maximum_execution_window_direct_before_outcome_filtering"
+        ),
+        "selection_columns": [evidence_column],
+        "outcome_dependent_selection": False,
+        "all_panel_rows": len(panel),
+        "direct_window_rows": len(direct_panel),
+        "direct_window_ratio": (
+            len(direct_panel) / len(panel) if len(panel) else 0.0
+        ),
+        "release_walk_forward_ready": False,
+    }
+    try:
+        dataset = splitter.build_sealed_development(
+            direct_panel,
+            horizon_sec,
+            lockbox_start=lockbox_start,
+        )
+    except ValueError as exc:
+        evidence["blocker"] = f"{type(exc).__name__}: {exc}"
+        return None, evidence
+    evidence.update(
+        {
+            "release_walk_forward_ready": True,
+            "release_development_rows": len(dataset.development),
+            "release_fold_count": len(dataset.folds),
+            "release_development_fingerprint": dataset.development_fingerprint,
+        }
+    )
+    return dataset, evidence
 
 
 FEATURE_COLUMNS: tuple[str, ...] = (
@@ -1837,6 +1931,8 @@ class ProfitabilityRebuild:
             maximum_folds=self.config.walk_forward_folds,
         )
         datasets: dict[int, object] = {}
+        release_datasets: dict[int, object] = {}
+        release_dataset_evidence: dict[int, dict[str, object]] = {}
         for horizon in HORIZONS_SEC:
             horizon_panel = panels.pop(horizon)
             datasets[horizon] = splitter.build_sealed_development(
@@ -1844,7 +1940,20 @@ class ProfitabilityRebuild:
                 horizon,
                 lockbox_start=lockbox_start_by_horizon[horizon],
             )
+            release_dataset, direct_evidence = _build_direct_release_dataset(
+                splitter,
+                horizon_panel,
+                horizon,
+                lockbox_start=lockbox_start_by_horizon[horizon],
+            )
+            if release_dataset is not None:
+                release_datasets[horizon] = release_dataset
+            release_dataset_evidence[horizon] = direct_evidence
             del horizon_panel
+        source_evidence["direct_execution_release_development"] = {
+            str(horizon): evidence
+            for horizon, evidence in release_dataset_evidence.items()
+        }
         panels.clear()
         del panels
         current_feature_store_stat = self.config.feature_store_path.stat()
@@ -1863,6 +1972,10 @@ class ProfitabilityRebuild:
                 "datasets": {
                     str(horizon): dataset_manifest(dataset)
                     for horizon, dataset in datasets.items()
+                },
+                "release_datasets": {
+                    str(horizon): evidence
+                    for horizon, evidence in release_dataset_evidence.items()
                 },
             },
         )
@@ -1905,7 +2018,7 @@ class ProfitabilityRebuild:
             },
         )
         legacy_result = _evaluate_legacy_technical_ablation(
-            datasets, market, selector, ablation_backtest
+            release_datasets, market, selector, ablation_backtest
         )
         evaluated_factor_groups.update(legacy_result)
         self.ledger.append_event(
@@ -1934,7 +2047,7 @@ class ProfitabilityRebuild:
                     },
                 )
                 result = _evaluate_long_factor_ablation(
-                    datasets,
+                    release_datasets,
                     market,
                     selector,
                     ablation_backtest,
@@ -1961,7 +2074,7 @@ class ProfitabilityRebuild:
                     },
                 )
                 result = _evaluate_bybit_pit_ablation(
-                    datasets,
+                    release_datasets,
                     market,
                     selector,
                     ablation_backtest,
@@ -2008,7 +2121,7 @@ class ProfitabilityRebuild:
             model_feature_columns_by_horizon[horizon] = FEATURE_COLUMNS + tuple(
                 dict.fromkeys(retained_factor_columns)
             )
-        for horizon, dataset in datasets.items():
+        for horizon, dataset in release_datasets.items():
             model_feature_columns = model_feature_columns_by_horizon[horizon]
             for fold in dataset.folds:
                 train = dataset.development.iloc[fold.train_indices]
@@ -2093,6 +2206,9 @@ class ProfitabilityRebuild:
                 "gate": horizon_gate.to_dict(),
                 "normal_cost": horizon_report.to_dict(include_trades=False),
                 "two_x_cost": horizon_stress.to_dict(include_trades=False),
+                "direct_execution_release_dataset": (
+                    release_dataset_evidence[horizon]
+                ),
             }
             self.ledger.append_event(
                 self.trial_id,
@@ -2157,6 +2273,10 @@ class ProfitabilityRebuild:
                 "development_eligible_horizons": list(
                     development_eligible_horizons
                 ),
+                "direct_execution_release_datasets": {
+                    str(horizon): evidence
+                    for horizon, evidence in release_dataset_evidence.items()
+                },
                 "candidate_horizon_selection_source": (
                     "development_outer_oos_only_before_lockbox"
                 ),
@@ -2216,8 +2336,9 @@ class ProfitabilityRebuild:
         final_models: dict[int, TwoStageAlphaModel] = {}
         for horizon, dataset in datasets.items():
             model_feature_columns = model_feature_columns_by_horizon[horizon]
+            training_dataset = release_datasets.get(horizon, dataset)
             selection = selector.select_and_fit(
-                dataset.development, model_feature_columns
+                training_dataset.development, model_feature_columns
             )
             path = model_dir / f"horizon_{horizon}.json"
             selection.model.save(path)
@@ -2227,6 +2348,11 @@ class ProfitabilityRebuild:
             final_selection[str(horizon)] = {
                 "audit": dict(selection.audit),
                 "candidate_results": list(selection.candidate_results),
+                "training_scope": (
+                    "direct_execution_release_development"
+                    if horizon in release_datasets
+                    else "rejected_shadow_full_development"
+                ),
             }
         bundle_path = model_dir / "model_bundle.json"
         rejected_bundle = {
@@ -2512,6 +2638,42 @@ class ProfitabilityRebuild:
                     names=bybit_names,
                     history=lockbox_bybit_history,
                 )
+            raw_lockbox_rows = len(lockbox_panel)
+            if "execution_window_evidence_complete" in lockbox_panel.columns:
+                direct_lockbox_mask = lockbox_panel[
+                    "execution_window_evidence_complete"
+                ].fillna(False).astype(bool)
+                lockbox_panel = lockbox_panel.loc[
+                    direct_lockbox_mask
+                ].reset_index(drop=True)
+            else:
+                lockbox_panel = lockbox_panel.iloc[0:0].copy()
+            if lockbox_panel.empty or lockbox_panel["symbol"].nunique() < 2:
+                lockbox_panel_fingerprints[horizon] = _hash_payload(
+                    {
+                        "horizon_sec": horizon,
+                        "status": "NO_DIRECT_EXECUTION_LOCKBOX_PANEL",
+                        "raw_rows": raw_lockbox_rows,
+                        "direct_rows": len(lockbox_panel),
+                    }
+                )
+                self.ledger.append_event(
+                    self.trial_id,
+                    "running",
+                    {
+                        "phase": "lockbox_horizon_scored",
+                        "horizon_sec": horizon,
+                        "raw_panel_rows": raw_lockbox_rows,
+                        "panel_rows": len(lockbox_panel),
+                        "signals": 0,
+                        "status": "FAILED_NO_DIRECT_EXECUTION_EVIDENCE",
+                        "panel_fingerprint": lockbox_panel_fingerprints[horizon],
+                    },
+                )
+                lockbox_history.clear()
+                lockbox_bybit_history = None
+                del lockbox_panel
+                continue
             lockbox_panel = PooledPanelBuilder.validate(
                 lockbox_panel, horizon
             )
@@ -2530,6 +2692,7 @@ class ProfitabilityRebuild:
                 {
                     "phase": "lockbox_horizon_scored",
                     "horizon_sec": horizon,
+                    "raw_panel_rows": raw_lockbox_rows,
                     "panel_rows": len(lockbox_panel),
                     "signals": len(horizon_signals),
                     "panel_fingerprint": lockbox_panel_fingerprints[horizon],
