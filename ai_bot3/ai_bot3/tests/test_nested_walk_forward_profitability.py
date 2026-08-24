@@ -52,6 +52,14 @@ def test_nested_selector_uses_inner_oos_only_and_fits_once_for_outer_test():
     assert selection.audit["selection_data"] == "inner_walk_forward_oos_only"
     assert selection.audit["outer_oos_used_for_selection"] is False
     assert selection.audit["inner_fold_count"] >= 2
+    assert selection.audit["inner_purge_sec"] == 180
+    assert selection.audit["inner_embargo_sec"] == 45
     assert len(selection.candidate_results) == 2
     assert all(result["outer_oos_rows_seen"] == 0 for result in selection.candidate_results)
+    for result in selection.candidate_results:
+        for fold in result["inner_folds"]:
+            train_end = pd.Timestamp(fold["train_decision_end"])
+            validation_start = pd.Timestamp(fold["validation_start"])
+            assert validation_start - train_end >= timedelta(seconds=180)
+            assert pd.Timestamp(fold["train_label_available_max"]) < validation_start
     assert selection.model.training_audit["level_two_training_source"] == "out_of_fold_level_one"

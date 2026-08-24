@@ -13,6 +13,7 @@ from core.models.two_stage import (
     TwoStageAlphaModel,
     TwoStageConfig,
     TwoStagePrediction,
+    _purge_embargo_seconds,
     prediction_gate_diagnostics,
 )
 
@@ -84,7 +85,9 @@ class NestedWalkForwardSelector:
         self.inner_folds = inner_folds
         self.first_validation_fraction = first_validation_fraction
 
-    def _folds(self, frame: pd.DataFrame) -> tuple[tuple[np.ndarray, np.ndarray], ...]:
+    def _folds(
+        self, frame: pd.DataFrame
+    ) -> tuple[tuple[tuple[np.ndarray, np.ndarray], ...], int, int]:
         if "decision_at" not in frame or "label_available_at" not in frame:
             raise ValueError("nested walk-forward requires PIT decision and label timestamps")
         decision = pd.to_datetime(frame["decision_at"], utc=True, errors="coerce")
@@ -94,7 +97,9 @@ class NestedWalkForwardSelector:
         unique_times = decision.drop_duplicates().sort_values().reset_index(drop=True)
         first = int(math.floor(len(unique_times) * self.first_validation_fraction))
         chunks = np.array_split(unique_times.iloc[first:].to_numpy(), self.inner_folds)
+        purge_sec, embargo_sec = _purge_embargo_seconds(frame)
         folds: list[tuple[np.ndarray, np.ndarray]] = []
+        previous_validation_end: pd.Timestamp | None = None
         for chunk in chunks:
             if len(chunk) == 0:
                 continue
@@ -103,13 +108,24 @@ class NestedWalkForwardSelector:
             if start.tzinfo is None:
                 start = start.tz_localize("UTC")
                 end = end.tz_localize("UTC")
-            train = np.flatnonzero(((decision < start) & (label_available < start)).to_numpy())
+            if previous_validation_end is not None:
+                start = max(
+                    start,
+                    previous_validation_end + pd.Timedelta(seconds=embargo_sec),
+                )
+            if start > end:
+                continue
+            train_cutoff = start - pd.Timedelta(seconds=purge_sec)
+            train = np.flatnonzero(
+                ((decision < train_cutoff) & (label_available < start)).to_numpy()
+            )
             validation = np.flatnonzero(((decision >= start) & (decision <= end)).to_numpy())
             if len(train) >= 50 and len(validation) >= 10:
                 folds.append((train, validation))
+                previous_validation_end = end
         if len(folds) < 2:
             raise ValueError("insufficient rows for nested walk-forward selection")
-        return tuple(folds)
+        return tuple(folds), purge_sec, embargo_sec
 
     def select_and_fit(
         self,
@@ -119,7 +135,7 @@ class NestedWalkForwardSelector:
         # The selector never mutates the caller's frame. Keeping the original
         # indexed view avoids duplicating a full multi-horizon training fold.
         data = outer_train
-        folds = self._folds(data)
+        folds, purge_sec, embargo_sec = self._folds(data)
         candidate_results: list[dict[str, object]] = []
         for config in self.candidate_configs:
             fold_results: list[dict[str, object]] = []
@@ -152,6 +168,20 @@ class NestedWalkForwardSelector:
                         "fold": fold_number,
                         "train_rows": len(train_positions),
                         "inner_oos_rows": len(validation_positions),
+                        "train_decision_end": pd.to_datetime(
+                            data.iloc[train_positions]["decision_at"], utc=True
+                        ).max().isoformat(),
+                        "train_label_available_max": pd.to_datetime(
+                            data.iloc[train_positions]["label_available_at"], utc=True
+                        ).max().isoformat(),
+                        "validation_start": pd.to_datetime(
+                            data.iloc[validation_positions]["decision_at"], utc=True
+                        ).min().isoformat(),
+                        "validation_end": pd.to_datetime(
+                            data.iloc[validation_positions]["decision_at"], utc=True
+                        ).max().isoformat(),
+                        "purge_sec": purge_sec,
+                        "embargo_sec": embargo_sec,
                         "trade_count": trade_count,
                         "prediction_gate": gate_diagnostics,
                         "net_utility": net_utility,
@@ -193,6 +223,8 @@ class NestedWalkForwardSelector:
                 "selection_data": "inner_walk_forward_oos_only",
                 "outer_oos_used_for_selection": False,
                 "inner_fold_count": len(folds),
+                "inner_purge_sec": purge_sec,
+                "inner_embargo_sec": embargo_sec,
                 "selected_config_id": selected_result["config_id"],
                 "outer_train_rows": len(data),
             },

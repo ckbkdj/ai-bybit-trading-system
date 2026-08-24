@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import asdict, dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -228,6 +229,29 @@ def _softmax(values: np.ndarray) -> np.ndarray:
 
 def _sigmoid(values: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-np.clip(values, -40, 40)))
+
+
+def _purge_embargo_seconds(frame: pd.DataFrame) -> tuple[int, int]:
+    """Resolve the fixed horizon and its auditable purge/embargo interval."""
+
+    if "horizon_sec" in frame:
+        horizons = pd.to_numeric(frame["horizon_sec"], errors="coerce").dropna().unique()
+        if len(horizons) != 1 or float(horizons[0]) <= 0:
+            raise ValueError("model training must contain exactly one positive horizon_sec")
+        purge_sec = int(round(float(horizons[0])))
+    else:
+        # Small library callers may omit horizon_sec.  Their observed label
+        # latency is the only conservative PIT duration available; production
+        # pooled panels always carry the explicit fixed horizon contract.
+        decision = pd.to_datetime(frame["decision_at"], utc=True, errors="coerce")
+        available = pd.to_datetime(
+            frame["label_available_at"], utc=True, errors="coerce"
+        )
+        delays = (available - decision).dt.total_seconds()
+        if delays.isna().any() or (delays <= 0).any():
+            raise ValueError("cannot infer a positive purge from label timestamps")
+        purge_sec = max(1, int(math.ceil(float(delays.max()))))
+    return purge_sec, int(round(purge_sec * 0.25))
 
 
 def _fit_ridge(x: np.ndarray, y: np.ndarray, penalty: float) -> np.ndarray:
@@ -495,17 +519,29 @@ class TwoStageAlphaModel:
         validation_times = np.array_split(
             unique_times.iloc[first_validation:].to_numpy(), self.config.oof_folds
         )
+        purge_sec, embargo_sec = _purge_embargo_seconds(frame)
         probabilities = np.full((len(frame), 3), np.nan, dtype=float)
         expected_net = np.full(len(frame), np.nan, dtype=float)
         expected_mae = np.full(len(frame), np.nan, dtype=float)
         expected_mfe = np.full(len(frame), np.nan, dtype=float)
         audit: list[dict[str, object]] = []
+        previous_validation_end: pd.Timestamp | None = None
         for fold_number, times in enumerate(validation_times, start=1):
             if len(times) == 0:
                 continue
             validation_start = pd.Timestamp(times[0])
             validation_end = pd.Timestamp(times[-1])
-            train_mask = (decision < validation_start) & (label_available < validation_start)
+            if previous_validation_end is not None:
+                validation_start = max(
+                    validation_start,
+                    previous_validation_end + timedelta(seconds=embargo_sec),
+                )
+            if validation_start > validation_end:
+                continue
+            train_cutoff = validation_start - timedelta(seconds=purge_sec)
+            train_mask = (decision < train_cutoff) & (
+                label_available < validation_start
+            )
             validation_mask = (decision >= validation_start) & (decision <= validation_end)
             train_positions = np.flatnonzero(train_mask.to_numpy())
             validation_positions = np.flatnonzero(validation_mask.to_numpy())
@@ -536,10 +572,14 @@ class TwoStageAlphaModel:
                     "train_rows": len(train_positions),
                     "validation_rows": len(validation_positions),
                     "train_label_available_max": label_available.iloc[train_positions].max().isoformat(),
+                    "train_decision_max": decision.iloc[train_positions].max().isoformat(),
                     "validation_start": validation_start.isoformat(),
                     "validation_end": validation_end.isoformat(),
+                    "purge_sec": purge_sec,
+                    "embargo_sec": embargo_sec,
                 }
             )
+            previous_validation_end = validation_end
         valid = np.isfinite(expected_net)
         minimum_oof_rows = max(20, self.config.minimum_oof_validation_rows)
         if int(valid.sum()) < minimum_oof_rows or len(audit) < 2:
@@ -764,7 +804,9 @@ class TwoStageAlphaModel:
         probabilities, expected_net, mae, mfe = self._level_one(
             x, direction_x, symbols=symbols
         )
-        meta_x = self._meta_features(x, direction_x, symbols=symbols)
+        meta_x = self._compose_meta_features(
+            probabilities, expected_net, mae, mfe
+        )
         trade_probability = _sigmoid(_linear_predict(meta_x, self.meta_weights))
         entropy = meta_x[:, -1]
         p10 = expected_net + self.residual_quantiles[0]

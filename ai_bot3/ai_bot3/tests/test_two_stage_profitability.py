@@ -50,6 +50,10 @@ def test_two_stage_model_predicts_distribution_meta_label_and_never_self_promote
     assert model.training_audit["oof_rows"] > 0
     assert model.training_audit["oof_rows"] < len(frame)
     assert model.training_audit["pit_label_cutoff_enforced"] is True
+    assert all(
+        fold["purge_sec"] == 180 and fold["embargo_sec"] == 45
+        for fold in model.training_audit["oof_folds"]
+    )
 
     artifact = tmp_path / "two-stage.json"
     model.save(artifact)
