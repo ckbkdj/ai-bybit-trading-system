@@ -36,35 +36,238 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _safe_int(value: object, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _safe_float(value: object, default: float) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return result if result == result and abs(result) != float("inf") else default
+
+
 def _evidence_semantic_failure(name: str, path: Path) -> str | None:
-    if name not in {
-        "data_coverage_report.json",
-        "missing_intervals_report.json",
-        "independent_timestamp_count_report.json",
-        "calibration_coverage_report.json",
-        "nested_cv_report.json",
-        "signal_funnel_report.json",
-        "intratrade_drawdown_report.json",
-        "production_replay_report.json",
-    }:
-        return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return "invalid_json"
     if not isinstance(payload, Mapping):
         return "invalid_payload"
-    if name == "data_coverage_report.json":
+    required_horizons = {"180", "900", "7200", "14400", "86400"}
+    if name == "walk_forward_report.json":
+        folds = payload.get("folds")
+        release_datasets = payload.get("direct_execution_release_datasets")
+        eligible_horizons = {
+            str(value)
+            for value in list(payload.get("development_eligible_horizons") or [])
+        }
+        if payload.get("outer_oos_used_for_tuning") is not False:
+            return "outer_oos_used_for_tuning"
+        if not isinstance(folds, list) or not folds:
+            return "walk_forward_folds_missing"
+        if not eligible_horizons or not eligible_horizons.issubset(required_horizons):
+            return "precommitted_horizons_incomplete"
+        if not isinstance(release_datasets, Mapping) or not eligible_horizons.issubset(
+            set(map(str, release_datasets))
+        ):
+            return "direct_execution_release_datasets_incomplete"
+        if any(
+            not isinstance(release_datasets[horizon], Mapping)
+            or not bool(release_datasets[horizon].get("release_walk_forward_ready"))
+            for horizon in eligible_horizons
+        ):
+            return "direct_execution_release_dataset_failed"
+        if _safe_float(payload.get("positive_fold_ratio"), 0.0) < 0.60:
+            return "positive_fold_ratio_failed"
+    elif name == "lockbox_report.json":
+        result = payload.get("result")
+        horizon_results = payload.get("horizon_results")
+        eligible_horizons = {
+            str(value)
+            for value in list(payload.get("development_eligible_horizons") or [])
+        }
+        if payload.get("status") != "EVALUATED_ONCE":
+            return "lockbox_not_evaluated_once"
+        if payload.get("used_for_parameter_selection") is not False:
+            return "lockbox_used_for_parameter_selection"
+        if payload.get("lockbox_labels_materialized") is not True:
+            return "lockbox_labels_not_materialized"
+        if not str(payload.get("lockbox_fingerprint") or ""):
+            return "lockbox_fingerprint_missing"
+        if not isinstance(result, Mapping) or len(list(result.get("trades") or [])) < 100:
+            return "lockbox_trade_evidence_incomplete"
+        if not eligible_horizons or not eligible_horizons.issubset(required_horizons):
+            return "lockbox_eligible_horizons_invalid"
+        if not isinstance(horizon_results, Mapping) or set(
+            map(str, horizon_results)
+        ) != eligible_horizons:
+            return "lockbox_horizon_evidence_incomplete"
+    elif name == "factor_ablation_report.json":
+        groups = payload.get("groups")
+        required_groups = {
+            "legacy_brain_technical",
+            "bybit_orderbook",
+            "public_trades",
+            "basis_funding_oi",
+            "liquidations",
+            "execution_quality",
+            "us_risk",
+            "rates_usd",
+            "commodities",
+            "healthcare",
+            "china",
+            "crypto_equities",
+            "stablecoin_flows",
+            "fund_flows",
+            "macro_vintage",
+            "tier_a_events",
+        }
+        if payload.get("all_required_groups_evaluated") is not True:
+            return "required_factor_ablation_incomplete"
+        if not isinstance(groups, list) or not groups:
+            return "factor_groups_missing"
+        if {
+            str(group.get("factor_group"))
+            for group in groups
+            if isinstance(group, Mapping)
+        } != required_groups:
+            return "required_factor_groups_incomplete"
+        for group in groups:
+            if not isinstance(group, Mapping):
+                return "factor_group_invalid"
+            horizon_results = group.get("horizon_results")
+            applicable = {
+                str(value) for value in list(group.get("applicable_horizons") or [])
+            }
+            if (
+                group.get("oos_ablation_status") != "EVALUATED_OOS"
+                or group.get("all_applicable_horizons_evaluated") is not True
+                or not applicable
+                or not isinstance(horizon_results, Mapping)
+                or set(map(str, horizon_results)) != applicable
+                or any(
+                    not isinstance(item, Mapping)
+                    or item.get("oos_ablation_status") != "EVALUATED_OOS"
+                    for item in horizon_results.values()
+                )
+            ):
+                return "factor_horizon_ablation_incomplete"
+    elif name == "execution_cost_report.json":
+        execution = payload.get("execution_evidence")
+        normal = payload.get("normal_cost")
+        stressed = payload.get("two_x_cost")
+        if payload.get("evaluation_scope") != "lockbox":
+            return "execution_scope_not_lockbox"
+        if payload.get("execution_evidence_complete") is not True or payload.get(
+            "candidate_backtest_execution_evidence_complete"
+        ) is not True:
+            return "candidate_execution_evidence_incomplete"
+        if not isinstance(execution, Mapping) or not all(
+            bool(execution.get(field))
+            for field in (
+                "official_pit_cost_inputs_complete",
+                "simulation_complete",
+                "risk_policy_compliant",
+                "candidate_backtest_execution_evidence_complete",
+            )
+        ):
+            return "direct_execution_contract_incomplete"
+        if _safe_int(execution.get("proxy_execution_cost_trade_count"), -1) != 0:
+            return "proxy_execution_cost_present"
+        if _safe_int(execution.get("direct_execution_cost_trade_count"), 0) < 100:
+            return "direct_execution_trade_count_incomplete"
+        if not isinstance(normal, Mapping) or not bool(normal.get("mark_to_market_used")):
+            return "normal_cost_mark_to_market_incomplete"
+        if not isinstance(stressed, Mapping) or _safe_float(
+            stressed.get("net_return"), -1.0
+        ) < 0.0:
+            return "two_x_cost_stress_failed"
+    elif name == "capital_preservation_report.json":
+        policy = payload.get("policy")
+        if not isinstance(policy, Mapping) or payload.get("fail_closed") is not True:
+            return "capital_preservation_policy_incomplete"
+        exact_limits = {
+            "risk_per_trade": 0.0025,
+            "daily_loss_limit": 0.005,
+            "weekly_loss_limit": 0.015,
+            "equity_drawdown_limit": 0.03,
+            "leverage_cap": 2.0,
+        }
+        if any(
+            _safe_float(policy.get(key), -1.0) != value
+            for key, value in exact_limits.items()
+        ):
+            return "capital_preservation_limits_changed"
+        if not all(
+            payload.get(field) is True
+            for field in (
+                "no_averaging_down",
+                "no_martingale",
+                "no_trade_without_stop",
+                "no_trade_when_lower_bound_net_edge_lte_zero",
+            )
+        ):
+            return "capital_preservation_prohibitions_incomplete"
+    elif name == "statistical_overfit_report.json":
+        development = payload.get("development")
+        lockbox = payload.get("lockbox")
+        eligible_horizons = {
+            str(value)
+            for value in list(payload.get("development_eligible_horizons") or [])
+        }
+        if not isinstance(development, Mapping) or not isinstance(lockbox, Mapping):
+            return "statistical_scopes_missing"
+        if lockbox.get("alternative_variants_scored_on_lockbox") is not False:
+            return "alternative_variants_scored_on_lockbox"
+        if not eligible_horizons or not eligible_horizons.issubset(required_horizons):
+            return "statistical_eligible_horizons_invalid"
+        for scope_name, scope in (("development", development), ("lockbox", lockbox)):
+            portfolio = scope.get("portfolio")
+            horizons = scope.get("horizons")
+            if not isinstance(portfolio, Mapping) or portfolio.get("complete") is not True:
+                return f"{scope_name}_statistical_portfolio_incomplete"
+            if _safe_float(portfolio.get("deflated_sharpe_probability"), 0.0) < 0.95:
+                return f"{scope_name}_deflated_sharpe_failed"
+            if _safe_float(
+                portfolio.get("probability_of_backtest_overfitting"), 1.0
+            ) > 0.05:
+                return f"{scope_name}_pbo_failed"
+            horizon_keys = set(map(str, horizons)) if isinstance(horizons, Mapping) else set()
+            if not eligible_horizons.issubset(horizon_keys) or (
+                scope_name == "lockbox" and horizon_keys != eligible_horizons
+            ):
+                return f"{scope_name}_statistical_horizons_incomplete"
+            if any(
+                not isinstance(horizons[horizon], Mapping)
+                or horizons[horizon].get("complete") is not True
+                or _safe_float(
+                    horizons[horizon].get("deflated_sharpe_probability"), 0.0
+                )
+                < 0.95
+                or _safe_float(
+                    horizons[horizon].get("probability_of_backtest_overfitting"),
+                    1.0,
+                )
+                > 0.05
+                for horizon in eligible_horizons
+            ):
+                return f"{scope_name}_statistical_horizon_failed"
+    elif name == "data_coverage_report.json":
         if payload.get("status") != "PASSED" or not bool(payload.get("complete")):
             return "coverage_incomplete"
-        if int(payload.get("passed_series_count", -1)) != int(
-            payload.get("expected_series_count", -2)
+        if _safe_int(payload.get("passed_series_count"), -1) != _safe_int(
+            payload.get("expected_series_count"), -2
         ):
             return "coverage_series_failed"
     elif name == "missing_intervals_report.json":
         if payload.get("status") != "PASSED" or not bool(payload.get("complete")):
             return "interval_audit_incomplete"
-        if int(payload.get("total_discontinuity_count", -1)) != 0:
+        if _safe_int(payload.get("total_discontinuity_count"), -1) != 0:
             return "discontinuities_present"
     elif name == "independent_timestamp_count_report.json":
         if payload.get("status") != "PASSED":
@@ -122,8 +325,8 @@ def _evidence_semantic_failure(name: str, path: Path) -> str | None:
         for scope, evidence in (("development", development), ("lockbox", lockbox)):
             if evidence.get("status") != "PASSED":
                 return f"{scope}_intratrade_drawdown_failed"
-            if not bool(evidence.get("mark_to_market_used")) or int(
-                evidence.get("equity_observation_count", 0)
+            if not bool(evidence.get("mark_to_market_used")) or _safe_int(
+                evidence.get("equity_observation_count"), 0
             ) <= 0:
                 return f"{scope}_mark_to_market_incomplete"
     elif name == "production_replay_report.json":
@@ -133,9 +336,9 @@ def _evidence_semantic_failure(name: str, path: Path) -> str | None:
             payload.get("alternative_models_scored")
         ):
             return "production_replay_scope_violated"
-        if int(payload.get("failed_sample_count", -1)) != 0 or int(
-            payload.get("observed_sample_count", -1)
-        ) != int(payload.get("expected_sample_count", -2)):
+        if _safe_int(payload.get("failed_sample_count"), -1) != 0 or _safe_int(
+            payload.get("observed_sample_count"), -1
+        ) != _safe_int(payload.get("expected_sample_count"), -2):
             return "production_replay_samples_failed"
         if payload.get("final_bundle_models_match_replayed") is not True or not str(
             payload.get("final_model_bundle_sha256") or ""
@@ -260,7 +463,9 @@ def verify_candidate_authorization(
         return False, "profitability_release_json_invalid"
     if report.get("profitability_gate") != "PASSED":
         return False, "profitability_gate_failed"
-    if int(report.get("candidate_count", 0)) != 1 or int(report.get("live_count", 0)) != 0:
+    if _safe_int(report.get("candidate_count"), 0) != 1 or _safe_int(
+        report.get("live_count"), 0
+    ) != 0:
         return False, "profitability_candidate_counts_invalid"
     if manifest.get("stage") != "candidate" or manifest.get("model_family") != "profitability_two_stage":
         return False, "profitability_manifest_stage_invalid"

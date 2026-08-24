@@ -137,6 +137,119 @@ def shadow_authenticity_evidence(
         "fixture_scope": "shadow_authenticity_only",
         "not_profitability_evidence": True,
     }
+    if name == "walk_forward_report.json":
+        horizons = ("180", "900", "7200", "14400", "86400")
+        return {
+            **common,
+            "folds": [{"fold_id": "shadow-authenticity-fixture"}],
+            "outer_oos_used_for_tuning": False,
+            "development_eligible_horizons": [int(value) for value in horizons],
+            "direct_execution_release_datasets": {
+                value: {"release_walk_forward_ready": True} for value in horizons
+            },
+            "positive_fold_ratio": 0.60,
+        }
+    if name == "lockbox_report.json":
+        horizons = ("180", "900", "7200", "14400", "86400")
+        return {
+            **common,
+            "status": "EVALUATED_ONCE",
+            "used_for_parameter_selection": False,
+            "lockbox_labels_materialized": True,
+            "lockbox_fingerprint": "c" * 64,
+            "development_eligible_horizons": [int(value) for value in horizons],
+            "result": {"trades": [{} for _ in range(100)]},
+            "horizon_results": {value: {"gate": "fixture"} for value in horizons},
+        }
+    if name == "factor_ablation_report.json":
+        definitions = {
+            "legacy_brain_technical": (180, 900, 7200, 14400, 86400),
+            "bybit_orderbook": (180, 900),
+            "public_trades": (180, 900),
+            "basis_funding_oi": (180, 900),
+            "liquidations": (180, 900),
+            "execution_quality": (180, 900),
+            "us_risk": (7200, 14400, 86400),
+            "rates_usd": (7200, 14400, 86400),
+            "commodities": (7200, 14400, 86400),
+            "healthcare": (7200, 14400, 86400),
+            "china": (7200, 14400, 86400),
+            "crypto_equities": (7200, 14400, 86400),
+            "stablecoin_flows": (7200, 14400, 86400),
+            "fund_flows": (7200, 14400, 86400),
+            "macro_vintage": (7200, 14400, 86400),
+            "tier_a_events": (7200, 14400, 86400),
+        }
+        return {
+            **common,
+            "all_required_groups_evaluated": True,
+            "groups": [
+                {
+                    "factor_group": group,
+                    "oos_ablation_status": "EVALUATED_OOS",
+                    "all_applicable_horizons_evaluated": True,
+                    "applicable_horizons": list(horizons),
+                    "horizon_results": {
+                        str(horizon): {"oos_ablation_status": "EVALUATED_OOS"}
+                        for horizon in horizons
+                    },
+                }
+                for group, horizons in definitions.items()
+            ],
+        }
+    if name == "execution_cost_report.json":
+        return {
+            **common,
+            "evaluation_scope": "lockbox",
+            "execution_evidence_complete": True,
+            "candidate_backtest_execution_evidence_complete": True,
+            "execution_evidence": {
+                "official_pit_cost_inputs_complete": True,
+                "simulation_complete": True,
+                "risk_policy_compliant": True,
+                "candidate_backtest_execution_evidence_complete": True,
+                "proxy_execution_cost_trade_count": 0,
+                "direct_execution_cost_trade_count": 100,
+            },
+            "normal_cost": {"mark_to_market_used": True},
+            "two_x_cost": {"net_return": 0.0},
+        }
+    if name == "capital_preservation_report.json":
+        return {
+            **common,
+            "fail_closed": True,
+            "no_averaging_down": True,
+            "no_martingale": True,
+            "no_trade_without_stop": True,
+            "no_trade_when_lower_bound_net_edge_lte_zero": True,
+            "policy": {
+                "risk_per_trade": 0.0025,
+                "daily_loss_limit": 0.005,
+                "weekly_loss_limit": 0.015,
+                "equity_drawdown_limit": 0.03,
+                "leverage_cap": 2.0,
+            },
+        }
+    if name == "statistical_overfit_report.json":
+        horizons = ("180", "900", "7200", "14400", "86400")
+        evidence = {
+            "complete": True,
+            "deflated_sharpe_probability": 0.95,
+            "probability_of_backtest_overfitting": 0.05,
+        }
+        return {
+            **common,
+            "development_eligible_horizons": [int(value) for value in horizons],
+            "development": {
+                "portfolio": evidence,
+                "horizons": {value: evidence for value in horizons},
+            },
+            "lockbox": {
+                "portfolio": evidence,
+                "horizons": {value: evidence for value in horizons},
+                "alternative_variants_scored_on_lockbox": False,
+            },
+        }
     if name == "data_coverage_report.json":
         return {
             **common,

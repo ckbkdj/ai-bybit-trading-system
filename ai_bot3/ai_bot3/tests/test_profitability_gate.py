@@ -27,6 +27,7 @@ from core.evaluation.profitability_rebuild import (
 from core.evaluation.statistical_governance import TrialLedger
 from core.release.profitability_release import (
     REQUIRED_EVIDENCE_REPORTS,
+    _evidence_semantic_failure,
     create_candidate_manifest,
     verify_candidate_authorization,
 )
@@ -81,6 +82,114 @@ def _calibration_evidence() -> dict[str, object]:
 def _release_evidence_fixture(
     name: str, model_sha256: str = "f" * 64
 ) -> dict[str, object]:
+    if name == "walk_forward_report.json":
+        horizons = ("180", "900", "7200", "14400", "86400")
+        return {
+            "folds": [{"fold_id": "fixture"}],
+            "outer_oos_used_for_tuning": False,
+            "development_eligible_horizons": [int(value) for value in horizons],
+            "direct_execution_release_datasets": {
+                value: {"release_walk_forward_ready": True} for value in horizons
+            },
+            "positive_fold_ratio": 0.60,
+        }
+    if name == "lockbox_report.json":
+        horizons = ("180", "900", "7200", "14400", "86400")
+        return {
+            "status": "EVALUATED_ONCE",
+            "used_for_parameter_selection": False,
+            "lockbox_labels_materialized": True,
+            "lockbox_fingerprint": "c" * 64,
+            "development_eligible_horizons": [int(value) for value in horizons],
+            "result": {"trades": [{} for _ in range(100)]},
+            "horizon_results": {value: {"gate": "fixture"} for value in horizons},
+        }
+    if name == "factor_ablation_report.json":
+        definitions = {
+            "legacy_brain_technical": (180, 900, 7200, 14400, 86400),
+            "bybit_orderbook": (180, 900),
+            "public_trades": (180, 900),
+            "basis_funding_oi": (180, 900),
+            "liquidations": (180, 900),
+            "execution_quality": (180, 900),
+            "us_risk": (7200, 14400, 86400),
+            "rates_usd": (7200, 14400, 86400),
+            "commodities": (7200, 14400, 86400),
+            "healthcare": (7200, 14400, 86400),
+            "china": (7200, 14400, 86400),
+            "crypto_equities": (7200, 14400, 86400),
+            "stablecoin_flows": (7200, 14400, 86400),
+            "fund_flows": (7200, 14400, 86400),
+            "macro_vintage": (7200, 14400, 86400),
+            "tier_a_events": (7200, 14400, 86400),
+        }
+        return {
+            "all_required_groups_evaluated": True,
+            "groups": [
+                {
+                    "factor_group": group,
+                    "oos_ablation_status": "EVALUATED_OOS",
+                    "all_applicable_horizons_evaluated": True,
+                    "applicable_horizons": list(horizons),
+                    "horizon_results": {
+                        str(horizon): {"oos_ablation_status": "EVALUATED_OOS"}
+                        for horizon in horizons
+                    },
+                }
+                for group, horizons in definitions.items()
+            ],
+        }
+    if name == "execution_cost_report.json":
+        return {
+            "evaluation_scope": "lockbox",
+            "execution_evidence_complete": True,
+            "candidate_backtest_execution_evidence_complete": True,
+            "execution_evidence": {
+                "official_pit_cost_inputs_complete": True,
+                "simulation_complete": True,
+                "risk_policy_compliant": True,
+                "candidate_backtest_execution_evidence_complete": True,
+                "proxy_execution_cost_trade_count": 0,
+                "direct_execution_cost_trade_count": 100,
+            },
+            "normal_cost": {"mark_to_market_used": True},
+            "two_x_cost": {"net_return": 0.0},
+        }
+    if name == "capital_preservation_report.json":
+        return {
+            "fail_closed": True,
+            "no_averaging_down": True,
+            "no_martingale": True,
+            "no_trade_without_stop": True,
+            "no_trade_when_lower_bound_net_edge_lte_zero": True,
+            "policy": {
+                "risk_per_trade": 0.0025,
+                "daily_loss_limit": 0.005,
+                "weekly_loss_limit": 0.015,
+                "equity_drawdown_limit": 0.03,
+                "leverage_cap": 2.0,
+            },
+        }
+    if name == "statistical_overfit_report.json":
+        horizons = ("180", "900", "7200", "14400", "86400")
+        evidence = {
+            "complete": True,
+            "deflated_sharpe_probability": 0.95,
+            "probability_of_backtest_overfitting": 0.05,
+        }
+        return {
+            "development_eligible_horizons": [int(value) for value in horizons],
+            "development": {
+                "portfolio": evidence,
+                "horizons": {value: evidence for value in horizons},
+            },
+            "lockbox": {
+                "portfolio": evidence,
+                "horizons": {value: evidence for value in horizons},
+                "alternative_variants_scored_on_lockbox": False,
+            },
+        }
+
     if name == "data_coverage_report.json":
         return {
             "status": "PASSED",
@@ -484,6 +593,46 @@ def test_candidate_manifest_binds_every_final_evidence_report(tmp_path):
     authorized, reason = verify_candidate_authorization(profitability, manifest)
     assert authorized is False
     assert reason == "profitability_evidence_hash_mismatch:execution_cost_report.json"
+
+
+@pytest.mark.parametrize("name", REQUIRED_EVIDENCE_REPORTS)
+def test_candidate_manifest_rejects_empty_evidence_report_semantics(tmp_path, name):
+    path = tmp_path / name
+    path.write_text("{}", encoding="utf-8")
+
+    assert _evidence_semantic_failure(name, path) is not None
+
+
+def test_candidate_evidence_accepts_a_development_selected_horizon_subset(tmp_path):
+    cases = {
+        "walk_forward_report.json": _release_evidence_fixture(
+            "walk_forward_report.json"
+        ),
+        "lockbox_report.json": _release_evidence_fixture("lockbox_report.json"),
+        "statistical_overfit_report.json": _release_evidence_fixture(
+            "statistical_overfit_report.json"
+        ),
+    }
+    cases["walk_forward_report.json"]["development_eligible_horizons"] = [180]
+    cases["lockbox_report.json"]["development_eligible_horizons"] = [180]
+    cases["lockbox_report.json"]["horizon_results"] = {
+        "180": {"gate": "fixture"}
+    }
+    cases["statistical_overfit_report.json"]["development_eligible_horizons"] = [
+        180
+    ]
+    cases["statistical_overfit_report.json"]["lockbox"]["horizons"] = {
+        "180": {
+            "complete": True,
+            "deflated_sharpe_probability": 0.95,
+            "probability_of_backtest_overfitting": 0.05,
+        }
+    }
+
+    for name, payload in cases.items():
+        path = tmp_path / name
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        assert _evidence_semantic_failure(name, path) is None
 
 
 def test_candidate_manifest_release_id_is_derived_from_bound_evidence(tmp_path):

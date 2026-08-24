@@ -4839,6 +4839,9 @@ class ProfitabilityRebuild:
                     }
                 ),
                 "evaluation_scope": "development_and_single_use_lockbox",
+                "development_eligible_horizons": list(
+                    development_eligible_horizons
+                ),
                 "thresholds": {
                     "minimum_deflated_sharpe_probability": 0.95,
                     "maximum_cscv_probability_of_backtest_overfitting": 0.05,
