@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -118,6 +119,36 @@ def test_separate_lockbox_bybit_store_is_not_opened_during_initialization(tmp_pa
         lockbox_bybit_pit_store_path=tmp_path / "another-sealed-store.sqlite3",
     )
     assert ProfitabilityRebuild(alternate).trial_id == runner.trial_id
+
+
+def test_trial_identity_binds_feature_store_content_not_only_size_and_mtime(tmp_path):
+    feature_store = tmp_path / "same-metadata-different-content.sqlite3"
+    feature_store.write_bytes(b"AAAA")
+    original_stat = feature_store.stat()
+
+    def config() -> ProfitabilityRebuildConfig:
+        return ProfitabilityRebuildConfig(
+            feature_store_path=feature_store,
+            output_dir=tmp_path / "reports",
+            trial_ledger_path=tmp_path / "trials.sqlite3",
+            model_output_dir=tmp_path / "models",
+            code_commit="1" * 40,
+        )
+
+    first = ProfitabilityRebuild(config())
+    feature_store.write_bytes(b"BBBB")
+    os.utime(
+        feature_store,
+        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+    )
+    second = ProfitabilityRebuild(config())
+
+    assert feature_store.stat().st_size == original_stat.st_size
+    assert feature_store.stat().st_mtime_ns == original_stat.st_mtime_ns
+    assert first.feature_store_identity["sha256"] != second.feature_store_identity[
+        "sha256"
+    ]
+    assert first.trial_id != second.trial_id
 
 
 def test_label_decisions_do_not_treat_overlapping_execution_windows_as_independent():

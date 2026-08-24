@@ -403,6 +403,25 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _stable_file_identity(path: Path) -> dict[str, object]:
+    """Hash an artifact only when its filesystem identity stays unchanged."""
+
+    resolved = Path(path).resolve()
+    before = resolved.stat()
+    sha256 = _sha256_file(resolved)
+    after = resolved.stat()
+    before_identity = (before.st_size, before.st_mtime_ns)
+    after_identity = (after.st_size, after.st_mtime_ns)
+    if after_identity != before_identity:
+        raise RuntimeError(f"artifact changed while hashing: {resolved}")
+    return {
+        "database": str(resolved),
+        "size_bytes": after.st_size,
+        "modified_ns": after.st_mtime_ns,
+        "sha256": sha256,
+    }
+
+
 def _archive_candidate_manifest(output_dir: Path, run_id: str) -> str | None:
     """Preserve, but deactivate, a manifest left by an older successful run."""
 
@@ -2220,16 +2239,16 @@ class ProfitabilityRebuild:
                 self.flow_pit_snapshot_maximum_sequence,
                 self.flow_pit_snapshot_maximum_invalidation_rowid,
             ) = flow_source.snapshot_watermarks()
-        feature_store_stat = config.feature_store_path.stat()
+        self.feature_store_identity = _stable_file_identity(
+            config.feature_store_path
+        )
         self.feature_store_snapshot = (
-            feature_store_stat.st_size,
-            feature_store_stat.st_mtime_ns,
+            int(self.feature_store_identity["size_bytes"]),
+            int(self.feature_store_identity["modified_ns"]),
         )
         run_payload = {
             "code_commit": config.code_commit,
-            "feature_store": str(config.feature_store_path.resolve()),
-            "feature_store_size_bytes": feature_store_stat.st_size,
-            "feature_store_modified_ns": feature_store_stat.st_mtime_ns,
+            "feature_store": self.feature_store_identity,
             "trad_panel_root": (
                 str(config.trad_panel_root.resolve()) if config.trad_panel_root else None
             ),
@@ -2276,7 +2295,9 @@ class ProfitabilityRebuild:
         self.ledger.append_event(self.trial_id, "running", {"phase": "load_and_label"})
         panels: dict[int, pd.DataFrame] = {}
         market: dict[str, Sequence[MarketBar]] = {}
-        source_evidence: dict[str, object] = {}
+        source_evidence: dict[str, object] = {
+            "kline_feature_store": dict(self.feature_store_identity)
+        }
         bybit_source: BybitPITFeatureSource | None = None
         bybit_evidence_by_horizon: dict[int, dict[str, object]] = {}
         bybit_names: tuple[str, ...] = ()
@@ -3092,25 +3113,23 @@ class ProfitabilityRebuild:
                     lockbox_bybit_maximum_import_rowid
                 ),
             }
-        kline_snapshot_sha256 = _sha256_file(self.config.feature_store_path)
-        post_hash_feature_store_stat = self.config.feature_store_path.stat()
+        lockbox_kline_identity = _stable_file_identity(
+            self.config.feature_store_path
+        )
         if (
-            post_hash_feature_store_stat.st_size,
-            post_hash_feature_store_stat.st_mtime_ns,
-        ) != (
-            current_feature_store_stat.st_size,
-            current_feature_store_stat.st_mtime_ns,
-        ):
+            int(lockbox_kline_identity["size_bytes"]),
+            int(lockbox_kline_identity["modified_ns"]),
+        ) != self.feature_store_snapshot:
             raise RuntimeError(
-                "kline feature store changed while the lockbox snapshot was hashed"
+                "kline feature store changed before the lockbox snapshot was hashed"
+            )
+        kline_snapshot_sha256 = str(lockbox_kline_identity["sha256"])
+        if kline_snapshot_sha256 != str(self.feature_store_identity["sha256"]):
+            raise RuntimeError(
+                "kline feature store content changed before lockbox evaluation"
             )
         lockbox_source_identity = {
-            "kline_feature_store": {
-                "database": str(self.config.feature_store_path.resolve()),
-                "size_bytes": current_feature_store_stat.st_size,
-                "modified_ns": current_feature_store_stat.st_mtime_ns,
-                "sha256": kline_snapshot_sha256,
-            },
+            "kline_feature_store": lockbox_kline_identity,
             "bybit_public_pit": lockbox_bybit_snapshot,
             "macro_pit_snapshot_maximum_sequence": (
                 self.macro_pit_snapshot_maximum_sequence
@@ -3336,6 +3355,13 @@ class ProfitabilityRebuild:
             lockbox_parts.clear()
             lockbox_bybit_history = None
             del lockbox_panel
+        post_lockbox_kline_identity = _stable_file_identity(
+            self.config.feature_store_path
+        )
+        if post_lockbox_kline_identity != lockbox_kline_identity:
+            raise RuntimeError(
+                "kline feature store changed while lockbox paths were evaluated"
+            )
         lockbox_fingerprint = _hash_payload(
             {
                 str(horizon): fingerprint
