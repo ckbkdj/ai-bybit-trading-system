@@ -62,7 +62,7 @@ def _captured_day(path: Path) -> BybitPublicPITStore:
         )
         if index < len(SYMBOLS) or index >= 1_441 - len(SYMBOLS):
             store.append_feature(
-                event_id=f"feature-{index}",
+                event_id=f"raw-{index}:bybit-liquidation-side-v2",
                 symbol=symbol,
                 name="liquidation_imbalance_5m",
                 value=0.25,
@@ -213,6 +213,53 @@ def test_capture_audit_rejects_stale_raw_event(tmp_path):
         assert "lag contract" in str(exc)
     else:
         raise AssertionError("a stale raw event was accepted as capture evidence")
+
+
+def test_capture_audit_rejects_liquidation_feature_without_raw_link(tmp_path):
+    store = BybitPublicPITStore(tmp_path / "unlinked-feature.sqlite3")
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    store.start_session(
+        "unlinked",
+        endpoint=BYBIT_PUBLIC_LINEAR_WS,
+        symbols=("BTCUSDT",),
+        started_at=now - timedelta(seconds=1),
+    )
+    store.append_raw(
+        event_id="raw-liquidation",
+        session_id="unlinked",
+        topic="allLiquidation.BTCUSDT",
+        symbol="BTCUSDT",
+        event_type="liquidation",
+        exchange_time=now,
+        received_at=now,
+        payload={"liquidation": 1},
+    )
+    store.append_feature(
+        event_id="not-the-raw-event:bybit-liquidation-side-v2",
+        symbol="BTCUSDT",
+        name="liquidation_imbalance_5m",
+        value=1.0,
+        unit="ratio",
+        event_time=now,
+        received_at=now,
+        source="bybit.public.liquidations.v2",
+        quality=1.0,
+    )
+    store.end_session(
+        "unlinked", ended_at=now + timedelta(seconds=1), status="completed"
+    )
+    try:
+        BybitPITFeatureSource(store.path).load(["liquidation_imbalance_5m"])
+    except RuntimeError as exc:
+        assert "no deterministic raw-event link" in str(exc)
+    else:
+        raise AssertionError("training accepted an unlinked liquidation feature")
+    try:
+        audit_live_capture(store)
+    except RuntimeError as exc:
+        assert "no deterministic raw-event link" in str(exc)
+    else:
+        raise AssertionError("an unlinked liquidation feature was accepted")
 
 
 def test_audited_liquidations_merge_append_only_and_unlock_continuity(tmp_path):

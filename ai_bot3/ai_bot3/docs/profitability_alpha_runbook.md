@@ -194,6 +194,8 @@ python scripts/backfill_bybit_historical_archive.py `
 
 审计还会逐条核对官方 public linear endpoint、已结束 session、订阅 symbol、topic 与 event type、event/receive 最大 10 秒时延、事件必须落在本 session 内，以及不存在脱离 session 的孤儿 raw row；任一违反都拒绝整个 capture audit。
 
+有效 `liquidation_imbalance_5m` 必须用 `raw_event_id + bybit-liquidation-side-v2 + symbol + feature name` 形成确定性 observation ID，并与 raw event 的 symbol/received_at 一致；审计与训练 loader 都会检查该绑定和 feature payload SHA。不要手工补 source 字符串冒充真实 WS 因子。
+
 满 180 天后先正常停止 public-only collector，确认没有 `status=running` 的 session，再做逐条 payload SHA 审计：
 
 ```powershell

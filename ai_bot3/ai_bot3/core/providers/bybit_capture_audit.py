@@ -44,6 +44,14 @@ def _topic_event_type(topic: str, symbol: str) -> str | None:
     return next((event_type for matches, event_type in contracts if matches), None)
 
 
+def _liquidation_observation_id(raw_event_id: str, symbol: str) -> str:
+    event_id = f"{raw_event_id}:bybit-liquidation-side-v2"
+    token = hashlib.sha256(
+        f"{event_id}|{symbol}|liquidation_imbalance_5m".encode()
+    ).hexdigest()[:48]
+    return f"bp_{token}"
+
+
 @dataclass(frozen=True)
 class LiveCaptureAuditEvidence:
     audit_id: str
@@ -55,6 +63,7 @@ class LiveCaptureAuditEvidence:
     last_received_at: str
     maximum_gap_sec: float
     raw_event_count: int
+    liquidation_feature_count: int
     symbols: tuple[str, ...]
     topic_counts: Mapping[str, int]
     event_type_counts: Mapping[str, int]
@@ -173,6 +182,7 @@ def audit_live_capture(
         interval_events = 0
         prior_received: datetime | None = None
         raw_event_count = 0
+        liquidation_links: dict[str, tuple[str, str]] = {}
 
         for session in sessions:
             rows = source.execute(
@@ -228,6 +238,14 @@ def audit_live_capture(
                 topic_counts[topic] += 1
                 event_type_counts[event_type] += 1
                 symbols.add(symbol)
+                if event_type == "liquidation":
+                    observation_id = _liquidation_observation_id(
+                        str(row["event_id"]), symbol
+                    )
+                    liquidation_links[observation_id] = (
+                        symbol,
+                        str(row["received_at"]),
+                    )
                 digest.update(
                     _canonical(
                         {
@@ -250,6 +268,47 @@ def audit_live_capture(
         )
         if raw_event_count != journal_count:
             raise RuntimeError("capture audit found raw events without a session contract")
+        liquidation_feature_count = 0
+        for feature in source.execute(
+            """SELECT observation_id,symbol,name,value,unit,event_time,available_at,
+                      ingested_at,source,quality,payload_sha256
+                 FROM bybit_feature_observations
+                WHERE sequence<=? AND name='liquidation_imbalance_5m'
+                  AND source='bybit.public.liquidations.v2'
+                ORDER BY sequence""",
+            (maximum_feature,),
+        ):
+            payload = {
+                "observation_id": feature["observation_id"],
+                "symbol": feature["symbol"],
+                "name": feature["name"],
+                "value": float(feature["value"]),
+                "unit": feature["unit"],
+                "event_time": feature["event_time"],
+                "available_at": feature["available_at"],
+                "ingested_at": feature["ingested_at"],
+                "source": feature["source"],
+                "quality": float(feature["quality"]),
+            }
+            if hashlib.sha256(_canonical(payload).encode()).hexdigest() != str(
+                feature["payload_sha256"]
+            ):
+                raise CaptureConflict("liquidation feature payload hash mismatch")
+            link = liquidation_links.get(str(feature["observation_id"]))
+            if link is None:
+                raise RuntimeError("liquidation feature has no deterministic raw-event link")
+            symbol, received_at = link
+            if (
+                str(feature["symbol"]).upper() != symbol
+                or str(feature["available_at"]) != received_at
+            ):
+                raise RuntimeError("liquidation feature/raw chronology contract failed")
+            event_time = _timestamp(feature["event_time"])
+            available_at = _timestamp(feature["available_at"])
+            ingested_at = _timestamp(feature["ingested_at"])
+            if not event_time <= available_at <= ingested_at:
+                raise RuntimeError("liquidation feature chronology is invalid")
+            liquidation_feature_count += 1
         if interval_start is not None and interval_end is not None:
             intervals.append(
                 {
@@ -287,6 +346,7 @@ def audit_live_capture(
             last_received_at=str(intervals[-1]["ended_at"]),
             maximum_gap_sec=float(maximum_gap_sec),
             raw_event_count=raw_event_count,
+            liquidation_feature_count=liquidation_feature_count,
             symbols=tuple(sorted(symbols)),
             topic_counts=dict(sorted(topic_counts.items())),
             event_type_counts=dict(sorted(event_type_counts.items())),
@@ -326,9 +386,10 @@ def audit_live_capture(
                    audit_id,created_at,snapshot_maximum_raw_sequence,
                    snapshot_maximum_feature_sequence,snapshot_maximum_invalidation_rowid,
                    first_received_at,last_received_at,maximum_gap_sec,raw_event_count,
-                   symbols_json,topic_counts_json,event_type_counts_json,interval_count,
+                   liquidation_feature_count,symbols_json,topic_counts_json,
+                   event_type_counts_json,interval_count,
                    longest_interval_sec,manifest_sha256,status,error
-               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 audit_id,
                 now,
@@ -339,6 +400,7 @@ def audit_live_capture(
                 evidence.last_received_at,
                 maximum_gap_sec,
                 raw_event_count,
+                liquidation_feature_count,
                 _canonical(evidence.symbols),
                 _canonical(evidence.topic_counts),
                 _canonical(evidence.event_type_counts),
@@ -457,8 +519,9 @@ def merge_audited_liquidation_capture(
             "audit_id", "created_at", "snapshot_maximum_raw_sequence",
             "snapshot_maximum_feature_sequence", "snapshot_maximum_invalidation_rowid",
             "first_received_at", "last_received_at", "maximum_gap_sec", "raw_event_count",
-            "symbols_json", "topic_counts_json", "event_type_counts_json", "interval_count",
-            "longest_interval_sec", "manifest_sha256", "status", "error",
+            "liquidation_feature_count", "symbols_json", "topic_counts_json",
+            "event_type_counts_json", "interval_count", "longest_interval_sec",
+            "manifest_sha256", "status", "error",
         )
         interval_columns = (
             "audit_id", "interval_index", "started_at", "ended_at", "raw_event_count"

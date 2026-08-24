@@ -217,6 +217,7 @@ class BybitPublicPITStore:
                     last_received_at TEXT NOT NULL,
                     maximum_gap_sec REAL NOT NULL,
                     raw_event_count INTEGER NOT NULL,
+                    liquidation_feature_count INTEGER NOT NULL,
                     symbols_json TEXT NOT NULL,
                     topic_counts_json TEXT NOT NULL,
                     event_type_counts_json TEXT NOT NULL,
@@ -362,6 +363,17 @@ class BybitPublicPITStore:
                 connection.execute(
                     """ALTER TABLE bybit_feature_observations
                        ADD COLUMN api_batch_id TEXT"""
+                )
+            audit_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(bybit_live_capture_audits)"
+                ).fetchall()
+            }
+            if "liquidation_feature_count" not in audit_columns:
+                connection.execute(
+                    """ALTER TABLE bybit_live_capture_audits
+                       ADD COLUMN liquidation_feature_count INTEGER NOT NULL DEFAULT 0"""
                 )
             migration_id = "invalidate-bybit-liquidation-side-v1"
             migration_applied = connection.execute(
@@ -619,6 +631,10 @@ class BybitPublicPITStore:
         definition = self.registry.require(name)
         if definition.unit != unit:
             raise ValueError(f"unit mismatch for {name}: {unit} != {definition.unit}")
+        value = float(value)
+        quality = float(quality)
+        if not math.isfinite(value) or not math.isfinite(quality) or not 0 <= quality <= 1:
+            raise ValueError("feature value or quality is invalid")
         normalized_symbol = symbol.strip().upper()
         token = hashlib.sha256(
             f"{event_id}|{normalized_symbol}|{name}".encode()
@@ -628,7 +644,7 @@ class BybitPublicPITStore:
             "observation_id": observation_id,
             "symbol": normalized_symbol,
             "name": name,
-            "value": float(value),
+            "value": value,
             "unit": unit,
             "event_time": _iso(event_time),
             "available_at": _iso(received_at),
@@ -660,7 +676,7 @@ class BybitPublicPITStore:
                     observation_id,
                     normalized_symbol,
                     name,
-                    float(value),
+                    value,
                     unit,
                     _iso(event_time),
                     _iso(received_at),

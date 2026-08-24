@@ -1643,6 +1643,10 @@ def _evaluate_bybit_pit_ablation(
                 and set(SYMBOLS).issubset(audit_symbols)
                 and topic_contracts_complete
                 and audited_feature_overlap_complete
+                and (
+                    group != "liquidations"
+                    or int(audit.get("liquidation_feature_count", 0)) > 0
+                )
                 and float(audit.get("maximum_gap_sec", math.inf)) <= 90.0
                 and continuous_days >= minimum_history_days
             ):

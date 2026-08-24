@@ -74,6 +74,14 @@ def _completed_day_continuity(values: Sequence[object]) -> dict[str, object]:
     }
 
 
+def _liquidation_observation_id(raw_event_id: str, symbol: str) -> str:
+    event_id = f"{raw_event_id}:bybit-liquidation-side-v2"
+    token = hashlib.sha256(
+        f"{event_id}|{symbol}|liquidation_imbalance_5m".encode()
+    ).hexdigest()[:48]
+    return f"bp_{token}"
+
+
 class BybitPITFeatureSource:
     """Read symbol-partitioned Bybit observations with strict as-of joins."""
 
@@ -472,6 +480,57 @@ class BybitPITFeatureSource:
         )
         if violation.any():
             raise RuntimeError("Bybit PIT feature chronology invariant failed")
+        liquidation_frame = frame[
+            (frame["name"] == "liquidation_imbalance_5m")
+            & (frame["source"] == "bybit.public.liquidations.v2")
+        ].copy()
+        if not liquidation_frame.empty:
+            symbols_in_frame = tuple(
+                sorted(set(liquidation_frame["symbol"].astype(str)))
+            )
+            symbol_placeholders = ",".join("?" for _ in symbols_in_frame)
+            received_start = (
+                liquidation_frame["available_at"]
+                .min()
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+            received_end = (
+                liquidation_frame["available_at"]
+                .max()
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+            with closing(self._connect()) as connection:
+                raw_table = connection.execute(
+                    """SELECT 1 FROM sqlite_master
+                         WHERE type='table' AND name='bybit_raw_public_events'"""
+                ).fetchone()
+                if not raw_table:
+                    raise RuntimeError("liquidation feature raw journal is missing")
+                raw_rows = connection.execute(
+                    f"""SELECT event_id,symbol,received_at
+                           FROM bybit_raw_public_events
+                          WHERE event_type='liquidation'
+                            AND symbol IN ({symbol_placeholders})
+                            AND received_at>=? AND received_at<=?""",
+                    symbols_in_frame + (received_start, received_end),
+                ).fetchall()
+            raw_links = {
+                _liquidation_observation_id(
+                    str(row["event_id"]), str(row["symbol"]).upper()
+                ): (str(row["symbol"]).upper(), str(row["received_at"]))
+                for row in raw_rows
+            }
+            for row in liquidation_frame.itertuples(index=False):
+                link = raw_links.get(str(row.observation_id))
+                if link is None:
+                    raise RuntimeError(
+                        "liquidation feature has no deterministic raw-event link"
+                    )
+                available_at = row.available_at.isoformat().replace("+00:00", "Z")
+                if link != (str(row.symbol).upper(), available_at):
+                    raise RuntimeError("liquidation feature/raw chronology mismatch")
         allowed_provenance = {
             "live_capture",
             "legacy_live_capture",
@@ -609,8 +668,9 @@ class BybitPITFeatureSource:
                               snapshot_maximum_feature_sequence,
                               snapshot_maximum_invalidation_rowid,first_received_at,
                               last_received_at,maximum_gap_sec,raw_event_count,
-                              symbols_json,topic_counts_json,event_type_counts_json,
-                              interval_count,longest_interval_sec,manifest_sha256,status,error
+                              liquidation_feature_count,symbols_json,topic_counts_json,
+                              event_type_counts_json,interval_count,longest_interval_sec,
+                              manifest_sha256,status,error
                          FROM bybit_live_capture_audits
                         WHERE status='completed' AND rowid<=?
                         ORDER BY created_at,audit_id"""
