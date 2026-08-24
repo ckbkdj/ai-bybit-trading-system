@@ -25,6 +25,30 @@ class ProfitabilityThresholds:
     bootstrap_samples: int = 2000
     bootstrap_seed: int = 20260823
 
+    def __post_init__(self) -> None:
+        if self.minimum_net_return < 0:
+            raise ValueError("minimum_net_return cannot be below zero")
+        if self.minimum_profit_factor < 1.20:
+            raise ValueError("minimum_profit_factor cannot be below 1.20")
+        if not 0 < self.maximum_drawdown <= 0.03:
+            raise ValueError("maximum_drawdown cannot exceed 3%")
+        if self.minimum_bootstrap_expectancy < 0:
+            raise ValueError("minimum_bootstrap_expectancy cannot be below zero")
+        if not 0 <= self.maximum_2x_cost_loss <= 0.005:
+            raise ValueError("maximum_2x_cost_loss cannot exceed 0.50%")
+        if not 0.60 <= self.minimum_positive_fold_ratio <= 1:
+            raise ValueError("minimum_positive_fold_ratio cannot be below 60%")
+        if not 0 < self.maximum_concentration_share <= 0.50:
+            raise ValueError("maximum_concentration_share cannot exceed 50%")
+        if self.minimum_trades < 30:
+            raise ValueError("minimum_trades cannot be below 30")
+        if self.minimum_independent_return_clusters < 20:
+            raise ValueError(
+                "minimum_independent_return_clusters cannot be below 20"
+            )
+        if self.bootstrap_samples < 2000:
+            raise ValueError("bootstrap_samples cannot be below 2000")
+
 
 @dataclass(frozen=True)
 class ProfitabilityGateResult:

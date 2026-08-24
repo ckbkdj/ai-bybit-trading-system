@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from core.evaluation.profitability_gate import (
+    ProfitabilityThresholds,
     _concentration,
     evaluate_development_gate,
     evaluate_profitability_gate,
@@ -18,7 +19,11 @@ from core.evaluation.profitability_gate import (
 )
 from core.evaluation.profitability_rebuild import write_failed_outputs
 from core.evaluation.statistical_governance import TrialLedger
-from core.release.profitability_release import create_candidate_manifest
+from core.release.profitability_release import (
+    REQUIRED_EVIDENCE_REPORTS,
+    create_candidate_manifest,
+    verify_candidate_authorization,
+)
 from core.risk.capital_preservation import CapitalState, TradeProposal, evaluate_trade_proposal
 
 
@@ -59,6 +64,24 @@ def test_profitability_gate_passes_only_complete_stable_evidence():
     assert gate.checks["bootstrap_lower_expectancy"]["unit"] == (
         "utc_calendar_day_portfolio_net_return"
     )
+
+
+def test_profitability_thresholds_cannot_be_relaxed():
+    unsafe = (
+        ("minimum_net_return", -0.0001),
+        ("minimum_profit_factor", 1.1999),
+        ("maximum_drawdown", 0.030001),
+        ("minimum_bootstrap_expectancy", -0.0001),
+        ("maximum_2x_cost_loss", 0.005001),
+        ("minimum_positive_fold_ratio", 0.5999),
+        ("maximum_concentration_share", 0.5001),
+        ("minimum_trades", 29),
+        ("minimum_independent_return_clusters", 19),
+        ("bootstrap_samples", 1999),
+    )
+    for field, value in unsafe:
+        with pytest.raises(ValueError):
+            ProfitabilityThresholds(**{field: value})
 
 
 def test_profitability_gate_does_not_treat_correlated_trades_as_independent():
@@ -162,6 +185,47 @@ def test_failed_gate_has_zero_candidates_and_cannot_create_manifest(tmp_path):
             lockbox_fingerprint="a" * 64,
             code_commit="1234567",
         )
+
+
+def test_candidate_manifest_binds_every_final_evidence_report(tmp_path):
+    gate = evaluate_profitability_gate(
+        _profitable_trades(),
+        [{"net_return": value} for value in (0.01, 0.02, -0.001, 0.015, 0.005)],
+        initial_equity_usdt=100_000,
+        two_x_cost_net_return=0.01,
+        mark_to_market_max_drawdown=0.02,
+        mark_to_market_evidence_complete=True,
+    )
+    profitability = tmp_path / "profitability_report.json"
+    model = tmp_path / "model.json"
+    write_profitability_report(profitability, gate)
+    model.write_text("{}", encoding="utf-8")
+    evidence = {}
+    for name in REQUIRED_EVIDENCE_REPORTS:
+        path = tmp_path / name
+        path.write_text(f'{{"report":"{name}"}}', encoding="utf-8")
+        evidence[name] = path
+    manifest = tmp_path / "candidate_release_manifest.json"
+    create_candidate_manifest(
+        manifest,
+        gate=gate,
+        profitability_report_path=profitability,
+        model_artifact_path=model,
+        lockbox_fingerprint="d" * 64,
+        code_commit="1234567",
+        evidence_report_paths=evidence,
+    )
+    assert verify_candidate_authorization(profitability, manifest) == (
+        True,
+        "verified_profitability_candidate",
+    )
+
+    evidence["execution_cost_report.json"].write_text(
+        '{"tampered":true}', encoding="utf-8"
+    )
+    authorized, reason = verify_candidate_authorization(profitability, manifest)
+    assert authorized is False
+    assert reason == "profitability_evidence_hash_mismatch:execution_cost_report.json"
 
 
 def test_profitability_gate_rejects_realized_only_or_excess_mtm_drawdown():

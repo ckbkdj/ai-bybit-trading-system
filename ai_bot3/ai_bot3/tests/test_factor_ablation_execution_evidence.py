@@ -142,3 +142,17 @@ def test_candidate_execution_evidence_does_not_self_authorize_live():
     assert candidate["live_execution_evidence_complete"] is False
     assert candidate["live_blocker"]
     assert live["live_execution_evidence_complete"] is True
+
+
+def test_candidate_execution_evidence_rejects_any_proxy_cost_trade():
+    report = SimpleNamespace(
+        execution_cost_evidence_complete=False,
+        direct_execution_cost_trade_count=39,
+        proxy_execution_cost_trade_count=1,
+    )
+
+    evidence = _execution_release_evidence(report)
+
+    assert evidence["candidate_backtest_execution_evidence_complete"] is False
+    assert evidence["live_execution_evidence_complete"] is False
+    assert evidence["proxy_execution_cost_trade_count"] == 1

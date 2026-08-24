@@ -102,6 +102,19 @@ def _profitability_release(root: Path) -> tuple[Path, Path, dict]:
     report = root / "profitability_report.json"
     artifact = root / "two-stage-model.json"
     artifact.write_text('{"release_stage":"rejected"}', encoding="utf-8")
+    evidence_paths = {}
+    for name in (
+        "walk_forward_report.json",
+        "lockbox_report.json",
+        "factor_ablation_report.json",
+        "execution_cost_report.json",
+        "capital_preservation_report.json",
+    ):
+        evidence_path = root / name
+        evidence_path.write_text(
+            json.dumps({"fixture": name}, sort_keys=True), encoding="utf-8"
+        )
+        evidence_paths[name] = evidence_path
     write_profitability_report(report, gate)
     manifest_path = root / "candidate_release_manifest.json"
     manifest = create_candidate_manifest(
@@ -111,6 +124,7 @@ def _profitability_release(root: Path) -> tuple[Path, Path, dict]:
         model_artifact_path=artifact,
         lockbox_fingerprint="c" * 64,
         code_commit="1234567",
+        evidence_report_paths=evidence_paths,
     ).to_dict()
     return report, manifest_path, manifest
 

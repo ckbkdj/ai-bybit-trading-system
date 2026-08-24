@@ -10,6 +10,15 @@ from typing import Mapping, Sequence
 from core.evaluation.profitability_gate import ProfitabilityGateResult
 
 
+REQUIRED_EVIDENCE_REPORTS = (
+    "walk_forward_report.json",
+    "lockbox_report.json",
+    "factor_ablation_report.json",
+    "execution_cost_report.json",
+    "capital_preservation_report.json",
+)
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -26,6 +35,7 @@ class ProfitabilityReleaseManifest:
     model_family: str
     model_artifact_sha256: str
     profitability_report_sha256: str
+    evidence_report_sha256: Mapping[str, str]
     lockbox_fingerprint: str
     code_commit: str
     created_at: str
@@ -43,21 +53,36 @@ def create_candidate_manifest(
     model_artifact_path: Path,
     lockbox_fingerprint: str,
     code_commit: str,
+    evidence_report_paths: Mapping[str, Path] | None = None,
 ) -> ProfitabilityReleaseManifest:
     if not gate.passed or gate.stage != "candidate" or gate.candidate_count != 1:
         raise ValueError("candidate manifest is forbidden when profitability gate has not passed")
     report_hash = _sha256(profitability_report_path)
     model_hash = _sha256(model_artifact_path)
+    evidence_paths = dict(evidence_report_paths or {})
+    missing = [name for name in REQUIRED_EVIDENCE_REPORTS if name not in evidence_paths]
+    if missing:
+        raise ValueError(
+            "candidate manifest requires every evidence report: " + ", ".join(missing)
+        )
+    evidence_hashes = {
+        name: _sha256(Path(evidence_paths[name]))
+        for name in REQUIRED_EVIDENCE_REPORTS
+    }
     release_id = hashlib.sha256(
-        f"{report_hash}|{model_hash}|{lockbox_fingerprint}|{code_commit}".encode()
+        (
+            f"{report_hash}|{model_hash}|{lockbox_fingerprint}|{code_commit}|"
+            + json.dumps(evidence_hashes, sort_keys=True)
+        ).encode()
     ).hexdigest()[:32]
     manifest = ProfitabilityReleaseManifest(
-        schema_version="profitability-release.v1",
+        schema_version="profitability-release.v2",
         release_id=f"pr_{release_id}",
         stage="candidate",
         model_family="profitability_two_stage",
         model_artifact_sha256=model_hash,
         profitability_report_sha256=report_hash,
+        evidence_report_sha256=evidence_hashes,
         lockbox_fingerprint=lockbox_fingerprint,
         code_commit=code_commit,
         created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -89,15 +114,30 @@ def verify_candidate_authorization(
         return False, "profitability_candidate_counts_invalid"
     if manifest.get("stage") != "candidate" or manifest.get("model_family") != "profitability_two_stage":
         return False, "profitability_manifest_stage_invalid"
+    if manifest.get("schema_version") != "profitability-release.v2":
+        return False, "profitability_manifest_schema_invalid"
     if bool(manifest.get("live_allowed")):
         return False, "profitability_manifest_must_not_enable_live"
     if manifest.get("profitability_report_sha256") != _sha256(profitability_report_path):
         return False, "profitability_report_hash_mismatch"
+    evidence_hashes = manifest.get("evidence_report_sha256")
+    if not isinstance(evidence_hashes, Mapping) or any(
+        name not in evidence_hashes for name in REQUIRED_EVIDENCE_REPORTS
+    ):
+        return False, "profitability_evidence_hashes_missing"
+    evidence_root = Path(manifest_path).parent
+    for name in REQUIRED_EVIDENCE_REPORTS:
+        evidence_path = evidence_root / name
+        if not evidence_path.is_file():
+            return False, f"profitability_evidence_report_missing:{name}"
+        if str(evidence_hashes[name]) != _sha256(evidence_path):
+            return False, f"profitability_evidence_hash_mismatch:{name}"
     return True, "verified_profitability_candidate"
 
 
 __all__: Sequence[str] = (
     "ProfitabilityReleaseManifest",
+    "REQUIRED_EVIDENCE_REPORTS",
     "create_candidate_manifest",
     "verify_candidate_authorization",
 )

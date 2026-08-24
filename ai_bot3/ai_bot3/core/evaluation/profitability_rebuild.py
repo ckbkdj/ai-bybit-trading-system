@@ -2158,6 +2158,12 @@ class ProfitabilityRebuild:
 
         lockbox_report = backtest.run(lockbox_signals, market)
         stressed_report = backtest.run(lockbox_signals, market, cost_multiplier=2.0)
+        lockbox_execution_evidence = _execution_release_evidence(lockbox_report)
+        lockbox_candidate_execution_evidence_complete = bool(
+            lockbox_execution_evidence[
+                "candidate_backtest_execution_evidence_complete"
+            ]
+        )
         gate = evaluate_profitability_gate(
             lockbox_report.trades,
             walk_forward,
@@ -2165,7 +2171,9 @@ class ProfitabilityRebuild:
             two_x_cost_net_return=stressed_report.net_return,
             mark_to_market_max_drawdown=lockbox_report.max_drawdown,
             mark_to_market_evidence_complete=lockbox_report.mark_to_market_used,
-            execution_evidence_complete=candidate_execution_evidence_complete,
+            execution_evidence_complete=(
+                lockbox_candidate_execution_evidence_complete
+            ),
             factor_ablation_complete=bool(factor_report["all_required_groups_evaluated"]),
             thresholds=ProfitabilityThresholds(),
         )
@@ -2188,8 +2196,47 @@ class ProfitabilityRebuild:
                     str(horizon): evidence
                     for horizon, evidence in lockbox_bybit_evidence_by_horizon.items()
                 },
+                "execution_evidence": lockbox_execution_evidence,
                 "final_development_selection": final_selection,
                 "result": lockbox_report.to_dict(include_trades=True),
+            },
+        )
+        _atomic_json(
+            output / "execution_cost_report.json",
+            {
+                "evaluation_scope": "lockbox",
+                "execution_evidence_complete": (
+                    lockbox_candidate_execution_evidence_complete
+                ),
+                "candidate_backtest_execution_evidence_complete": (
+                    lockbox_candidate_execution_evidence_complete
+                ),
+                "live_execution_evidence_complete": bool(
+                    lockbox_execution_evidence[
+                        "live_execution_evidence_complete"
+                    ]
+                ),
+                "execution_evidence": lockbox_execution_evidence,
+                "development_execution_evidence": execution_evidence,
+                "normal_cost": lockbox_report.to_dict(include_trades=False),
+                "two_x_cost": stressed_report.to_dict(include_trades=False),
+                "limitations": [
+                    *(
+                        []
+                        if lockbox_report.proxy_execution_cost_trade_count == 0
+                        else [
+                            "one or more lockbox trades still use OHLCV-derived execution cost proxies"
+                        ]
+                    ),
+                    *(
+                        []
+                        if lockbox_bybit_evidence_by_horizon
+                        else ["no independently sealed lockbox Bybit execution source was supplied"]
+                    ),
+                    "official historical public data is not realized own-order fill evidence",
+                    "immutable OOS shadow/testnet receipts and queue/latency calibration are incomplete",
+                    "candidate evidence never authorizes live execution; live remains separately fail-closed",
+                ],
             },
         )
         _atomic_json(
@@ -2220,6 +2267,16 @@ class ProfitabilityRebuild:
                 model_artifact_path=bundle_path,
                 lockbox_fingerprint=lockbox_fingerprint,
                 code_commit=self.config.code_commit,
+                evidence_report_paths={
+                    name: output / name
+                    for name in (
+                        "walk_forward_report.json",
+                        "lockbox_report.json",
+                        "factor_ablation_report.json",
+                        "execution_cost_report.json",
+                        "capital_preservation_report.json",
+                    )
+                },
             )
         record = TrialRecord(
             trial_id=self.trial_id,
