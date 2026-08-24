@@ -1255,7 +1255,6 @@ class ProfitabilityRebuild:
         market: dict[str, Sequence[MarketBar]] = {}
         source_evidence: dict[str, object] = {}
         bybit_source: BybitPITFeatureSource | None = None
-        bybit_history_by_horizon: dict[int, pd.DataFrame] = {}
         bybit_evidence_by_horizon: dict[int, dict[str, object]] = {}
         bybit_names: tuple[str, ...] = ()
         bybit_pit_evidence: dict[str, object] | None = None
@@ -1273,22 +1272,18 @@ class ProfitabilityRebuild:
         for horizon in HORIZONS_SEC:
             timeframe = HORIZON_TIMEFRAME[horizon]
             panel_parts: list[pd.DataFrame] = []
-            horizon_history: dict[str, tuple[pd.DataFrame, Sequence[MarketBar]]] = {}
             decision_times: list[pd.Series] = []
             for symbol in SYMBOLS:
                 frame = self.source.load(symbol, timeframe, self.config.max_bars_per_symbol)
                 coverage = validate_source_coverage(frame, timeframe)
-                enriched = _engineer_features(frame)
-                bars = _market_bars(enriched)
-                market[f"{symbol}:{horizon}"] = bars
-                horizon_history[symbol] = (enriched, bars)
-                decision_times.append(enriched["close_at"])
+                decision_times.append(frame["close_at"].copy())
                 source_evidence[f"{symbol}:{horizon}"] = {
                     "timeframe": timeframe,
                     "decision_sampling": "non_overlapping_max_execution_windows",
                     "paired_side_alternatives": True,
                     **coverage,
                 }
+                del frame
             unique_times = (
                 pd.concat(decision_times, ignore_index=True)
                 .drop_duplicates()
@@ -1306,25 +1301,15 @@ class ProfitabilityRebuild:
             )
             lockbox_start = pd.Timestamp(unique_times.iloc[boundary_position]).to_pydatetime()
             lockbox_start_by_horizon[horizon] = lockbox_start
+            decision_minimum = pd.Timestamp(unique_times.iloc[0]).to_pydatetime()
+            decision_times.clear()
             max_wait_sec = max(30, min(300, horizon // 2))
             development_decision_end = lockbox_start - timedelta(
                 seconds=horizon + max_wait_sec
             )
-            for symbol in SYMBOLS:
-                enriched, bars = horizon_history[symbol]
-                development_enriched = enriched[
-                    enriched["close_at"] < lockbox_start
-                ].reset_index(drop=True)
-                development_bars = [
-                    bar for bar in bars if bar.open_time < lockbox_start
-                ]
-                horizon_history[symbol] = (
-                    development_enriched,
-                    development_bars,
-                )
-                market[f"{symbol}:{horizon}"] = development_bars
+            bybit_history: pd.DataFrame | None = None
+            horizon_evidence: dict[str, object] | None = None
             if bybit_source is not None and horizon in {180, 900}:
-                decision_minimum = pd.Timestamp(unique_times.iloc[0]).to_pydatetime()
                 bybit_history, horizon_evidence = bybit_source.load(
                     bybit_names,
                     maximum_sequence=self.bybit_pit_snapshot_maximum_sequence,
@@ -1332,12 +1317,19 @@ class ProfitabilityRebuild:
                     maximum_decision_at=development_decision_end,
                     symbols=SYMBOLS,
                 )
-                bybit_history_by_horizon[horizon] = bybit_history
                 bybit_evidence_by_horizon[horizon] = horizon_evidence
                 if horizon == 180:
                     bybit_pit_evidence = horizon_evidence
-                for symbol in SYMBOLS:
-                    enriched, bars = horizon_history[symbol]
+            for symbol in SYMBOLS:
+                frame = self.source.load(
+                    symbol, timeframe, self.config.max_bars_per_symbol
+                )
+                enriched = _engineer_features(frame)
+                development_enriched = enriched[
+                    enriched["close_at"] <= lockbox_start
+                ].reset_index(drop=True)
+                development_bars = _market_bars(development_enriched)
+                if bybit_history is not None and horizon_evidence is not None:
                     symbol_history = (
                         bybit_history[
                             bybit_history["symbol"].astype(str).str.upper() == symbol
@@ -1345,29 +1337,37 @@ class ProfitabilityRebuild:
                         if not bybit_history.empty
                         else bybit_history.copy()
                     )
-                    bars, bar_evidence = enrich_market_bars_with_bybit_execution_pit(
-                        bars,
+                    development_bars, bar_evidence = enrich_market_bars_with_bybit_execution_pit(
+                        development_bars,
                         source=bybit_source,
                         history=symbol_history,
                         source_evidence=horizon_evidence,
                     )
-                    horizon_history[symbol] = (enriched, bars)
-                    market[f"{symbol}:{horizon}"] = bars
                     execution_bar_evidence[f"{symbol}:{horizon}"] = bar_evidence
-            for symbol in SYMBOLS:
-                enriched, bars = horizon_history[symbol]
+                    del symbol_history
+                market[f"{symbol}:{horizon}"] = development_bars
                 panel_parts.append(
                     pd.DataFrame(
                         _panel_rows(
-                            enriched,
+                            development_enriched,
                             horizon,
-                            bars,
+                            development_bars,
                             decision_before=development_decision_end,
                         )
                     )
                 )
+                del frame
+                del enriched
+                del development_enriched
+                del development_bars
             panels[horizon] = pd.concat(panel_parts, ignore_index=True)
             panel_parts.clear()
+            if bybit_history is not None:
+                assert bybit_source is not None
+                panels[horizon] = bybit_source.join(
+                    panels[horizon], names=bybit_names, history=bybit_history
+                )
+                bybit_history = None
             self.ledger.append_event(
                 self.trial_id,
                 "running",
@@ -1453,17 +1453,6 @@ class ProfitabilityRebuild:
                     panels[horizon], names=flow_names, history=flow_history
                 )
             source_evidence["coinmetrics_stablecoin_pit"] = flow_pit_evidence
-
-        if bybit_source is not None and bybit_history_by_horizon:
-            for horizon in (180, 900):
-                panels[horizon] = bybit_source.join(
-                    panels[horizon],
-                    names=bybit_names,
-                    history=bybit_history_by_horizon[horizon],
-                )
-            bybit_history_by_horizon.clear()
-            del bybit_history
-            del symbol_history
 
         splitter = PooledPanelBuilder(
             lockbox_fraction=self.config.lockbox_fraction,
