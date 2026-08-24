@@ -192,8 +192,14 @@ def _execution_release_evidence(
     official_pit_cost_inputs_complete = bool(
         getattr(report, "execution_cost_evidence_complete", False)
     )
+    simulation_complete = bool(getattr(report, "simulation_complete", False))
+    risk_policy_compliant = bool(getattr(report, "risk_policy_compliant", False))
     receipts_complete = shadow_or_testnet_fill_receipt_count > 0
-    candidate_complete = official_pit_cost_inputs_complete
+    candidate_complete = bool(
+        official_pit_cost_inputs_complete
+        and simulation_complete
+        and risk_policy_compliant
+    )
     live_complete = bool(
         candidate_complete
         and receipts_complete
@@ -201,6 +207,14 @@ def _execution_release_evidence(
     )
     return {
         "official_pit_cost_inputs_complete": official_pit_cost_inputs_complete,
+        "simulation_complete": simulation_complete,
+        "unresolved_position_count": int(
+            getattr(report, "unresolved_position_count", 0)
+        ),
+        "risk_policy_compliant": risk_policy_compliant,
+        "risk_budget_breach_count": int(
+            getattr(report, "risk_budget_breach_count", 0)
+        ),
         "direct_execution_cost_trade_count": int(
             getattr(report, "direct_execution_cost_trade_count", 0)
         ),
@@ -222,6 +236,15 @@ def _execution_release_evidence(
         "candidate_scope": (
             "may open a sealed lockbox and produce candidate/shadow evidence only"
         ),
+        "candidate_blockers": [
+            name
+            for name, passed in (
+                ("official_pit_cost_inputs_incomplete", official_pit_cost_inputs_complete),
+                ("execution_simulation_incomplete", simulation_complete),
+                ("capital_risk_budget_breached", risk_policy_compliant),
+            )
+            if not passed
+        ],
         "live_blocker": (
             None
             if live_complete
@@ -706,6 +729,12 @@ def _ablation_fold_metrics(report: object, signal_count: int) -> dict[str, objec
         "unresolved_position_count": int(
             getattr(report, "unresolved_position_count", 0)
         ),
+        "risk_policy_compliant": bool(
+            getattr(report, "risk_policy_compliant", False)
+        ),
+        "risk_budget_breach_count": int(
+            getattr(report, "risk_budget_breach_count", 0)
+        ),
     }
 
 
@@ -739,6 +768,11 @@ def _ablation_execution_evidence(
             "unresolved_position_count": sum(
                 int(fold.get("unresolved_position_count", 0)) for fold in folds
             ),
+            "risk_policy_compliant": bool(folds)
+            and all(bool(fold.get("risk_policy_compliant", False)) for fold in folds),
+            "risk_budget_breach_count": sum(
+                int(fold.get("risk_budget_breach_count", 0)) for fold in folds
+            ),
         }
 
     baseline = summarize(baseline_folds)
@@ -760,6 +794,11 @@ def _ablation_execution_evidence(
         and int(summary["unresolved_position_count"]) == 0
         for summary in (baseline, augmented)
     )
+    risk_policy_compliant = all(
+        bool(summary["risk_policy_compliant"])
+        and int(summary["risk_budget_breach_count"]) == 0
+        for summary in (baseline, augmented)
+    )
     blockers = []
     if not trade_sample_complete:
         blockers.append("insufficient_oos_trades")
@@ -767,6 +806,8 @@ def _ablation_execution_evidence(
         blockers.append("incomplete_direct_execution_cost_evidence")
     if not simulation_complete:
         blockers.append("incomplete_execution_simulation")
+    if not risk_policy_compliant:
+        blockers.append("capital_risk_budget_breached")
     return {
         "passed": not blockers,
         "minimum_oos_trades_per_arm": MINIMUM_ABLATION_OOS_TRADES,
@@ -774,6 +815,7 @@ def _ablation_execution_evidence(
         "trade_sample_complete": trade_sample_complete,
         "direct_execution_cost_evidence_complete": direct_cost_evidence_complete,
         "simulation_complete": simulation_complete,
+        "risk_policy_compliant": risk_policy_compliant,
         "blockers": blockers,
         "baseline": baseline,
         "augmented": augmented,

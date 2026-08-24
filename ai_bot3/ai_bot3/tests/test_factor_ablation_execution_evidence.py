@@ -70,6 +70,8 @@ def test_ablation_requires_real_trades_across_multiple_oos_folds_in_both_arms():
                 "execution_cost_evidence_complete": True,
                 "simulation_complete": True,
                 "unresolved_position_count": 0,
+                "risk_policy_compliant": True,
+                "risk_budget_breach_count": 0,
             },
             {
                 "net_return": 0.01,
@@ -80,6 +82,8 @@ def test_ablation_requires_real_trades_across_multiple_oos_folds_in_both_arms():
                 "execution_cost_evidence_complete": True,
                 "simulation_complete": True,
                 "unresolved_position_count": 0,
+                "risk_policy_compliant": True,
+                "risk_budget_breach_count": 0,
             },
         ],
         [
@@ -92,6 +96,8 @@ def test_ablation_requires_real_trades_across_multiple_oos_folds_in_both_arms():
                 "execution_cost_evidence_complete": True,
                 "simulation_complete": True,
                 "unresolved_position_count": 0,
+                "risk_policy_compliant": True,
+                "risk_budget_breach_count": 0,
             },
             {
                 "net_return": 0.01,
@@ -102,6 +108,8 @@ def test_ablation_requires_real_trades_across_multiple_oos_folds_in_both_arms():
                 "execution_cost_evidence_complete": True,
                 "simulation_complete": True,
                 "unresolved_position_count": 0,
+                "risk_policy_compliant": True,
+                "risk_budget_breach_count": 0,
             },
         ],
     )
@@ -120,6 +128,8 @@ def test_ablation_with_enough_proxy_trades_is_not_formal_evidence():
         "execution_cost_evidence_complete": True,
         "simulation_complete": True,
         "unresolved_position_count": 0,
+        "risk_policy_compliant": True,
+        "risk_budget_breach_count": 0,
     }
     proxy = {
         **direct,
@@ -200,6 +210,10 @@ def test_candidate_execution_evidence_does_not_self_authorize_live():
         execution_cost_evidence_complete=True,
         direct_execution_cost_trade_count=40,
         proxy_execution_cost_trade_count=0,
+        simulation_complete=True,
+        unresolved_position_count=0,
+        risk_policy_compliant=True,
+        risk_budget_breach_count=0,
     )
 
     candidate = _execution_release_evidence(report)
@@ -220,6 +234,10 @@ def test_candidate_execution_evidence_rejects_any_proxy_cost_trade():
         execution_cost_evidence_complete=False,
         direct_execution_cost_trade_count=39,
         proxy_execution_cost_trade_count=1,
+        simulation_complete=True,
+        unresolved_position_count=0,
+        risk_policy_compliant=True,
+        risk_budget_breach_count=0,
     )
 
     evidence = _execution_release_evidence(report)
@@ -227,3 +245,21 @@ def test_candidate_execution_evidence_rejects_any_proxy_cost_trade():
     assert evidence["candidate_backtest_execution_evidence_complete"] is False
     assert evidence["live_execution_evidence_complete"] is False
     assert evidence["proxy_execution_cost_trade_count"] == 1
+
+
+def test_candidate_execution_evidence_rejects_capital_risk_breach():
+    report = SimpleNamespace(
+        execution_cost_evidence_complete=True,
+        direct_execution_cost_trade_count=40,
+        proxy_execution_cost_trade_count=0,
+        simulation_complete=True,
+        unresolved_position_count=0,
+        risk_policy_compliant=False,
+        risk_budget_breach_count=1,
+    )
+
+    evidence = _execution_release_evidence(report)
+
+    assert evidence["candidate_backtest_execution_evidence_complete"] is False
+    assert evidence["risk_policy_compliant"] is False
+    assert "capital_risk_budget_breached" in evidence["candidate_blockers"]

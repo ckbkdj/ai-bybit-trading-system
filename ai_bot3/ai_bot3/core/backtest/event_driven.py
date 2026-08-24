@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from dataclasses import asdict, dataclass
@@ -45,6 +46,7 @@ class BacktestConfig:
     equity_drawdown_limit: float = 0.03
     leverage_cap: float = 2.0
     max_gross_exposure: float = 1.0
+    funding_risk_buffer_bps_per_8h: float = 10.0
     no_averaging_down: bool = True
     no_martingale: bool = True
     require_stop: bool = True
@@ -65,6 +67,8 @@ class BacktestConfig:
             raise ValueError("leverage cannot exceed 2x")
         if not 0 < self.max_gross_exposure <= self.leverage_cap:
             raise ValueError("gross exposure must fit inside the leverage cap")
+        if self.funding_risk_buffer_bps_per_8h < 10.0:
+            raise ValueError("funding risk buffer cannot be below 10 bps per 8h")
 
 
 @dataclass(frozen=True)
@@ -96,6 +100,8 @@ class TradeRecord:
     entry_fill_price: float
     exit_fill_price: float
     filled_quantity: float
+    risk_budget_usdt: float
+    pretrade_risk_loss_bps: float
     market_key: str
     execution_cost_evidence_complete: bool
     entry_spread_source: str
@@ -148,6 +154,9 @@ class EventDrivenReport:
     proxy_execution_cost_trade_count: int
     simulation_complete: bool
     unresolved_position_count: int
+    risk_policy_compliant: bool
+    risk_budget_breach_count: int
+    maximum_realized_loss_to_risk_budget: float
     intrabar_path_used: bool = True
     mark_to_market_used: bool = True
     equity_curve: tuple[EquityPoint, ...] = ()
@@ -168,6 +177,37 @@ def _drawdown(curve: Sequence[float]) -> float:
         if peak > 0:
             maximum = max(maximum, (peak - value) / peak)
     return maximum
+
+
+def _pretrade_risk_loss_bps(
+    signal: SignalEvent,
+    execution: TripleBarrierConfig,
+    config: BacktestConfig,
+) -> float:
+    """Conservative, decision-time loss budget without future bar information."""
+
+    entry_fee = execution.maker_fee_bps if signal.maker_entry else execution.taker_fee_bps
+    exit_fee = execution.maker_fee_bps if signal.maker_exit else execution.taker_fee_bps
+    # Impact is capped at 3x full-depth impact by the execution model. Use that
+    # cap here because actual future depth/spread must not influence sizing.
+    adverse_slippage_per_leg = (
+        execution.base_slippage_bps
+        + execution.default_spread_bps / 2.0
+        + execution.impact_bps_at_full_depth * 3.0
+    ) * execution.slippage_stress_multiplier
+    funding_intervals = max(1, math.ceil(signal.max_holding_sec / (8 * 60 * 60)))
+    funding_buffer = (
+        funding_intervals
+        * config.funding_risk_buffer_bps_per_8h
+        * execution.funding_stress_multiplier
+    )
+    return (
+        signal.stop_loss_bps
+        + entry_fee
+        + exit_fee
+        + 2.0 * adverse_slippage_per_leg
+        + funding_buffer
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -477,7 +517,13 @@ class EventDrivenBacktest:
             if current_equity <= 0:
                 rejected["non_positive_equity"] += 1
                 continue
-            risk_notional = current_equity * cfg.risk_per_trade / max(signal.stop_loss_bps / 10_000.0, 1e-12)
+            risk_budget = current_equity * cfg.risk_per_trade
+            pretrade_risk_loss_bps = _pretrade_risk_loss_bps(
+                signal, self.execution, cfg
+            )
+            risk_notional = risk_budget / max(
+                pretrade_risk_loss_bps / 10_000.0, 1e-12
+            )
             leverage_notional = current_equity * cfg.leverage_cap
             portfolio_available = max(
                 0.0,
@@ -611,6 +657,8 @@ class EventDrivenBacktest:
                 entry_fill_price=float(label.entry_fill_price),
                 exit_fill_price=float(label.exit_fill_price),
                 filled_quantity=float(label.filled_quantity),
+                risk_budget_usdt=risk_budget,
+                pretrade_risk_loss_bps=pretrade_risk_loss_bps,
                 market_key=signal.market_key or signal.symbol.upper(),
                 execution_cost_evidence_complete=label.execution_cost_evidence_complete,
                 entry_spread_source=label.entry_spread_source,
@@ -631,6 +679,13 @@ class EventDrivenBacktest:
             _market_index=market_index,
         )
         mtm_values = [cfg.initial_equity_usdt] + [point.equity_usdt for point in equity_curve]
+        realized_loss_to_budget = [
+            max(0.0, -trade.net_pnl) / max(trade.risk_budget_usdt, 1e-12)
+            for trade in trades
+        ]
+        risk_budget_breach_count = sum(
+            ratio > 1.0 + 1e-12 for ratio in realized_loss_to_budget
+        )
 
         return EventDrivenReport(
             configuration={**asdict(cfg), "execution": asdict(execution), "cost_multiplier": cost_multiplier},
@@ -656,6 +711,11 @@ class EventDrivenBacktest:
             ),
             simulation_complete=unresolved_position_count == 0,
             unresolved_position_count=unresolved_position_count,
+            risk_policy_compliant=risk_budget_breach_count == 0,
+            risk_budget_breach_count=risk_budget_breach_count,
+            maximum_realized_loss_to_risk_budget=max(
+                realized_loss_to_budget, default=0.0
+            ),
             equity_curve=equity_curve,
             maximum_gross_exposure_usdt=max(
                 (point.gross_exposure_usdt for point in equity_curve), default=0.0

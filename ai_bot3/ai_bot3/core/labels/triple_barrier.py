@@ -337,9 +337,25 @@ def build_triple_barrier_label(
         )
         if stop_hit and target_hit:
             exit_reason = "STOP_LOSS" if cfg.stop_first_when_same_bar else "TAKE_PROFIT"
-            exit_reference = stop_loss if cfg.stop_first_when_same_bar else take_profit
+            if cfg.stop_first_when_same_bar and bar.open_time >= entry_fill_at and (
+                (direction > 0 and bar.open < stop_loss)
+                or (direction < 0 and bar.open > stop_loss)
+            ):
+                exit_reference = bar.open
+            else:
+                exit_reference = stop_loss if cfg.stop_first_when_same_bar else take_profit
         elif stop_hit:
-            exit_reason, exit_reference = "STOP_LOSS", stop_loss
+            exit_reason = "STOP_LOSS"
+            # A stop-market order cannot fill at the trigger when a later bar
+            # opens through it. The entry bar open may predate a mid-bar fill,
+            # so it is intentionally excluded from gap logic.
+            if bar.open_time >= entry_fill_at and (
+                (direction > 0 and bar.open < stop_loss)
+                or (direction < 0 and bar.open > stop_loss)
+            ):
+                exit_reference = bar.open
+            else:
+                exit_reference = stop_loss
         elif target_hit:
             exit_reason, exit_reference = "TAKE_PROFIT", take_profit
         if exit_reference is not None:

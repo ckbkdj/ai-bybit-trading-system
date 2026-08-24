@@ -173,6 +173,41 @@ def test_mid_bar_activation_never_credits_a_pre_fill_target():
     assert label.path_observations == 2
 
 
+def test_stop_market_uses_adverse_gap_open_not_ideal_trigger_price():
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    spec = EntrySpec(
+        symbol="BTCUSDT",
+        side="BUY",
+        signal_at=start,
+        reference_price=100.0,
+        quantity=1.0,
+        take_profit_bps=1_000.0,
+        stop_loss_bps=100.0,
+        max_holding_sec=180,
+    )
+    entry_bar = _bar(start, high=100.5, low=100.0, close=100.2)
+    gap_bar = MarketBar(
+        symbol="BTCUSDT",
+        open_time=start + timedelta(minutes=1),
+        close_time=start + timedelta(minutes=2),
+        available_at=start + timedelta(minutes=2),
+        open=95.0,
+        high=97.0,
+        low=94.0,
+        close=96.0,
+        volume=1_000.0,
+        spread_bps=4.0,
+        depth_usdt=50_000.0,
+        volatility_bps=20.0,
+    )
+
+    label = build_triple_barrier_label(spec, [entry_bar, gap_bar])
+
+    assert label.exit_reason == "STOP_LOSS"
+    assert label.exit_reference_price == 95.0
+    assert label.net_return is not None and label.net_return < -0.04
+
+
 @pytest.mark.parametrize(
     ("side", "expected_mae", "expected_mfe"),
     [("BUY", 0.50, 0.50), ("SELL", 0.50, 0.50)],

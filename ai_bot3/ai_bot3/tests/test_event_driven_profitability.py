@@ -22,13 +22,14 @@ def _bar(
     *,
     symbol: str = "BTCUSDT",
     observed_execution_costs: bool = False,
+    open_price: float = 100.0,
 ) -> MarketBar:
     return MarketBar(
         symbol=symbol,
         open_time=start,
         close_time=start + timedelta(minutes=1),
         available_at=start + timedelta(minutes=1),
-        open=100.0,
+        open=open_price,
         high=high,
         low=low,
         close=close,
@@ -154,10 +155,65 @@ def test_two_x_cost_stress_includes_observed_spread_slippage_and_funding():
 
     base_trade = baseline.trades[0]
     stressed_trade = stressed.trades[0]
-    assert stressed_trade.fee_cost == pytest.approx(base_trade.fee_cost * 2)
-    assert stressed_trade.funding_cost == pytest.approx(base_trade.funding_cost * 2)
-    assert stressed_trade.slippage_cost > base_trade.slippage_cost * 1.9
-    assert stressed_trade.net_pnl < base_trade.net_pnl
+    assert stressed_trade.fee_cost / stressed_trade.notional_usdt == pytest.approx(
+        base_trade.fee_cost / base_trade.notional_usdt * 2
+    )
+    assert stressed_trade.funding_cost / stressed_trade.notional_usdt == pytest.approx(
+        base_trade.funding_cost / base_trade.notional_usdt * 2
+    )
+    assert (
+        stressed_trade.slippage_cost / stressed_trade.notional_usdt
+        > base_trade.slippage_cost / base_trade.notional_usdt * 1.9
+    )
+    assert stressed_trade.net_return < base_trade.net_return
+    assert stressed_trade.notional_usdt == pytest.approx(base_trade.notional_usdt)
+
+
+def test_pretrade_sizing_includes_costs_and_gap_loss_breaches_risk_gate():
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    signal = SignalEvent(
+        signal_id="gap-risk-breach",
+        symbol="BTCUSDT",
+        side="BUY",
+        decision_at=start,
+        reference_price=100.0,
+        lower_bound_net_edge=0.001,
+        take_profit_bps=1_000,
+        stop_loss_bps=100,
+        max_holding_sec=180,
+    )
+    bars = [
+        _bar(
+            start,
+            100.5,
+            100.0,
+            100.2,
+            observed_execution_costs=True,
+        ),
+        _bar(
+            start + timedelta(minutes=1),
+            97.0,
+            94.0,
+            96.0,
+            observed_execution_costs=True,
+            open_price=95.0,
+        ),
+    ]
+
+    report = EventDrivenBacktest().run([signal], {"BTCUSDT": bars})
+
+    assert len(report.trades) == 1
+    trade = report.trades[0]
+    assert trade.pretrade_risk_loss_bps > signal.stop_loss_bps
+    stop_only_notional = (
+        report.initial_equity_usdt
+        * BacktestConfig().risk_per_trade
+        / (signal.stop_loss_bps / 10_000.0)
+    )
+    assert trade.notional_usdt < stop_only_notional
+    assert trade.net_pnl < -trade.risk_budget_usdt
+    assert report.risk_budget_breach_count == 1
+    assert report.risk_policy_compliant is False
 
 
 def test_event_driven_backtest_fails_closed_on_nonpositive_edge():
