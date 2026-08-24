@@ -373,41 +373,48 @@ def publish_release_gated_ticket(temp: Path, control_db: Path, now: datetime) ->
         code_commit="shadow-e2e-commit",
         evidence_report_paths=evidence_report_paths,
     ).to_dict()
-    alpha_prediction = {
-        "model_family": "profitability_two_stage",
-        "model_bundle_id": "profitability-two-stage-shadow-e2e",
-        "strategy_release_id": RELEASE_ID,
-        "release_id": manifest["release_id"],
-        "model_artifact_sha256": manifest["model_artifact_sha256"],
-        "lockbox_fingerprint": manifest["lockbox_fingerprint"],
-        "profitability_gate": "PASSED",
-        "release_stage": "candidate",
-        "decision": "TRADE",
-        "actionable": True,
-        "direction": "long",
-        "p_up": 0.8,
-        "p_flat": 0.1,
-        "p_down": 0.1,
-        "expected_net_return_bps": 70.0,
-        "expected_mae_bps": 50.0,
-        "expected_mfe_bps": 120.0,
-        "lower_bound_net_edge_bps": 40.0,
-        "feature_evidence": {
-            "price_path": {
-                "status": "verified",
-                "training_kline_source": "bybit",
-                "runtime_price_source": "bybit_linear_last_trade_kline",
-                "same_venue": True,
-            }
-        },
-        "return_quantiles_bps": {
-            "p10": 80.0,
-            "p25": 90.0,
-            "p50": 100.0,
-            "p75": 115.0,
-            "p90": 130.0,
-        },
-    }
+    def alpha_prediction_for(horizon_sec: int) -> dict:
+        return {
+            "model_family": "profitability_two_stage",
+            "model_bundle_id": "profitability-two-stage-shadow-e2e",
+            "strategy_release_id": RELEASE_ID,
+            "release_id": manifest["release_id"],
+            "model_artifact_sha256": manifest["model_artifact_sha256"],
+            "lockbox_fingerprint": manifest["lockbox_fingerprint"],
+            "profitability_gate": "PASSED",
+            "release_stage": "candidate",
+            "horizon_sec": horizon_sec,
+            "decision": "TRADE",
+            "actionable": True,
+            "direction": "long",
+            "p_up": 0.8,
+            "p_flat": 0.1,
+            "p_down": 0.1,
+            "expected_net_return_bps": 70.0,
+            "expected_mae_bps": 50.0,
+            "expected_mfe_bps": 120.0,
+            "lower_bound_net_edge_bps": 40.0,
+            "feature_evidence": {
+                "price_path": {
+                    "status": "verified",
+                    "training_kline_source": "bybit",
+                    "runtime_price_source": "bybit_linear_last_trade_kline",
+                    "same_venue": True,
+                    "continuous": True,
+                    "ohlcv_contract_valid": True,
+                    "observed_bar_count": 100,
+                    "interval_sec": horizon_sec,
+                    "candidate_freshness_verified": True,
+                }
+            },
+            "return_quantiles_bps": {
+                "p10": 80.0,
+                "p25": 90.0,
+                "p50": 100.0,
+                "p75": 115.0,
+                "p90": 130.0,
+            },
+        }
     manager = ResultManager(
         temp / "results",
         control_plane_db=control_db,
@@ -428,7 +435,7 @@ def publish_release_gated_ticket(temp: Path, control_db: Path, now: datetime) ->
                 now,
                 mode="scalping",
                 expected_return=0.010,
-                alpha_prediction=alpha_prediction,
+                alpha_prediction=alpha_prediction_for(180),
             ),
         )
     )
@@ -447,7 +454,7 @@ def publish_release_gated_ticket(temp: Path, control_db: Path, now: datetime) ->
                 now,
                 mode="mid_short",
                 expected_return=0.009,
-                alpha_prediction=alpha_prediction,
+                alpha_prediction=alpha_prediction_for(900),
             ),
         )
     )
