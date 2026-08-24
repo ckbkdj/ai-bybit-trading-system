@@ -357,6 +357,44 @@ class CoinSharesFundFlowPITStore:
                         row["response_id"],
                     ),
                 )
+                current_invalidated = connection.execute(
+                    """SELECT 1 FROM flow_pit_observation_invalidations
+                         WHERE observation_id=?""",
+                    (row["observation_id"],),
+                ).fetchone()
+                if current_invalidated:
+                    raise ValueError(
+                        "current CoinShares parser observation was previously "
+                        "invalidated; bump PARSER_VERSION before replacing it"
+                    )
+                superseded = connection.execute(
+                    """SELECT o.observation_id
+                         FROM flow_pit_observations o
+                         LEFT JOIN flow_pit_observation_invalidations i
+                           ON i.observation_id=o.observation_id
+                        WHERE o.name=? AND o.available_at=?
+                          AND o.observation_id<>? AND i.observation_id IS NULL""",
+                    (
+                        row["name"],
+                        _iso(row["available_at"]),
+                        row["observation_id"],
+                    ),
+                ).fetchall()
+                for superseded_row in superseded:
+                    connection.execute(
+                        """INSERT OR IGNORE INTO flow_pit_observation_invalidations(
+                               observation_id,invalidated_at,reason,parser_version
+                           ) VALUES (?,?,?,?)""",
+                        (
+                            superseded_row["observation_id"],
+                            _iso(datetime.now(timezone.utc)),
+                            (
+                                f"SUPERSEDED_BY:{row['observation_id']}:"
+                                f"{PARSER_VERSION}"
+                            ),
+                            PARSER_VERSION,
+                        ),
+                    )
             for published, reason in invalidations:
                 rows = connection.execute(
                     """SELECT observation_id FROM flow_pit_observations
@@ -503,7 +541,21 @@ def backfill_coinshares_fund_flow_pit(
         )
         if feature is not None:
             features.append(feature)
-    features.sort(key=lambda item: (item["available_at"], item["observation_id"]))
+    # Multiple URLs can represent the same weekly release. Keep one deterministic
+    # current-parser observation per publication timestamp so a repeated backfill
+    # cannot invalidate its own equivalent output.
+    canonical_features: dict[tuple[str, datetime], dict[str, object]] = {}
+    for item in features:
+        key = (str(item["name"]), item["available_at"])
+        current = canonical_features.get(key)
+        if current is None or str(item["observation_id"]) < str(
+            current["observation_id"]
+        ):
+            canonical_features[key] = item
+    features = sorted(
+        canonical_features.values(),
+        key=lambda item: (item["available_at"], item["observation_id"]),
+    )
     if len(features) < 52:
         raise RuntimeError("fewer than 52 CoinShares weekly publications were parsed")
     parsed_dates = sorted(

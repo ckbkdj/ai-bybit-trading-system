@@ -163,6 +163,46 @@ def test_coinshares_unparsable_article_is_explicitly_excluded(tmp_path: Path):
     assert "no parsable global weekly flow" in report["exclusions"][0]["reason"]
 
 
+def test_equivalent_duplicate_publication_urls_are_canonical_and_idempotent(
+    tmp_path: Path,
+):
+    duplicate_url = (
+        "https://coinshares.test/insights/research-data/fund-flows-1000/"
+    )
+
+    def requester(url: str, timeout_sec: float) -> HTTPPayload:
+        if url == SITEMAP_URL:
+            body = _sitemap().replace(
+                b"</urlset>",
+                f"<url><loc>{duplicate_url}</loc></url></urlset>".encode(),
+            )
+        else:
+            index = int(url.rstrip("/").rsplit("-", 1)[-1])
+            body = _article(0 if index == 1000 else index)
+        return HTTPPayload(
+            body=body,
+            requested_at=FETCHED - timedelta(seconds=1),
+            received_at=FETCHED,
+            http_status=200,
+        )
+
+    database = tmp_path / "flows.sqlite3"
+    store = CoinSharesFundFlowPITStore(database)
+    for _ in range(2):
+        report = backfill_coinshares_fund_flow_pit(
+            store,
+            cache_dir=tmp_path / "raw",
+            publication_start=START,
+            publication_end=START + timedelta(days=59 * 7),
+            workers=2,
+            requester=requester,
+        )
+        assert report["article_response_count"] == 61
+        assert report["feature_observation_count"] == 60
+    history, _ = FlowPITFeatureSource(database).load([FEATURE_NAME])
+    assert len(history) == 60
+
+
 def test_flow_source_rejects_conflicting_active_parser_outputs(tmp_path: Path):
     database = tmp_path / "flows.sqlite3"
     store = CoinSharesFundFlowPITStore(database)
@@ -205,19 +245,14 @@ def test_flow_source_rejects_conflicting_active_parser_outputs(tmp_path: Path):
         source.load([FEATURE_NAME])
     frozen_sequence, frozen_invalidation_rowid = source.snapshot_watermarks()
 
-    with store.connect() as connection:
-        connection.execute(
-            """INSERT INTO flow_pit_observation_invalidations(
-                   observation_id,invalidated_at,reason,parser_version
-               ) VALUES (?,?,?,?)""",
-            (
-                conflicting_id,
-                FETCHED.isoformat(),
-                "test parser output superseded after manual review",
-                "test",
-            ),
-        )
-        connection.commit()
+    backfill_coinshares_fund_flow_pit(
+        store,
+        cache_dir=tmp_path / "raw",
+        publication_start=START,
+        publication_end=START + timedelta(days=59 * 7),
+        workers=2,
+        requester=_requester,
+    )
     with pytest.raises(RuntimeError, match="ambiguous active releases"):
         source.load(
             [FEATURE_NAME],
@@ -228,6 +263,28 @@ def test_flow_source_rejects_conflicting_active_parser_outputs(tmp_path: Path):
     assert len(history) == 60
     assert evidence["equivalent_duplicate_count"] == 0
     assert evidence["snapshot_maximum_invalidation_rowid"] > frozen_invalidation_rowid
+    with store.connect() as connection:
+        correction = connection.execute(
+            """SELECT reason,parser_version
+                 FROM flow_pit_observation_invalidations
+                WHERE observation_id=?""",
+            (conflicting_id,),
+        ).fetchone()
+    assert correction["reason"].startswith("SUPERSEDED_BY:")
+    assert correction["parser_version"].startswith("coinshares-weekly-flow-parser.")
+
+    # Repeating the same parser backfill is idempotent: the canonical current
+    # observation remains active and is not allowed to invalidate itself.
+    backfill_coinshares_fund_flow_pit(
+        store,
+        cache_dir=tmp_path / "raw",
+        publication_start=START,
+        publication_end=START + timedelta(days=59 * 7),
+        workers=2,
+        requester=_requester,
+    )
+    repeated, _ = source.load([FEATURE_NAME])
+    assert len(repeated) == 60
 
 
 def test_coinshares_parser_separates_headline_cumulative_and_nearest_direction():
