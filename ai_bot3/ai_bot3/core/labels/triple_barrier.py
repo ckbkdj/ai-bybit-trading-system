@@ -368,7 +368,11 @@ def build_triple_barrier_label(
         exit_bar = path[-1]
         exit_reference = exit_bar.close
         exit_reason = "MAX_HOLDING"
-        exit_at = expiry
+        # The exact expiry can fall inside the next OHLC bar (for example
+        # after a 250 ms entry latency).  The last completed close is a real
+        # observable price; pairing it with the later expiry timestamp would
+        # invent an execution at a time for which no price was observed.
+        exit_at = exit_bar.close_time
     if exit_bar is None or exit_reference is None or exit_at is None:
         return _incomplete_filled_label(
             spec,

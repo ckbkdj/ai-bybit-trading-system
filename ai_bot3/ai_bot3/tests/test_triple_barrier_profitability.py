@@ -121,6 +121,43 @@ def test_triple_barrier_evaluates_every_observation_through_max_holding():
     assert label.exit_at == start + timedelta(minutes=5)
 
 
+def test_max_holding_exit_never_claims_an_unobserved_intrabar_timestamp():
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    latency_ms = 250
+    spec = EntrySpec(
+        symbol="BTCUSDT",
+        side="BUY",
+        signal_at=start,
+        reference_price=100.0,
+        quantity=1.0,
+        take_profit_bps=5_000.0,
+        stop_loss_bps=5_000.0,
+        max_holding_sec=180,
+    )
+    bars = [
+        _bar(
+            start + timedelta(minutes=index),
+            high=100.2,
+            low=99.8,
+            close=100.0 + index * 0.01,
+        )
+        for index in range(5)
+    ]
+
+    label = build_triple_barrier_label(
+        spec,
+        bars,
+        TripleBarrierConfig(latency_ms=latency_ms),
+    )
+
+    expiry = start + timedelta(milliseconds=latency_ms, seconds=180)
+    assert label.exit_reason == "MAX_HOLDING"
+    assert label.exit_at == start + timedelta(minutes=3)
+    assert label.exit_at < expiry
+    assert label.exit_reference_price == bars[2].close
+    assert label.label_available_at == bars[2].available_at
+
+
 def test_incomplete_holding_path_preserves_fill_and_never_invents_zero_return():
     start = datetime(2026, 1, 1, tzinfo=UTC)
     spec = EntrySpec(

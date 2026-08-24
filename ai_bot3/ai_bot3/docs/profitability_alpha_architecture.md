@@ -176,6 +176,7 @@ FOMC 采集不能用会议日历日期猜测 14:00，也不能把 minutes、impl
 10. Bybit 大库只读取 `[最早 development 决策 - 因子最大陈旧期, development 截止]` 且不超过 trial 冻结 sequence 的观测；新 lockbox 只有 development 通过后才建立独立时间窗快照。
 11. 正式 walk-forward、因子消融和 lockbox 只能使用 `execution_window_evidence_complete=true` 的 release 子集。该标志必须在读取 Triple Barrier 收益、MAE/MFE 或 exit reason 之前，仅根据从下单等待到最大持仓结束的完整窗口是否逐 bar 具备直接 spread、depth 和 settled funding 证据计算。价格路径覆盖只按连续 K 线 `close_time` 判断；funding 的较晚 `available_at` 只能推迟标签可用时间，不能伪造更长的价格路径。某周期 direct 样本不足时，该周期只能保存为 rejected shadow，不能用历史代理成本补足。
 12. 因子消融按 horizon 独立判定。180 秒 fold 的正增益不能授权 900 秒使用，7200 秒结果也不能授权 14400/86400 秒使用。组级汇总均值仅供诊断；`horizon_results` 必须分别具备至少两个可交易 outer OOS folds 和完整直接成本证据。只有出现在该周期 `retained_horizons` 的因子才可装入该周期模型；任一适用周期缺证据时，组级 `formal_feature_set=false`，且总因子门禁失败。
+13. max-holding 到点若落在 OHLC bar 内，不允许用到点前的旧 close 冒充到点成交价。标签只能使用最后一个真实完成 close 并记录它的实际 `exit_at`；若没有可用完成 bar，则保持 `NO_EXIT_OBSERVATION`，不能发明零收益或虚假退出时间。
 
 ## 7. 事件回测和回撤
 
