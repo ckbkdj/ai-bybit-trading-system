@@ -255,6 +255,35 @@ python -c "import sqlite3; c=sqlite3.connect(r'data/bybit_public_pit.sqlite3', t
 
 ## 8. Development-only 盈利实验
 
+### 8.1 先构建独立版本的 K 线历史库
+
+正式实验的最低连续历史为：3m=180 天、15m=365 天、2h/4h=1095 天、1d=1825 天。旧实验正在读取的数据库禁止原地回填；先复制成新版本，再从 Binance 官方 USD-M 月度归档下载 ZIP 与 `.CHECKSUM`：
+
+```powershell
+python scripts/backfill_binance_kline_archive.py `
+  --source data/kline_feature_store.rebuilt.20260822.sqlite3 `
+  --output data/kline_feature_store.profitability-v2.sqlite3 `
+  --cache-dir data/raw/binance-kline-archive
+```
+
+每个月必须满足官方 URL、保留的原始 ZIP/Checksum、SHA-256、月内连续网格和 OHLC 不变量后，才在同一事务写入 `raw_kline` 与 completed manifest。脚本中断后可重跑，completed 月不会改写。不能以“币种较新”为理由手工降门槛；只有首个官方归档月已校验、紧邻前一月的 archive 与 checksum 都真实返回 HTTP 404 时，才生成不可修改的 `VERIFIED_SINCE_LISTING` 收据。研究预检会重新读取保留的 ZIP/Checksum 并计算 SHA-256，同时逐字段复核该收据；文件缺失、损坏或收据不一致时仍按固定历史门槛失败。
+
+回填结束后把实验命令的 feature store 显式切换为新版本：
+
+```powershell
+python scripts/run_profitability_rebuild.py `
+  --feature-store data/kline_feature_store.profitability-v2.sqlite3 `
+  --trad-panel-root D:\lh\trad_data_service_20260821\data_service `
+  --macro-pit-store data/macro_pit.sqlite3 `
+  --flow-pit-store data/flow_pit.sqlite3 `
+  --bybit-pit-store data/bybit_public_pit.prelockbox.sqlite3 `
+  --lockbox-bybit-pit-store data/bybit_public_pit.sqlite3 `
+  --max-bars-per-symbol 200000 `
+  --walk-forward-folds 3
+```
+
+新 lockbox 数据库参数只会在 development 全部门禁（包括 production replay）通过后被实例化和读取。
+
 在 development 阶段接入真实跨资产和 macro PIT；Bybit 历史未完整前可先省略 `--bybit-pit-store` 做中长周期研究，但短周期因子组会失败关闭：
 
 `--trad-panel-root` 不是“给一个 Parquet 就接受”。该根目录必须同时具有 canonical、baseline、最近 PASS 发布收据和匹配 canonical SHA 的质量审计；before/after 哈希不一致、允许标的历史价格改写、旧日期回填或基础价格审计问题都会直接终止实验。当前参考服务最近一次更新任务为 `BLOCKED`，所以实时 provider 保持 `degraded`；即使某个正式模型将来保留跨资产组，运行时也会返回 `NO_TRADE`，直到数据服务恢复健康更新。
@@ -297,14 +326,20 @@ runtime 会校验模型和 bundle 哈希、逐列 staleness、`available_at <= d
 
 按以下顺序审阅：
 
-1. `factor_ablation_report.json`：真实数据、完整组、足量 trades、fold 改善；
-2. `walk_forward_report.json`：outer OOS 是否从未参与调参；
-3. `execution_cost_report.json`：费率、滑点、partial fill、latency、MTM；
-4. `capital_preservation_report.json`：单笔、日/周损失、回撤、杠杆和止损；
-5. `profitability_report.json`：development/lockbox 门禁总结果；
-6. `lockbox_report.json`：未获授权时必须保持 sealed/unlabeled；
-7. `candidate_release_manifest.json`：只有全部门禁通过时才允许存在。
-8. `statistical_overfit_report.json`：逐 horizon 与组合的 DSR、CSCV/PBO、完整试验计数和 lockbox 不比较备选模型的证据。
+1. `data_coverage_report.json` 与 `missing_intervals_report.json`：25 个 symbol×horizon 的真实跨度、逐 bar 连续性和经校验的上市边界；
+2. `independent_timestamp_count_report.json`：BUY/SELL 配对和同时间多币种不重复计数；
+3. `nested_cv_report.json` 与 `walk_forward_report.json`：inner OOS 选参、purge/embargo 和 outer OOS 永不调参；
+4. `calibration_coverage_report.json`：development 与单次 lockbox 的 p10/p50/p90 实际覆盖；
+5. `factor_ablation_report.json`：真实数据、完整因子组、足量 trades、逐 fold 费用后改善；
+6. `signal_funnel_report.json`：候选决策、Meta、正下界、方向、signals、trades 与拒绝原因；
+7. `execution_cost_report.json` 与 `intratrade_drawdown_report.json`：费用、滑点、partial fill、latency、完整路径和逐时间点 MTM 回撤；
+8. `statistical_overfit_report.json`：逐 horizon 与组合的 DSR、CSCV/PBO、完整试验计数和 lockbox 不比较备选模型；
+9. `production_replay_report.json`：25 个开发 outer-OOS 样本重走正式生产推理，逐特征/预测对齐并绑定最终 bundle SHA；
+10. `capital_preservation_report.json`：单笔、日/周损失、回撤、杠杆和止损；
+11. `profitability_report.json`：development/lockbox 门禁总结果；
+12. `lockbox_report.json`：未获授权时必须保持 sealed/unlabeled；
+13. `trial_ledger.sqlite3`：成功和失败实验的 append-only 审计轨迹；
+14. `candidate_release_manifest.json`：只有以上证据全部通过时才允许存在；它只授权 candidate/shadow，永远不直接授权 live。
 
 失败时应明确看到：
 

@@ -95,6 +95,39 @@ def test_each_horizon_enforces_the_preregistered_history_floor():
         assert evidence["coverage_gate"] == "PASSED"
 
 
+def test_short_listed_symbol_requires_verified_official_archive_boundary():
+    frame = _frame(400, 86_400)
+    listing_start = frame.loc[0, "open_at"]
+    evidence = {
+        "status": "VERIFIED_SINCE_LISTING",
+        "listing_start_utc": listing_start.isoformat().replace("+00:00", "Z"),
+        "earliest_open_time_ms": int(listing_start.timestamp() * 1000),
+        "first_archive_url": (
+            "https://data.binance.vision/data/futures/um/monthly/klines/"
+            "1000PEPEUSDT/1d/1000PEPEUSDT-1d-2023-05.zip"
+        ),
+        "first_archive_checksum_verified": 1,
+        "prior_month_http_status": 404,
+        "raw_receipt_reverified": True,
+    }
+
+    audit = validate_source_coverage(
+        frame, "1d", listing_evidence=evidence
+    )
+
+    assert audit["coverage_gate"] == "PASSED"
+    assert audit["listing_exception_applied"] is True
+    assert audit["coverage_policy"] == "fixed_floor_or_verified_since_listing"
+
+    unverified = {**evidence, "prior_month_http_status": 200}
+    with pytest.raises(ValueError, match="below required"):
+        validate_source_coverage(frame, "1d", listing_evidence=unverified)
+
+    corrupted_receipt = {**evidence, "raw_receipt_reverified": False}
+    with pytest.raises(ValueError, match="below required"):
+        validate_source_coverage(frame, "1d", listing_evidence=corrupted_receipt)
+
+
 def test_nominal_history_span_cannot_hide_a_missing_kline():
     frame = _frame(181, 180).drop(index=100).reset_index(drop=True)
 

@@ -521,20 +521,94 @@ class KlinePanelSource:
         frame["close_at"] = pd.to_datetime(frame["close_time"], unit="ms", utc=True)
         return frame.reset_index(drop=True)
 
+    def listing_evidence(
+        self, symbol: str, timeframe: str
+    ) -> dict[str, object] | None:
+        uri = f"file:{self.path.resolve().as_posix()}?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True)) as connection:
+            exists = connection.execute(
+                """SELECT 1 FROM sqlite_master
+                     WHERE type='table' AND name='kline_listing_evidence'"""
+            ).fetchone()
+            if not exists:
+                return None
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                """SELECT evidence.*,
+                          batch.archive_path AS retained_archive_path,
+                          batch.checksum_path AS retained_checksum_path,
+                          batch.archive_url AS batch_archive_url,
+                          batch.archive_sha256 AS batch_archive_sha256,
+                          batch.checksum_sha256 AS batch_checksum_sha256,
+                          batch.checksum_verified AS batch_checksum_verified
+                     FROM kline_listing_evidence AS evidence
+                LEFT JOIN kline_archive_batches AS batch
+                       ON batch.symbol=evidence.symbol
+                      AND batch.timeframe=evidence.timeframe
+                      AND batch.source=evidence.source
+                      AND batch.year_month=evidence.first_archive_year_month
+                    WHERE evidence.symbol=? AND evidence.timeframe=?
+                      AND evidence.source='binance'
+                    ORDER BY evidence.verified_at DESC LIMIT 1""",
+                (symbol, timeframe),
+            ).fetchone()
+        if row is None:
+            return None
+        evidence = dict(row)
+        failures: list[str] = []
+        archive_path = Path(str(evidence.pop("retained_archive_path") or ""))
+        checksum_path = Path(str(evidence.pop("retained_checksum_path") or ""))
+        batch_archive_url = evidence.pop("batch_archive_url")
+        batch_archive_sha256 = evidence.pop("batch_archive_sha256")
+        batch_checksum_sha256 = evidence.pop("batch_checksum_sha256")
+        batch_checksum_verified = evidence.pop("batch_checksum_verified")
+        if batch_archive_url != evidence.get("first_archive_url"):
+            failures.append("archive_url_receipt_mismatch")
+        if batch_archive_sha256 != evidence.get("first_archive_sha256"):
+            failures.append("archive_sha256_receipt_mismatch")
+        if batch_checksum_verified not in {1, True}:
+            failures.append("batch_checksum_not_verified")
+        for label, path, expected_sha256 in (
+            ("archive", archive_path, batch_archive_sha256),
+            ("checksum", checksum_path, batch_checksum_sha256),
+        ):
+            if not path.is_file():
+                failures.append(f"retained_{label}_missing")
+                continue
+            try:
+                actual_sha256 = _sha256_file(path)
+            except OSError:
+                failures.append(f"retained_{label}_unreadable")
+                continue
+            if not expected_sha256 or actual_sha256 != expected_sha256:
+                failures.append(f"retained_{label}_sha256_mismatch")
+        evidence["raw_receipt_reverified"] = not failures
+        evidence["raw_receipt_reverification_failures"] = failures
+        return evidence
 
-def audit_source_coverage(frame: pd.DataFrame, timeframe: str) -> dict[str, object]:
+
+def audit_source_coverage(
+    frame: pd.DataFrame,
+    timeframe: str,
+    *,
+    listing_evidence: Mapping[str, object] | None = None,
+) -> dict[str, object]:
     """Describe the complete, actually observed kline grid without hiding failures."""
 
     if timeframe not in MINIMUM_COVERAGE_DAYS:
         raise ValueError(f"unsupported coverage timeframe: {timeframe}")
     expected_interval_sec = TIMEFRAME_INTERVAL_SEC[timeframe]
-    minimum = float(MINIMUM_COVERAGE_DAYS[timeframe])
+    fixed_minimum = float(MINIMUM_COVERAGE_DAYS[timeframe])
     base: dict[str, object] = {
         "bars": int(len(frame)),
         "start": None,
         "end": None,
         "coverage_days": 0.0,
-        "minimum_coverage_days": minimum,
+        "minimum_coverage_days": fixed_minimum,
+        "fixed_minimum_coverage_days": fixed_minimum,
+        "coverage_policy": "fixed_history_floor",
+        "listing_exception_applied": False,
+        "listing_evidence": dict(listing_evidence or {}),
         "coverage_gate": "FAILED",
         "continuity_gate": "FAILED",
         "status": "FAILED",
@@ -581,6 +655,39 @@ def audit_source_coverage(frame: pd.DataFrame, timeframe: str) -> dict[str, obje
     base["end"] = pd.Timestamp(last).isoformat().replace("+00:00", "Z")
     coverage_days = float((last - first).total_seconds() / 86_400.0)
     base["coverage_days"] = coverage_days
+    effective_minimum = fixed_minimum
+    if listing_evidence:
+        listing_start = pd.to_datetime(
+            listing_evidence.get("listing_start_utc"), utc=True, errors="coerce"
+        )
+        earliest_open_time_ms = listing_evidence.get("earliest_open_time_ms")
+        official_archive = str(listing_evidence.get("first_archive_url") or "").startswith(
+            "https://data.binance.vision/data/futures/um/monthly/klines/"
+        )
+        listing_verified = bool(
+            listing_evidence.get("status") == "VERIFIED_SINCE_LISTING"
+            and int(listing_evidence.get("prior_month_http_status", 0)) == 404
+            and listing_evidence.get("first_archive_checksum_verified") in {1, True}
+            and listing_evidence.get("raw_receipt_reverified") is True
+            and official_archive
+            and not pd.isna(listing_start)
+            and earliest_open_time_ms is not None
+            and abs(
+                float(earliest_open_time_ms)
+                - pd.Timestamp(first).timestamp() * 1000.0
+            )
+            <= 1_000.0
+            and abs((pd.Timestamp(first) - listing_start).total_seconds()) <= 1.0
+        )
+        if listing_verified:
+            since_listing_days = max(
+                0.0,
+                float((last - listing_start).total_seconds() / 86_400.0),
+            )
+            effective_minimum = min(fixed_minimum, since_listing_days)
+            base["minimum_coverage_days"] = effective_minimum
+            base["coverage_policy"] = "fixed_floor_or_verified_since_listing"
+            base["listing_exception_applied"] = effective_minimum < fixed_minimum
     ordered = ordered.sort_values("open_at").reset_index(drop=True)
     durations = (
         ordered["close_at"] - ordered["open_at"]
@@ -626,10 +733,14 @@ def audit_source_coverage(frame: pd.DataFrame, timeframe: str) -> dict[str, obje
         failure_reasons.append("invalid_bar_durations")
     if int(base["discontinuity_count"]):
         failure_reasons.append("discontinuous_bar_grid")
-    if coverage_days < minimum:
+    if coverage_days < effective_minimum:
         failure_reasons.append("insufficient_history")
     base["failure_reasons"] = failure_reasons
-    base["coverage_gate"] = "PASSED" if coverage_days >= minimum else "FAILED"
+    base["coverage_gate"] = (
+        "PASSED"
+        if coverage_days >= effective_minimum
+        else "FAILED"
+    )
     base["continuity_gate"] = (
         "PASSED"
         if not any(
@@ -646,8 +757,15 @@ def audit_source_coverage(frame: pd.DataFrame, timeframe: str) -> dict[str, obje
     return base
 
 
-def validate_source_coverage(frame: pd.DataFrame, timeframe: str) -> dict[str, object]:
-    evidence = audit_source_coverage(frame, timeframe)
+def validate_source_coverage(
+    frame: pd.DataFrame,
+    timeframe: str,
+    *,
+    listing_evidence: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    evidence = audit_source_coverage(
+        frame, timeframe, listing_evidence=listing_evidence
+    )
     if evidence["failure_reasons"] == ["open_at_and_close_at_required"]:
         raise ValueError("source coverage requires open_at and close_at")
     if int(evidence["invalid_timestamp_count"]):
@@ -2961,7 +3079,13 @@ class ProfitabilityRebuild:
                     frame = self.source.load(
                         symbol, timeframe, self.config.max_bars_per_symbol
                     )
-                    audit = audit_source_coverage(frame, timeframe)
+                    audit = audit_source_coverage(
+                        frame,
+                        timeframe,
+                        listing_evidence=self.source.listing_evidence(
+                            symbol, timeframe
+                        ),
+                    )
                     decision_times.append(frame["close_at"].copy())
                 except Exception as exc:
                     audit = audit_source_coverage(
