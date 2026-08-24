@@ -146,6 +146,8 @@ class EventDrivenReport:
     execution_cost_evidence_complete: bool
     direct_execution_cost_trade_count: int
     proxy_execution_cost_trade_count: int
+    simulation_complete: bool
+    unresolved_position_count: int
     intrabar_path_used: bool = True
     mark_to_market_used: bool = True
     equity_curve: tuple[EquityPoint, ...] = ()
@@ -405,6 +407,8 @@ class EventDrivenBacktest:
         curve = [equity]
         trades: list[TradeRecord] = []
         pending: list[TradeRecord] = []
+        order_reservations: list[tuple[datetime, float]] = []
+        unresolved_position_count = 0
         active_until: dict[str, datetime] = {}
         rejected: dict[str, int] = defaultdict(int)
         gross_profit = 0.0
@@ -430,6 +434,9 @@ class EventDrivenBacktest:
         for signal in ordered:
             now = signal.decision_at.astimezone(timezone.utc)
             settle_until(now)
+            order_reservations = [
+                item for item in order_reservations if item[0] > now
+            ]
             if cfg.require_positive_lower_bound_edge and signal.lower_bound_net_edge <= 0:
                 rejected["non_positive_lower_bound_edge"] += 1
                 continue
@@ -474,7 +481,9 @@ class EventDrivenBacktest:
             leverage_notional = current_equity * cfg.leverage_cap
             portfolio_available = max(
                 0.0,
-                current_equity * cfg.max_gross_exposure - sum(trade.notional_usdt for trade in pending),
+                current_equity * cfg.max_gross_exposure
+                - sum(trade.notional_usdt for trade in pending)
+                - sum(value for _, value in order_reservations),
             )
             notional = min(risk_notional, leverage_notional, portfolio_available)
             if signal.requested_notional_usdt is not None:
@@ -520,16 +529,58 @@ class EventDrivenBacktest:
                 execution,
             )
             if label.entry_fill_at is None or label.exit_at is None:
+                incomplete_position = label.entry_fill_at is not None
+                if not incomplete_position:
+                    # The offline result cannot be used before the timeout/cancel
+                    # observation that established no fill. Reserve the order in
+                    # the same way the live system must while its outcome is open.
+                    reservation_until = label.label_available_at
+                    reserved_notional = notional
+                else:
+                    # A known fill without a complete exit path is an unresolved
+                    # position, never a zero-return non-trade.
+                    unresolved_position_count += 1
+                    reservation_until = label.entry_fill_at + timedelta(
+                        seconds=signal.max_holding_sec
+                    )
+                    reserved_notional = notional * label.fill_fraction
+                active_until[symbol] = max(
+                    active_until.get(
+                        symbol, datetime.min.replace(tzinfo=timezone.utc)
+                    ),
+                    reservation_until,
+                )
+                order_reservations.append(
+                    (reservation_until, reserved_notional)
+                )
                 rejected[label.exit_reason.lower()] += 1
+                if incomplete_position:
+                    # Equity and portfolio exposure are unknowable beyond this
+                    # point. Continuing would let later signals trade on an
+                    # invented balance even though the final gate would fail.
+                    break
                 continue
+            if any(
+                value is None
+                for value in (
+                    label.gross_return,
+                    label.net_return,
+                    label.fee_return,
+                    label.slippage_return,
+                    label.funding_return,
+                    label.entry_fill_price,
+                    label.exit_fill_price,
+                )
+            ):
+                raise RuntimeError("completed execution label has missing economics")
             filled_notional = notional * label.fill_fraction
-            gross_pnl = filled_notional * label.gross_return
-            net_pnl = filled_notional * label.net_return
-            fee_cost = filled_notional * label.fee_return
+            gross_pnl = filled_notional * float(label.gross_return)
+            net_pnl = filled_notional * float(label.net_return)
+            fee_cost = filled_notional * float(label.fee_return)
             entry_fee_bps = execution.maker_fee_bps if signal.maker_entry else execution.taker_fee_bps
             entry_fee_cost = filled_notional * entry_fee_bps / 10_000.0
-            slippage_cost = filled_notional * label.slippage_return
-            funding_cost = filled_notional * label.funding_return
+            slippage_cost = filled_notional * float(label.slippage_return)
+            funding_cost = filled_notional * float(label.funding_return)
             cancel_at = now.timestamp() + signal.max_wait_sec
             race = abs(label.entry_fill_at.timestamp() - cancel_at) <= max(1.0, execution.latency_ms / 1000.0)
             trade = TradeRecord(
@@ -544,8 +595,8 @@ class EventDrivenBacktest:
                 notional_usdt=filled_notional,
                 gross_pnl=gross_pnl,
                 net_pnl=net_pnl,
-                gross_return=label.gross_return,
-                net_return=label.net_return,
+                gross_return=float(label.gross_return),
+                net_return=float(label.net_return),
                 fee_cost=fee_cost,
                 entry_fee_cost=entry_fee_cost,
                 slippage_cost=slippage_cost,
@@ -595,6 +646,7 @@ class EventDrivenBacktest:
             total_funding_cost=sum(trade.funding_cost for trade in trades),
             cancel_fill_race_count=sum(trade.cancel_fill_race for trade in trades),
             execution_cost_evidence_complete=bool(trades)
+            and unresolved_position_count == 0
             and all(trade.execution_cost_evidence_complete for trade in trades),
             direct_execution_cost_trade_count=sum(
                 trade.execution_cost_evidence_complete for trade in trades
@@ -602,6 +654,8 @@ class EventDrivenBacktest:
             proxy_execution_cost_trade_count=sum(
                 not trade.execution_cost_evidence_complete for trade in trades
             ),
+            simulation_complete=unresolved_position_count == 0,
+            unresolved_position_count=unresolved_position_count,
             equity_curve=equity_curve,
             maximum_gross_exposure_usdt=max(
                 (point.gross_exposure_usdt for point in equity_curve), default=0.0

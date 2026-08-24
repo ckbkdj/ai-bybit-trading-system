@@ -153,17 +153,18 @@ class TripleBarrierLabel:
     fill_probability: float
     fill_fraction: float
     partial_fill: bool
-    gross_return: float
-    net_return: float
-    fee_return: float
-    slippage_return: float
-    funding_return: float
+    gross_return: float | None
+    net_return: float | None
+    fee_return: float | None
+    slippage_return: float | None
+    funding_return: float | None
     mae: float
     mfe: float
     exit_reason: ExitReason
     max_holding_sec: int
     path_observations: int
     pit_valid: bool
+    outcome_complete: bool
     execution_cost_evidence_complete: bool
     entry_spread_source: str
     entry_depth_source: str
@@ -353,7 +354,20 @@ def build_triple_barrier_label(
         exit_reason = "MAX_HOLDING"
         exit_at = expiry
     if exit_bar is None or exit_reference is None or exit_at is None:
-        return _empty_label(spec, ordered[-1].available_at, "NO_EXIT_OBSERVATION", probability=probability)
+        return _incomplete_filled_label(
+            spec,
+            entry_bar=entry_bar,
+            entry_fill_at=entry_fill_at,
+            entry_reference=float(entry_reference),
+            entry_fill=float(entry_fill),
+            filled_quantity=float(filled_quantity),
+            fill_probability=float(probability),
+            fill_fraction=float(fill_fraction),
+            path=path,
+            label_available_at=max(bar.available_at for bar in ordered),
+            mae=float(max(0.0, mae)),
+            mfe=float(max(0.0, mfe)),
+        )
 
     exit_slippage_bps = _slippage_bps(exit_bar, notional * fill_fraction, cfg)
     exit_fill = exit_reference * (1.0 - direction * exit_slippage_bps / 10_000.0)
@@ -414,6 +428,7 @@ def build_triple_barrier_label(
         max_holding_sec=spec.max_holding_sec,
         path_observations=len(path),
         pit_valid=True,
+        outcome_complete=True,
         execution_cost_evidence_complete=execution_cost_evidence_complete,
         entry_spread_source=entry_bar.spread_source,
         entry_depth_source=entry_bar.depth_source,
@@ -461,12 +476,75 @@ def _empty_label(
         max_holding_sec=spec.max_holding_sec,
         path_observations=0,
         pit_valid=True,
+        outcome_complete=True,
         execution_cost_evidence_complete=False,
         entry_spread_source="unfilled",
         entry_depth_source="unfilled",
         exit_spread_source="unfilled",
         exit_depth_source="unfilled",
         funding_source="unfilled",
+    )
+
+
+def _incomplete_filled_label(
+    spec: EntrySpec,
+    *,
+    entry_bar: MarketBar,
+    entry_fill_at: datetime,
+    entry_reference: float,
+    entry_fill: float,
+    filled_quantity: float,
+    fill_probability: float,
+    fill_fraction: float,
+    path: Sequence[MarketBar],
+    label_available_at: datetime,
+    mae: float,
+    mfe: float,
+) -> TripleBarrierLabel:
+    """Preserve a known fill without inventing a zero-return exit."""
+
+    funding_sources = sorted({bar.funding_source for bar in path})
+    label_id = hashlib.sha256(
+        f"{spec.symbol}|{spec.side}|{_utc(spec.signal_at).isoformat()}|"
+        f"{entry_fill_at.isoformat()}|NO_EXIT_OBSERVATION".encode()
+    ).hexdigest()[:32]
+    return TripleBarrierLabel(
+        label_id=label_id,
+        symbol=spec.symbol.upper(),
+        side=spec.side,
+        signal_at=_utc(spec.signal_at),
+        entry_fill_at=entry_fill_at,
+        exit_at=None,
+        label_available_at=_utc(label_available_at),
+        entry_reference_price=entry_reference,
+        entry_fill_price=entry_fill,
+        exit_reference_price=None,
+        exit_fill_price=None,
+        requested_quantity=float(spec.quantity),
+        filled_quantity=filled_quantity,
+        fill_probability=fill_probability,
+        fill_fraction=fill_fraction,
+        partial_fill=fill_fraction < 1.0 - 1e-12,
+        gross_return=None,
+        net_return=None,
+        fee_return=None,
+        slippage_return=None,
+        funding_return=None,
+        mae=mae,
+        mfe=mfe,
+        exit_reason="NO_EXIT_OBSERVATION",
+        max_holding_sec=spec.max_holding_sec,
+        path_observations=len(path),
+        pit_valid=True,
+        outcome_complete=False,
+        execution_cost_evidence_complete=False,
+        entry_spread_source=entry_bar.spread_source,
+        entry_depth_source=entry_bar.depth_source,
+        exit_spread_source="unobserved",
+        exit_depth_source="unobserved",
+        funding_source=(
+            "+".join(funding_sources) if funding_sources else "unobserved"
+        ),
     )
 
 

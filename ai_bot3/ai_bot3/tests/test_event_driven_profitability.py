@@ -178,6 +178,101 @@ def test_event_driven_backtest_fails_closed_on_nonpositive_edge():
     assert report.rejected_signals["non_positive_lower_bound_edge"] == 1
 
 
+def test_unfilled_limit_reserves_symbol_until_timeout_is_observable():
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    first = SignalEvent(
+        signal_id="limit-waiting",
+        symbol="BTCUSDT",
+        side="BUY",
+        decision_at=start,
+        reference_price=100.0,
+        lower_bound_net_edge=0.001,
+        take_profit_bps=100,
+        stop_loss_bps=100,
+        max_holding_sec=60,
+        order_type="LIMIT",
+        limit_price=50.0,
+        max_wait_sec=120,
+    )
+    overlapping = SignalEvent(
+        **{
+            **first.__dict__,
+            "signal_id": "must-not-use-future-timeout",
+            "decision_at": start + timedelta(minutes=1),
+            "order_type": "MARKET",
+            "limit_price": None,
+        }
+    )
+    after_timeout = SignalEvent(
+        **{
+            **first.__dict__,
+            "signal_id": "allowed-after-timeout",
+            "decision_at": start + timedelta(minutes=2),
+            "order_type": "MARKET",
+            "limit_price": None,
+        }
+    )
+    bars = [
+        _bar(start + timedelta(minutes=index), 102.0, 99.0, 101.0)
+        for index in range(5)
+    ]
+
+    report = EventDrivenBacktest().run(
+        [first, overlapping, after_timeout], {"BTCUSDT": bars}
+    )
+
+    assert [trade.signal_id for trade in report.trades] == ["allowed-after-timeout"]
+    assert report.rejected_signals["entry_timeout"] == 1
+    assert report.rejected_signals["averaging_down_or_overlapping_position"] == 1
+
+
+def test_filled_position_without_exit_path_makes_simulation_incomplete():
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    signal = SignalEvent(
+        signal_id="filled-but-data-ended",
+        symbol="BTCUSDT",
+        side="BUY",
+        decision_at=start,
+        reference_price=100.0,
+        lower_bound_net_edge=0.001,
+        take_profit_bps=1_000,
+        stop_loss_bps=1_000,
+        max_holding_sec=300,
+    )
+    later_signal = SignalEvent(
+        **{
+            **signal.__dict__,
+            "signal_id": "must-not-trade-on-unknown-equity",
+            "symbol": "ETHUSDT",
+            "decision_at": start + timedelta(minutes=1),
+            "feature_available_at": (start + timedelta(minutes=1),),
+        }
+    )
+
+    report = EventDrivenBacktest().run(
+        [signal, later_signal],
+        {
+            "BTCUSDT": [_bar(start, 101.0, 99.0, 100.5)],
+            "ETHUSDT": [
+                _bar(
+                    start + timedelta(minutes=index),
+                    102.0,
+                    99.0,
+                    101.0,
+                    symbol="ETHUSDT",
+                )
+                for index in range(8)
+            ],
+        },
+    )
+
+    assert not report.trades
+    assert report.rejected_signals["no_exit_observation"] == 1
+    assert report.unresolved_position_count == 1
+    assert report.simulation_complete is False
+    assert report.execution_cost_evidence_complete is False
+
+
 def test_research_backtest_can_measure_negative_edge_without_changing_production_default():
     start = datetime(2026, 1, 1, tzinfo=timezone.utc)
     signal = SignalEvent(
