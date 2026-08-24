@@ -336,6 +336,7 @@ moving-block bootstrap 的 95% 下界不大于零，都不得通过。
 - 完整路径必须由连续 K 线 `close_time` 覆盖；较晚的 funding `available_at` 不得被当成价格路径结束时间；
 - `release_walk_forward_ready=true` 后，该周期才允许进入正式 walk-forward 和因子消融；
 - direct 样本不足必须显示 blocker 并保持 rejected，禁止回退到 OHLCV 代理成本凑交易数。
+- K 线 coverage 不只检查首尾天数。`continuity_gate` 必须逐 bar 验证周期时长、相邻 open 间隔和重复 open；名义跨度足够但中间缺 bar、周期错误或重复的数据必须在标签构建前终止 trial。
 
 blocker 只允许表示样本量、fold 或跨币种不足。PIT 违规、混周期、非法标签或 schema 损坏必须终止 trial 并登记 `pipeline_error`，不得伪装成普通的数据收集中状态。
 

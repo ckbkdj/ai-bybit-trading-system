@@ -30,23 +30,30 @@ from core.training.pooled_panel import PooledPanelBuilder
 from core.labels.triple_barrier import MarketBar
 
 
-def _frame(days: int) -> pd.DataFrame:
+def _frame(days: int, interval_sec: int) -> pd.DataFrame:
     start = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    periods = int(days * 86_400 / interval_sec) + 1
+    opens = pd.date_range(
+        start,
+        periods=periods,
+        freq=pd.Timedelta(seconds=interval_sec),
+    )
     return pd.DataFrame(
         {
-            "open_at": [start, start + timedelta(days=days)],
-            "close_at": [start + timedelta(minutes=3), start + timedelta(days=days, minutes=3)],
+            "open_at": opens,
+            "close_at": opens + pd.Timedelta(seconds=interval_sec),
         }
     )
 
 
 def test_short_horizon_coverage_cannot_silently_collapse_to_six_or_31_days(tmp_path):
     with pytest.raises(ValueError, match="coverage"):
-        validate_source_coverage(_frame(6), "3m")
+        validate_source_coverage(_frame(6, 180), "3m")
     with pytest.raises(ValueError, match="coverage"):
-        validate_source_coverage(_frame(31), "15m")
-    evidence = validate_source_coverage(_frame(181), "3m")
+        validate_source_coverage(_frame(31, 900), "15m")
+    evidence = validate_source_coverage(_frame(181, 180), "3m")
     assert evidence["coverage_days"] >= MINIMUM_COVERAGE_DAYS["3m"]
+    assert evidence["continuity_gate"] == "PASSED"
 
     config = ProfitabilityRebuildConfig(
         feature_store_path=tmp_path / "features.sqlite3",
@@ -56,6 +63,13 @@ def test_short_horizon_coverage_cannot_silently_collapse_to_six_or_31_days(tmp_p
         code_commit="1" * 40,
     )
     assert config.max_bars_per_symbol >= 175_200
+
+
+def test_nominal_history_span_cannot_hide_a_missing_kline():
+    frame = _frame(181, 180).drop(index=100).reset_index(drop=True)
+
+    with pytest.raises(ValueError, match="discontinuous"):
+        validate_source_coverage(frame, "3m")
 
 
 def test_long_horizons_load_real_execution_evidence_without_using_short_factors():

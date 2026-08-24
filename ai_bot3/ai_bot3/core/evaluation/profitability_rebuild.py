@@ -70,6 +70,9 @@ MINIMUM_COVERAGE_DAYS: Mapping[str, float] = {
     "4h": 730.0,
     "1d": 1095.0,
 }
+TIMEFRAME_INTERVAL_SEC: Mapping[str, int] = {
+    timeframe: horizon for horizon, timeframe in HORIZON_TIMEFRAME.items()
+}
 SHORT_FACTOR_GROUPS: Mapping[str, tuple[str, ...]] = {
     "bybit_orderbook": ("bybit_orderbook_delta_l5", "orderbook_spread_bps", "orderbook_depth_usdt_l5", "microprice_deviation_bps"),
     "public_trades": ("public_trade_imbalance_1m", "ofi_1m", "aggressive_cvd_1m"),
@@ -459,6 +462,27 @@ def validate_source_coverage(frame: pd.DataFrame, timeframe: str) -> dict[str, o
     last = pd.to_datetime(frame["close_at"], utc=True, errors="coerce").max()
     if pd.isna(first) or pd.isna(last) or last <= first:
         raise ValueError("source coverage timestamps are invalid")
+    expected_interval_sec = TIMEFRAME_INTERVAL_SEC[timeframe]
+    ordered = frame[["open_at", "close_at"]].copy()
+    ordered["open_at"] = pd.to_datetime(
+        ordered["open_at"], utc=True, errors="coerce"
+    )
+    ordered["close_at"] = pd.to_datetime(
+        ordered["close_at"], utc=True, errors="coerce"
+    )
+    if ordered.isna().any().any():
+        raise ValueError("source coverage timestamps are invalid")
+    ordered = ordered.sort_values("open_at").reset_index(drop=True)
+    if ordered["open_at"].duplicated().any():
+        raise ValueError("source coverage contains duplicate bar opens")
+    durations = (
+        ordered["close_at"] - ordered["open_at"]
+    ).dt.total_seconds()
+    if ((durations - expected_interval_sec).abs() > 1.0).any():
+        raise ValueError("source coverage contains invalid bar durations")
+    gaps = ordered["open_at"].diff().dt.total_seconds().iloc[1:]
+    if ((gaps - expected_interval_sec).abs() > 1.0).any():
+        raise ValueError("source coverage is discontinuous")
     coverage_days = float((last - first).total_seconds() / 86_400.0)
     minimum = float(MINIMUM_COVERAGE_DAYS[timeframe])
     if coverage_days < minimum:
@@ -472,6 +496,11 @@ def validate_source_coverage(frame: pd.DataFrame, timeframe: str) -> dict[str, o
         "coverage_days": coverage_days,
         "minimum_coverage_days": minimum,
         "coverage_gate": "PASSED",
+        "continuity_gate": "PASSED",
+        "expected_interval_sec": expected_interval_sec,
+        "maximum_open_gap_sec": float(gaps.max()) if len(gaps) else None,
+        "duplicate_open_count": 0,
+        "invalid_bar_duration_count": 0,
     }
 
 
