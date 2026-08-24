@@ -61,17 +61,88 @@ def test_zero_trade_ablation_is_not_accepted_as_evaluated_evidence():
 def test_ablation_requires_real_trades_across_multiple_oos_folds_in_both_arms():
     evidence = _ablation_execution_evidence(
         [
-            {"net_return": 0.01, "signal_count": 20, "trade_count": 15},
-            {"net_return": 0.01, "signal_count": 20, "trade_count": 15},
+            {
+                "net_return": 0.01,
+                "signal_count": 20,
+                "trade_count": 15,
+                "direct_execution_cost_trade_count": 15,
+                "proxy_execution_cost_trade_count": 0,
+                "execution_cost_evidence_complete": True,
+                "simulation_complete": True,
+                "unresolved_position_count": 0,
+            },
+            {
+                "net_return": 0.01,
+                "signal_count": 20,
+                "trade_count": 15,
+                "direct_execution_cost_trade_count": 15,
+                "proxy_execution_cost_trade_count": 0,
+                "execution_cost_evidence_complete": True,
+                "simulation_complete": True,
+                "unresolved_position_count": 0,
+            },
         ],
         [
-            {"net_return": 0.02, "signal_count": 22, "trade_count": 16},
-            {"net_return": 0.01, "signal_count": 20, "trade_count": 14},
+            {
+                "net_return": 0.02,
+                "signal_count": 22,
+                "trade_count": 16,
+                "direct_execution_cost_trade_count": 16,
+                "proxy_execution_cost_trade_count": 0,
+                "execution_cost_evidence_complete": True,
+                "simulation_complete": True,
+                "unresolved_position_count": 0,
+            },
+            {
+                "net_return": 0.01,
+                "signal_count": 20,
+                "trade_count": 14,
+                "direct_execution_cost_trade_count": 14,
+                "proxy_execution_cost_trade_count": 0,
+                "execution_cost_evidence_complete": True,
+                "simulation_complete": True,
+                "unresolved_position_count": 0,
+            },
         ],
     )
     assert evidence["passed"] is True
     assert evidence["baseline"]["traded_folds"] == 2
     assert evidence["augmented"]["traded_folds"] == 2
+
+
+def test_ablation_with_enough_proxy_trades_is_not_formal_evidence():
+    direct = {
+        "net_return": 0.01,
+        "signal_count": 40,
+        "trade_count": 30,
+        "direct_execution_cost_trade_count": 30,
+        "proxy_execution_cost_trade_count": 0,
+        "execution_cost_evidence_complete": True,
+        "simulation_complete": True,
+        "unresolved_position_count": 0,
+    }
+    proxy = {
+        **direct,
+        "direct_execution_cost_trade_count": 29,
+        "proxy_execution_cost_trade_count": 1,
+        "execution_cost_evidence_complete": False,
+    }
+
+    result = _failed_ablation_execution_result(
+        cadence="short",
+        group="bybit_orderbook",
+        factors=("ofi_1m",),
+        fold_evidence=({"status": "EVALUATED_OOS", "test_rows": 500},) * 2,
+        baseline_folds=(direct, direct),
+        augmented_folds=(proxy, proxy),
+    )
+
+    assert result is not None
+    assert result["oos_ablation_status"] == (
+        "FAILED_INCOMPLETE_EXECUTION_EVIDENCE"
+    )
+    assert result["formal_feature_set"] is False
+    assert result["execution_evidence"]["direct_execution_cost_evidence_complete"] is False
 
 
 def test_ablation_research_budget_measures_rankings_without_faking_deployable_edge():
