@@ -101,6 +101,7 @@ class TradeRecord:
     partial_fill: bool
     exit_reason: str
     cancel_fill_race: bool
+    entry_reference_price: float
     entry_fill_price: float
     exit_fill_price: float
     filled_quantity: float
@@ -305,8 +306,11 @@ def _mark_to_market_curve(
     initial_equity: float,
     *,
     until: datetime | None = None,
+    funding_stress_multiplier: float = 1.0,
     _market_index: Mapping[str, _MarketPathIndex] | None = None,
 ) -> tuple[EquityPoint, ...]:
+    if funding_stress_multiplier < 1.0:
+        raise ValueError("funding stress cannot make MTM costs more optimistic")
     if not trades:
         return ()
     market_index = dict(_market_index or _prepare_market_index(market_bars))
@@ -355,7 +359,10 @@ def _mark_to_market_curve(
                 continue
             active_positions += 1
             gross_exposure += trade.notional_usdt
-            mark = trade.entry_fill_price
+            # Mark the position against the PIT reference immediately after
+            # entry.  Using the fill price as both cost basis and market mark
+            # would hide entry spread/slippage until the first later bar.
+            mark = trade.entry_reference_price
             current_bar: MarketBar | None = None
             accrued_funding_bps = 0.0
             for bar in trade_bars[id(trade)]:
@@ -380,6 +387,9 @@ def _mark_to_market_curve(
             accrued_funding = (
                 trade.notional_usdt * direction * accrued_funding_bps / 10_000.0
             )
+            accrued_funding += (
+                funding_stress_multiplier - 1.0
+            ) * abs(accrued_funding)
             # Fill-to-mark PnL already embeds entry slippage.  Only the entry
             # fee is a separate cash debit while the position remains open.
             unrealized += gross_open_pnl - trade.entry_fee_cost - accrued_funding
@@ -522,6 +532,7 @@ class EventDrivenBacktest:
                 market_bars,
                 cfg.initial_equity_usdt,
                 until=now,
+                funding_stress_multiplier=execution.funding_stress_multiplier,
                 _market_index=market_index,
             )
             current_equity = state_curve[-1].equity_usdt if state_curve else equity
@@ -684,6 +695,7 @@ class EventDrivenBacktest:
                 partial_fill=label.partial_fill,
                 exit_reason=label.exit_reason,
                 cancel_fill_race=race,
+                entry_reference_price=float(label.entry_reference_price),
                 entry_fill_price=float(label.entry_fill_price),
                 exit_fill_price=float(label.exit_fill_price),
                 filled_quantity=float(label.filled_quantity),
@@ -706,6 +718,7 @@ class EventDrivenBacktest:
             trades,
             market_bars,
             cfg.initial_equity_usdt,
+            funding_stress_multiplier=execution.funding_stress_multiplier,
             _market_index=market_index,
         )
         mtm_values = [cfg.initial_equity_usdt] + [point.equity_usdt for point in equity_curve]

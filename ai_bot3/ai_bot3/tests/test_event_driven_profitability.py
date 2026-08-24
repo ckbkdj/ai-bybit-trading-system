@@ -395,6 +395,103 @@ def test_drawdown_uses_mark_to_market_path_not_only_realized_closes():
     assert adverse and min(adverse) < min(closes)
 
 
+def test_mark_to_market_recognizes_entry_slippage_at_the_fill_timestamp():
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    signal = SignalEvent(
+        signal_id="entry-slippage-mtm",
+        symbol="BTCUSDT",
+        side="BUY",
+        decision_at=start,
+        reference_price=100.0,
+        lower_bound_net_edge=0.001,
+        take_profit_bps=5_000,
+        stop_loss_bps=5_000,
+        max_holding_sec=120,
+    )
+    bars = [
+        _bar(start + timedelta(minutes=index), 101.0, 99.0, 100.0)
+        for index in range(4)
+    ]
+
+    report = EventDrivenBacktest().run([signal], {"BTCUSDT": bars})
+
+    trade = report.trades[0]
+    entry_mark = next(
+        point
+        for point in report.equity_curve
+        if point.observed_at == trade.entry_at and point.mark_kind == "bar_close"
+    )
+    assert trade.entry_fill_price > trade.entry_reference_price
+    assert entry_mark.unrealized_pnl_usdt < -trade.entry_fee_cost
+
+
+def test_two_x_funding_stress_is_applied_to_open_position_mtm():
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    signal = SignalEvent(
+        signal_id="funding-stress-mtm",
+        symbol="BTCUSDT",
+        side="BUY",
+        decision_at=start,
+        reference_price=100.0,
+        lower_bound_net_edge=0.001,
+        take_profit_bps=5_000,
+        stop_loss_bps=5_000,
+        max_holding_sec=120,
+    )
+    bars = [
+        MarketBar(
+            symbol="BTCUSDT",
+            open_time=start + timedelta(minutes=index),
+            close_time=start + timedelta(minutes=index + 1),
+            available_at=start + timedelta(minutes=index + 1),
+            open=100.0,
+            high=100.0,
+            low=100.0,
+            close=100.0,
+            volume=10_000,
+            spread_bps=0.0,
+            depth_usdt=1_000_000_000.0,
+            volatility_bps=0.0,
+            funding_bps=10.0,
+            spread_source="bybit.public.orderbook",
+            depth_source="bybit.public.orderbook",
+            funding_source="bybit.public.funding_history",
+            spread_observed=True,
+            depth_observed=True,
+            funding_observed=True,
+        )
+        for index in range(4)
+    ]
+    execution = event_driven.TripleBarrierConfig(
+        maker_fee_bps=0.0,
+        taker_fee_bps=0.0,
+        base_slippage_bps=0.0,
+        volatility_slippage_multiplier=0.0,
+        impact_bps_at_full_depth=0.0,
+        default_spread_bps=0.0,
+    )
+    runner = EventDrivenBacktest(execution=execution)
+
+    baseline = runner.run([signal], {"BTCUSDT": bars})
+    stressed = runner.run([signal], {"BTCUSDT": bars}, cost_multiplier=2.0)
+    first_close = start + timedelta(minutes=1)
+    baseline_mark = next(
+        point
+        for point in baseline.equity_curve
+        if point.observed_at == first_close and point.mark_kind == "bar_close"
+    )
+    stressed_mark = next(
+        point
+        for point in stressed.equity_curve
+        if point.observed_at == first_close and point.mark_kind == "bar_close"
+    )
+
+    assert baseline_mark.unrealized_pnl_usdt < 0
+    assert stressed_mark.unrealized_pnl_usdt == pytest.approx(
+        baseline_mark.unrealized_pnl_usdt * 2
+    )
+
+
 def test_unrealized_drawdown_blocks_new_cross_symbol_risk():
     start = datetime(2026, 1, 1, tzinfo=timezone.utc)
     first = SignalEvent(

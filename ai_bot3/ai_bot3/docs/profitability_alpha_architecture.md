@@ -187,6 +187,7 @@ FOMC 采集不能用会议日历日期猜测 14:00，也不能把 minutes、impl
 - stop/take-profit 的盘中路径和 max holding；
 - 单仓、总仓和杠杆约束；
 - 每个市场观测点对所有持仓 mark-to-market，计算真实盘中组合 drawdown。
+- 成交瞬间按 PIT reference/mid 而不是 fill price 标记权益，使入场 spread/slippage 立即进入回撤；2× 成本压力也同步作用于未平仓 funding MTM，不能只加压最终已实现收益。
 - 同日跨币种和重叠持仓在统计门禁中属于同一组合收益簇，不能重复增加有效样本数。
 
 执行成本证据分两层，不能混写：
