@@ -24,6 +24,7 @@ REQUIRED_EVIDENCE_REPORTS = (
     "nested_cv_report.json",
     "signal_funnel_report.json",
     "intratrade_drawdown_report.json",
+    "production_replay_report.json",
 )
 
 
@@ -44,6 +45,7 @@ def _evidence_semantic_failure(name: str, path: Path) -> str | None:
         "nested_cv_report.json",
         "signal_funnel_report.json",
         "intratrade_drawdown_report.json",
+        "production_replay_report.json",
     }:
         return None
     try:
@@ -124,6 +126,21 @@ def _evidence_semantic_failure(name: str, path: Path) -> str | None:
                 evidence.get("equity_observation_count", 0)
             ) <= 0:
                 return f"{scope}_mark_to_market_incomplete"
+    elif name == "production_replay_report.json":
+        if payload.get("status") != "PASSED" or not bool(payload.get("complete")):
+            return "production_replay_incomplete"
+        if bool(payload.get("lockbox_used")) or bool(
+            payload.get("alternative_models_scored")
+        ):
+            return "production_replay_scope_violated"
+        if int(payload.get("failed_sample_count", -1)) != 0 or int(
+            payload.get("observed_sample_count", -1)
+        ) != int(payload.get("expected_sample_count", -2)):
+            return "production_replay_samples_failed"
+        if payload.get("final_bundle_models_match_replayed") is not True or not str(
+            payload.get("final_model_bundle_sha256") or ""
+        ):
+            return "production_replay_final_bundle_unbound"
     return None
 
 
@@ -189,6 +206,15 @@ def create_candidate_manifest(
             raise ValueError(
                 f"candidate manifest evidence incomplete:{name}:{failure}"
             )
+    replay_payload = json.loads(
+        Path(evidence_paths["production_replay_report.json"]).read_text(
+            encoding="utf-8"
+        )
+    )
+    if replay_payload.get("final_model_bundle_sha256") != model_hash:
+        raise ValueError(
+            "candidate manifest production replay does not bind the final model bundle"
+        )
     evidence_hashes = {
         name: _sha256(Path(evidence_paths[name]))
         for name in REQUIRED_EVIDENCE_REPORTS
@@ -259,6 +285,12 @@ def verify_candidate_authorization(
         failure = _evidence_semantic_failure(name, evidence_path)
         if failure is not None:
             return False, f"profitability_evidence_incomplete:{name}:{failure}"
+        if name == "production_replay_report.json":
+            replay_payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+            if replay_payload.get("final_model_bundle_sha256") != manifest.get(
+                "model_artifact_sha256"
+            ):
+                return False, "profitability_production_replay_bundle_hash_mismatch"
     expected_release_id = _release_id(
         profitability_report_sha256=str(manifest.get("profitability_report_sha256") or ""),
         model_artifact_sha256=str(manifest.get("model_artifact_sha256") or ""),

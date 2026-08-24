@@ -423,10 +423,10 @@ class BybitPITFeatureSource:
         time_clauses: list[str] = []
         time_parameters: list[object] = []
         if available_minimum_text is not None:
-            time_clauses.append("o.available_at>=?")
+            time_clauses.append("julianday(o.available_at)>=julianday(?)")
             time_parameters.append(available_minimum_text)
         if available_maximum_text is not None:
-            time_clauses.append("o.available_at<=?")
+            time_clauses.append("julianday(o.available_at)<=julianday(?)")
             time_parameters.append(available_maximum_text)
         time_clause = "" if not time_clauses else " AND " + " AND ".join(time_clauses)
         with closing(self._connect()) as connection:
@@ -499,7 +499,7 @@ class BybitPITFeatureSource:
                              {symbol_clause}
                              {time_clause}
                              {invalidation_clause}
-                      ORDER BY symbol,name,available_at,sequence""",
+                      ORDER BY symbol,name,julianday(available_at),sequence""",
                 requested
                 + (frozen_sequence,)
                 + symbol_parameters
@@ -1188,6 +1188,8 @@ class BybitPITFeatureSource:
         names: Sequence[str],
         *,
         decision_at: object,
+        maximum_sequence: int | None = None,
+        maximum_invalidation_rowid: int | None = None,
     ) -> tuple[dict[str, float], dict[str, object]]:
         decision = pd.to_datetime(decision_at, utc=True, errors="coerce")
         if pd.isna(decision):
@@ -1197,7 +1199,7 @@ class BybitPITFeatureSource:
         available: dict[str, str] = {}
         with closing(self._connect()) as connection:
             connection.execute("BEGIN")
-            snapshot_maximum_sequence = int(
+            current_maximum_sequence = int(
                 connection.execute(
                     "SELECT COALESCE(MAX(sequence),0) FROM bybit_feature_observations"
                 ).fetchone()[0]
@@ -1206,12 +1208,7 @@ class BybitPITFeatureSource:
                 """SELECT 1 FROM sqlite_master
                      WHERE type='table' AND name='bybit_feature_invalidations'"""
             ).fetchone()
-            invalidation_clause = (
-                "AND observation_id NOT IN (SELECT observation_id FROM bybit_feature_invalidations)"
-                if invalidation_table
-                else ""
-            )
-            snapshot_maximum_invalidation_rowid = (
+            current_maximum_invalidation_rowid = (
                 int(
                     connection.execute(
                         "SELECT COALESCE(MAX(rowid),0) FROM bybit_feature_invalidations"
@@ -1219,6 +1216,35 @@ class BybitPITFeatureSource:
                 )
                 if invalidation_table
                 else 0
+            )
+            if (maximum_sequence is None) != (maximum_invalidation_rowid is None):
+                raise ValueError(
+                    "Bybit runtime replay watermarks must be frozen together"
+                )
+            snapshot_maximum_sequence = (
+                current_maximum_sequence
+                if maximum_sequence is None
+                else int(maximum_sequence)
+            )
+            snapshot_maximum_invalidation_rowid = (
+                current_maximum_invalidation_rowid
+                if maximum_invalidation_rowid is None
+                else int(maximum_invalidation_rowid)
+            )
+            if snapshot_maximum_sequence < 0 or snapshot_maximum_invalidation_rowid < 0:
+                raise ValueError("Bybit runtime replay watermarks cannot be negative")
+            if snapshot_maximum_sequence > current_maximum_sequence or (
+                snapshot_maximum_invalidation_rowid
+                > current_maximum_invalidation_rowid
+            ):
+                raise ValueError(
+                    "Bybit runtime replay watermarks exceed the available snapshot"
+                )
+            invalidation_clause = (
+                "AND observation_id NOT IN (SELECT observation_id "
+                "FROM bybit_feature_invalidations WHERE rowid<=?)"
+                if invalidation_table
+                else ""
             )
             for name in names:
                 definition = self.registry.require(name)
@@ -1231,15 +1257,22 @@ class BybitPITFeatureSource:
                     f"""SELECT value,unit,event_time,available_at,ingested_at,quality,source
                          FROM bybit_feature_observations
                          WHERE symbol=? AND name=? AND source IN ({source_placeholders})
-                           AND available_at<=? AND quality>=?
+                           AND julianday(available_at)<=julianday(?) AND quality>=?
+                           AND sequence<=?
                            {invalidation_clause}
-                         ORDER BY available_at DESC,sequence DESC LIMIT 1""",
+                         ORDER BY julianday(available_at) DESC,sequence DESC LIMIT 1""",
                     (
                         normalized_symbol,
                         name,
                         *expected_sources,
                         decision.isoformat().replace("+00:00", "Z"),
                         definition.minimum_quality,
+                        snapshot_maximum_sequence,
+                        *(
+                            (snapshot_maximum_invalidation_rowid,)
+                            if invalidation_table
+                            else ()
+                        ),
                     ),
                 ).fetchone()
                 if not row:

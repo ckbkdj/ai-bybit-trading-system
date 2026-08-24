@@ -13,6 +13,7 @@ from typing import Callable, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
+from contracts.horizons import MODE_HORIZONS
 from core.backtest.event_driven import BacktestConfig, EventDrivenBacktest, SignalEvent
 from core.evaluation.profitability_gate import (
     ProfitabilityGateResult,
@@ -29,6 +30,7 @@ from core.evaluation.calibration_coverage import (
 from core.evaluation.release_evidence import (
     intratrade_drawdown_evidence,
     nested_cv_evidence,
+    production_replay_evidence,
     signal_funnel_evidence,
 )
 from core.evaluation.statistical_governance import (
@@ -48,6 +50,12 @@ from core.models.two_stage import (
     TwoStageConfig,
     TwoStagePrediction,
     prediction_gate_diagnostics,
+)
+from core.models.profitability_runtime import (
+    EXTERNAL_FEATURE_ALIASES,
+    build_current_feature_rows,
+    generate_profitability_alpha_prediction,
+    select_directional_prediction,
 )
 from core.release.profitability_release import create_candidate_manifest
 from core.risk.capital_preservation import CapitalPreservationConfig, policy_report
@@ -770,6 +778,397 @@ def _write_kline_data_evidence(
             },
             "outer_oos_by_horizon": oos_payload,
         },
+    )
+
+
+def _external_replay_context(
+    row: pd.Series,
+    *,
+    model_feature_columns: Sequence[str],
+    trad_panel_evidence: Mapping[str, object] | None,
+) -> Mapping[str, object] | None:
+    required = [
+        name for name in model_feature_columns if name in EXTERNAL_FEATURE_ALIASES
+    ]
+    if not required:
+        return None
+    if trad_panel_evidence is None:
+        raise ValueError("production replay requires verified trad panel evidence")
+    available_at = pd.to_datetime(
+        row.get("factor_available_at"), utc=True, errors="coerce"
+    )
+    if pd.isna(available_at):
+        raise ValueError("production replay external factor availability is missing")
+    revision_control = trad_panel_evidence.get("revision_control")
+    if not isinstance(revision_control, Mapping):
+        raise ValueError("production replay external revision evidence is missing")
+    features = {
+        EXTERNAL_FEATURE_ALIASES[name]: float(row[name]) for name in required
+    }
+    if not all(np.isfinite(value) for value in features.values()):
+        raise ValueError("production replay external features are not finite")
+    return {
+        "status": "ok",
+        "source": trad_panel_evidence.get("source"),
+        "data": {
+            "available_at": pd.Timestamp(available_at).isoformat().replace(
+                "+00:00", "Z"
+            ),
+            "hash_verified": trad_panel_evidence.get("hash_verified"),
+            "latest_pass_run_id": trad_panel_evidence.get("latest_pass_run_id"),
+            "canonical_sha_from_receipt": trad_panel_evidence.get(
+                "canonical_sha256"
+            ),
+            "revision_control": dict(revision_control),
+            "features": features,
+        },
+    }
+
+
+def _prediction_values(prediction: object) -> dict[str, float | str | bool]:
+    return {
+        "decision": str(prediction.decision),
+        "p_down": float(prediction.p_down),
+        "p_flat": float(prediction.p_flat),
+        "p_up": float(prediction.p_up),
+        "expected_net_return": float(prediction.expected_net_return),
+        "return_p10": float(prediction.return_p10),
+        "return_p50": float(prediction.return_p50),
+        "return_p90": float(prediction.return_p90),
+        "expected_mae": float(prediction.expected_mae),
+        "expected_mfe": float(prediction.expected_mfe),
+        "uncertainty": float(prediction.uncertainty),
+        "meta_trade_probability": float(prediction.meta_trade_probability),
+        "lower_bound_net_edge": float(prediction.lower_bound_net_edge),
+        "shadow_actionable": bool(
+            prediction.decision == "TRADE"
+            and float(prediction.lower_bound_net_edge) > 0
+        ),
+    }
+
+
+def _require_development_evidence(
+    gate: ProfitabilityGateResult,
+    *,
+    check_name: str,
+    evidence: Mapping[str, object],
+) -> ProfitabilityGateResult:
+    passed_check = bool(evidence.get("passed"))
+    checks = {
+        **gate.checks,
+        check_name: {
+            "passed": passed_check,
+            "status": evidence.get("status", "MISSING"),
+            "complete": bool(evidence.get("complete")),
+            "failed_sample_count": evidence.get("failed_sample_count"),
+            "observed_sample_count": evidence.get("observed_sample_count"),
+            "expected_sample_count": evidence.get("expected_sample_count"),
+        },
+    }
+    blockers = tuple(
+        dict.fromkeys([*gate.blockers, *(() if passed_check else (check_name,))])
+    )
+    passed = gate.passed and passed_check
+    return ProfitabilityGateResult(
+        profitability_gate="PASSED" if passed else "FAILED",
+        stage="development_validated" if passed else "rejected",
+        candidate_count=0,
+        live_count=0,
+        checks=checks,
+        metrics={
+            **gate.metrics,
+            f"{check_name}_status": evidence.get("status", "MISSING"),
+        },
+        blockers=blockers,
+    )
+
+
+def _require_candidate_evidence(
+    gate: ProfitabilityGateResult,
+    *,
+    check_name: str,
+    passed_check: bool,
+) -> ProfitabilityGateResult:
+    checks = {
+        **gate.checks,
+        check_name: {"passed": bool(passed_check), "required": True},
+    }
+    blockers = tuple(
+        dict.fromkeys([*gate.blockers, *(() if passed_check else (check_name,))])
+    )
+    passed = gate.passed and passed_check
+    return ProfitabilityGateResult(
+        profitability_gate="PASSED" if passed else "FAILED",
+        stage="candidate" if passed else "rejected",
+        candidate_count=1 if passed else 0,
+        live_count=0,
+        checks=checks,
+        metrics={**gate.metrics, f"{check_name}_passed": bool(passed_check)},
+        blockers=blockers,
+    )
+
+
+def _run_production_replay(
+    *,
+    source: KlinePanelSource,
+    max_bars_per_symbol: int,
+    release_datasets: Mapping[int, HorizonDataset],
+    final_models: Mapping[int, TwoStageAlphaModel],
+    model_feature_columns_by_horizon: Mapping[int, Sequence[str]],
+    model_bundle_path: Path,
+    trad_panel_evidence: Mapping[str, object] | None,
+    bybit_pit_store_path: Path | None,
+    macro_pit_store_path: Path | None,
+    flow_pit_store_path: Path | None,
+    pit_snapshot_watermarks: Mapping[str, Mapping[str, int | None]],
+) -> dict[str, object]:
+    mode_by_horizon = {horizon: mode for mode, horizon in MODE_HORIZONS.items()}
+    samples: list[dict[str, object]] = []
+    categorical = {"symbol", "side", "session", "regime"}
+    for horizon in HORIZONS_SEC:
+        dataset = release_datasets.get(horizon)
+        if dataset is None:
+            for symbol in SYMBOLS:
+                samples.append(
+                    {
+                        "horizon_sec": horizon,
+                        "symbol": symbol,
+                        "passed": False,
+                        "reason": "direct_execution_outer_oos_dataset_missing",
+                    }
+                )
+            continue
+        outer_positions = sorted(
+            {
+                int(position)
+                for fold in dataset.folds
+                for position in fold.test_indices
+            }
+        )
+        outer_oos = dataset.development.iloc[outer_positions]
+        features = list(model_feature_columns_by_horizon[horizon])
+        model = final_models[horizon]
+        for symbol in SYMBOLS:
+            sample_result: dict[str, object] = {
+                "horizon_sec": horizon,
+                "symbol": symbol,
+                "passed": False,
+            }
+            try:
+                symbol_oos = outer_oos[
+                    outer_oos["symbol"].astype(str).str.upper() == symbol
+                ].sort_values("decision_at")
+                selected_group: pd.DataFrame | None = None
+                for _, group in symbol_oos.groupby("decision_at", sort=True):
+                    if set(group["side"].astype(str).str.upper()) == {"BUY", "SELL"}:
+                        selected_group = group.copy()
+                        break
+                if selected_group is None:
+                    raise ValueError("no paired outer-OOS replay decision")
+                side_order = pd.Categorical(
+                    selected_group["side"].astype(str).str.upper(),
+                    categories=["BUY", "SELL"],
+                    ordered=True,
+                )
+                offline_rows = (
+                    selected_group.assign(__side_order=side_order)
+                    .sort_values("__side_order")
+                    .drop(columns="__side_order")
+                    .reset_index(drop=True)
+                )
+                decision_at = pd.to_datetime(
+                    offline_rows.loc[0, "decision_at"], utc=True, errors="raise"
+                ).to_pydatetime()
+                raw = source.load(
+                    symbol,
+                    HORIZON_TIMEFRAME[horizon],
+                    max_bars_per_symbol,
+                )
+                raw = raw[raw["close_at"] <= decision_at].reset_index(drop=True)
+                external_context = _external_replay_context(
+                    offline_rows.iloc[0],
+                    model_feature_columns=features,
+                    trad_panel_evidence=trad_panel_evidence,
+                )
+                runtime_rows, feature_evidence = build_current_feature_rows(
+                    raw,
+                    symbol=symbol,
+                    horizon_sec=horizon,
+                    model_feature_columns=features,
+                    latest_decision_at=decision_at,
+                    external_panel_context=external_context,
+                    bybit_pit_store_path=bybit_pit_store_path,
+                    macro_pit_store_path=macro_pit_store_path,
+                    flow_pit_store_path=flow_pit_store_path,
+                    pit_snapshot_watermarks=pit_snapshot_watermarks,
+                )
+                feature_mismatches: dict[str, object] = {}
+                maximum_numeric_difference = 0.0
+                for column in features:
+                    if column in categorical:
+                        offline_values = offline_rows[column].astype(str).tolist()
+                        runtime_values = runtime_rows[column].astype(str).tolist()
+                        if offline_values != runtime_values:
+                            feature_mismatches[column] = {
+                                "offline": offline_values,
+                                "runtime": runtime_values,
+                            }
+                    else:
+                        offline_values = pd.to_numeric(
+                            offline_rows[column], errors="coerce"
+                        ).to_numpy(float)
+                        runtime_values = pd.to_numeric(
+                            runtime_rows[column], errors="coerce"
+                        ).to_numpy(float)
+                        difference = float(
+                            np.max(np.abs(offline_values - runtime_values))
+                        )
+                        maximum_numeric_difference = max(
+                            maximum_numeric_difference, difference
+                        )
+                        if not np.isfinite(difference) or difference > 1e-10:
+                            feature_mismatches[column] = {
+                                "maximum_absolute_difference": difference
+                            }
+                offline_side, offline_prediction = select_directional_prediction(
+                    model.predict(offline_rows)
+                )
+                runtime_side, runtime_prediction = select_directional_prediction(
+                    model.predict(runtime_rows)
+                )
+                offline_values = _prediction_values(offline_prediction)
+                runtime_values = _prediction_values(runtime_prediction)
+                prediction_mismatches: dict[str, object] = {}
+                for name, expected in offline_values.items():
+                    observed = runtime_values[name]
+                    if isinstance(expected, float):
+                        if abs(expected - float(observed)) > 1e-10:
+                            prediction_mismatches[name] = {
+                                "offline": expected,
+                                "runtime": observed,
+                            }
+                    elif observed != expected:
+                        prediction_mismatches[name] = {
+                            "offline": expected,
+                            "runtime": observed,
+                        }
+                runtime_output = generate_profitability_alpha_prediction(
+                    raw,
+                    symbol=symbol,
+                    mode=mode_by_horizon[horizon],
+                    latest_decision_at=decision_at,
+                    external_panel_context=external_context,
+                    bybit_pit_store_path=bybit_pit_store_path,
+                    macro_pit_store_path=macro_pit_store_path,
+                    flow_pit_store_path=flow_pit_store_path,
+                    model_bundle_path=model_bundle_path,
+                    pit_snapshot_watermarks=pit_snapshot_watermarks,
+                )
+                output_mismatches: dict[str, object] = {}
+                expected_output = {
+                    "status": "ok",
+                    "release_stage": "rejected",
+                    "profitability_gate": "FAILED",
+                    "actionable": False,
+                    "side": offline_side,
+                    "decision": offline_values["decision"],
+                    "shadow_actionable": offline_values["shadow_actionable"],
+                    "p_down": offline_values["p_down"],
+                    "p_flat": offline_values["p_flat"],
+                    "p_up": offline_values["p_up"],
+                    "expected_net_return": offline_values[
+                        "expected_net_return"
+                    ],
+                    "expected_net_return_bps": float(
+                        offline_values["expected_net_return"]
+                    )
+                    * 10_000,
+                    "expected_mae_bps": float(offline_values["expected_mae"])
+                    * 10_000,
+                    "expected_mfe_bps": float(offline_values["expected_mfe"])
+                    * 10_000,
+                    "lower_bound_net_edge_bps": float(
+                        offline_values["lower_bound_net_edge"]
+                    )
+                    * 10_000,
+                    "meta_trade_probability": offline_values[
+                        "meta_trade_probability"
+                    ],
+                    "uncertainty": offline_values["uncertainty"],
+                }
+                for name, expected in expected_output.items():
+                    observed = runtime_output.get(name)
+                    if isinstance(expected, float):
+                        matches = observed is not None and abs(
+                            expected - float(observed)
+                        ) <= 1e-10
+                    else:
+                        matches = observed == expected
+                    if not matches:
+                        output_mismatches[name] = {
+                            "offline": expected,
+                            "production": observed,
+                        }
+                production_quantiles = runtime_output.get("return_quantiles_bps")
+                if not isinstance(production_quantiles, Mapping):
+                    output_mismatches["return_quantiles_bps"] = {
+                        "offline": "p10/p50/p90",
+                        "production": production_quantiles,
+                    }
+                else:
+                    for quantile in ("p10", "p50", "p90"):
+                        expected = float(offline_values[f"return_{quantile}"]) * 10_000
+                        observed = production_quantiles.get(quantile)
+                        if observed is None or abs(expected - float(observed)) > 1e-10:
+                            output_mismatches[f"return_quantiles_bps.{quantile}"] = {
+                                "offline": expected,
+                                "production": observed,
+                            }
+                production_feature_evidence = runtime_output.get("feature_evidence")
+                production_feature_hash = (
+                    production_feature_evidence.get("feature_snapshot_sha256")
+                    if isinstance(production_feature_evidence, Mapping)
+                    else None
+                )
+                if production_feature_hash != feature_evidence.get(
+                    "feature_snapshot_sha256"
+                ):
+                    output_mismatches["feature_snapshot_sha256"] = {
+                        "offline_replay": feature_evidence.get(
+                            "feature_snapshot_sha256"
+                        ),
+                        "production": production_feature_hash,
+                    }
+                sample_result.update(
+                    {
+                        "decision_at": decision_at,
+                        "feature_snapshot_sha256": feature_evidence.get(
+                            "feature_snapshot_sha256"
+                        ),
+                        "maximum_numeric_feature_difference": (
+                            maximum_numeric_difference
+                        ),
+                        "feature_mismatches": feature_mismatches,
+                        "offline_selected_side": offline_side,
+                        "runtime_selected_side": runtime_side,
+                        "prediction_mismatches": prediction_mismatches,
+                        "production_output_mismatches": output_mismatches,
+                        "production_authorization_expected": False,
+                        "passed": not (
+                            feature_mismatches
+                            or prediction_mismatches
+                            or output_mismatches
+                            or runtime_side != offline_side
+                        ),
+                    }
+                )
+            except Exception as exc:
+                sample_result["reason"] = f"{type(exc).__name__}: {exc}"
+            samples.append(sample_result)
+    return production_replay_evidence(
+        samples,
+        expected_horizons=HORIZONS_SEC,
+        expected_symbols=SYMBOLS,
     )
 
 
@@ -3598,6 +3997,60 @@ class ProfitabilityRebuild:
         }
         _atomic_json(bundle_path, rejected_bundle)
 
+        replay_snapshot_watermarks: dict[str, Mapping[str, int | None]] = {
+            "bybit": {
+                "maximum_sequence": self.bybit_pit_snapshot_maximum_sequence,
+                "maximum_invalidation_rowid": (
+                    self.bybit_pit_snapshot_maximum_invalidation_rowid
+                ),
+            },
+            "macro": {
+                "maximum_sequence": self.macro_pit_snapshot_maximum_sequence,
+            },
+            "flow": {
+                "maximum_sequence": self.flow_pit_snapshot_maximum_sequence,
+                "maximum_invalidation_rowid": (
+                    self.flow_pit_snapshot_maximum_invalidation_rowid
+                ),
+            },
+        }
+        replay_evidence = _run_production_replay(
+            source=self.source,
+            max_bars_per_symbol=self.config.max_bars_per_symbol,
+            release_datasets=release_datasets,
+            final_models=final_models,
+            model_feature_columns_by_horizon=model_feature_columns_by_horizon,
+            model_bundle_path=bundle_path,
+            trad_panel_evidence=trad_panel_evidence,
+            bybit_pit_store_path=self.config.bybit_pit_store_path,
+            macro_pit_store_path=self.config.macro_pit_store_path,
+            flow_pit_store_path=self.config.flow_pit_store_path,
+            pit_snapshot_watermarks=replay_snapshot_watermarks,
+        )
+        _atomic_json(
+            output / "production_replay_report.json",
+            {
+                "trial_id": self.trial_id,
+                "code_commit": self.config.code_commit,
+                "replayed_model_bundle_sha256": _sha256_file(bundle_path),
+                "replayed_model_sha256": dict(model_sha256),
+                "replayed_feature_contract_sha256": _hash_payload(
+                    model_feature_columns_by_horizon
+                ),
+                "final_model_bundle_sha256": None,
+                "final_bundle_models_match_replayed": None,
+                **replay_evidence,
+            },
+        )
+        development_gate = _require_development_evidence(
+            development_gate,
+            check_name="production_replay",
+            evidence=replay_evidence,
+        )
+        write_profitability_report(
+            output / "profitability_report.json", development_gate
+        )
+
         if not development_gate.passed:
             _atomic_json(
                 output / "lockbox_report.json",
@@ -4326,26 +4779,40 @@ class ProfitabilityRebuild:
                 ],
             },
         )
-        _atomic_json(
-            bundle_path,
-            {
+        candidate_model_paths = {
+            key: value
+            for key, value in model_paths.items()
+            if int(key) in development_eligible_horizons
+        }
+        candidate_model_hashes = {
+            key: value
+            for key, value in model_sha256.items()
+            if int(key) in development_eligible_horizons
+        }
+        replay_artifact_integrity = bool(
+            candidate_model_paths
+            and all(
+                _sha256_file(model_dir / relative_path)
+                == candidate_model_hashes[key]
+                for key, relative_path in candidate_model_paths.items()
+            )
+        )
+        gate = _require_candidate_evidence(
+            gate,
+            check_name="production_replay_artifact_integrity",
+            passed_check=replay_artifact_integrity,
+        )
+        write_profitability_report(output / "profitability_report.json", gate)
+        final_model_paths = candidate_model_paths if gate.passed else model_paths
+        final_model_hashes = candidate_model_hashes if gate.passed else model_sha256
+        final_bundle_payload = {
                 "schema_version": "profitability-model-bundle.v2",
                 "trial_id": self.trial_id,
                 "model_family": "profitability_two_stage",
                 "release_stage": "candidate" if gate.passed else "rejected",
                 "profitability_gate": gate.profitability_gate,
-                "models": {
-                    key: value
-                    for key, value in model_paths.items()
-                    if not gate.passed
-                    or int(key) in development_eligible_horizons
-                },
-                "model_sha256": {
-                    key: value
-                    for key, value in model_sha256.items()
-                    if not gate.passed
-                    or int(key) in development_eligible_horizons
-                },
+                "models": final_model_paths,
+                "model_sha256": final_model_hashes,
                 "formal_feature_columns": {
                     str(horizon): list(columns)
                     for horizon, columns in model_feature_columns_by_horizon.items()
@@ -4365,8 +4832,30 @@ class ProfitabilityRebuild:
                 "lockbox_fingerprint": lockbox_fingerprint,
                 "lockbox_consumed": True,
                 "code_commit": self.config.code_commit,
-            },
+        }
+        _atomic_json(bundle_path, final_bundle_payload)
+        production_replay_path = output / "production_replay_report.json"
+        production_replay_payload = json.loads(
+            production_replay_path.read_text(encoding="utf-8")
         )
+        production_replay_payload["final_model_bundle_sha256"] = _sha256_file(
+            bundle_path
+        )
+        production_replay_payload["final_bundle_models_match_replayed"] = bool(
+            replay_artifact_integrity
+            and all(
+                production_replay_payload.get("replayed_model_sha256", {}).get(key)
+                == value
+                for key, value in final_model_hashes.items()
+            )
+        )
+        if not production_replay_payload[
+            "final_bundle_models_match_replayed"
+        ]:
+            production_replay_payload["status"] = "FAILED"
+            production_replay_payload["passed"] = False
+            production_replay_payload["complete"] = False
+        _atomic_json(production_replay_path, production_replay_payload)
         if gate.passed:
             create_candidate_manifest(
                 output / "candidate_release_manifest.json",
@@ -4391,6 +4880,7 @@ class ProfitabilityRebuild:
                         "nested_cv_report.json",
                         "signal_funnel_report.json",
                         "intratrade_drawdown_report.json",
+                        "production_replay_report.json",
                     )
                 },
             )
@@ -4524,6 +5014,22 @@ def write_failed_outputs(output_dir: Path, *, reason: str) -> ProfitabilityGateR
                 "reason": reason,
                 "development": {"status": "INCOMPLETE"},
                 "lockbox": {"status": "SEALED_NOT_OPENED"},
+            },
+        ),
+        (
+            "production_replay_report.json",
+            {
+                "schema_version": "profitability-production-replay.v1",
+                "status": "FAILED",
+                "passed": False,
+                "complete": False,
+                "reason": reason,
+                "lockbox_used": False,
+                "alternative_models_scored": False,
+                "expected_sample_count": len(HORIZONS_SEC) * len(SYMBOLS),
+                "observed_sample_count": 0,
+                "failed_sample_count": 0,
+                "samples": [],
             },
         ),
     ):

@@ -254,8 +254,64 @@ def intratrade_drawdown_evidence(report: object, *, scope: str) -> dict[str, obj
     }
 
 
+def production_replay_evidence(
+    samples: Sequence[Mapping[str, object]],
+    *,
+    expected_horizons: Sequence[int],
+    expected_symbols: Sequence[str],
+) -> dict[str, object]:
+    expected_keys = {
+        (int(horizon), str(symbol).upper())
+        for horizon in expected_horizons
+        for symbol in expected_symbols
+    }
+    observed_keys = [
+        (int(sample.get("horizon_sec", -1)), str(sample.get("symbol", "")).upper())
+        for sample in samples
+    ]
+    duplicates = len(observed_keys) - len(set(observed_keys))
+    missing = sorted(expected_keys.difference(observed_keys))
+    unexpected = sorted(set(observed_keys).difference(expected_keys))
+    failed = [sample for sample in samples if not bool(sample.get("passed"))]
+    complete = bool(
+        not missing
+        and not unexpected
+        and duplicates == 0
+        and len(samples) == len(expected_keys)
+    )
+    passed = complete and not failed
+    return {
+        "schema_version": "profitability-production-replay.v1",
+        "status": "PASSED" if passed else "FAILED",
+        "passed": passed,
+        "complete": complete,
+        "scope": "development_outer_oos_feature_and_prediction_replay",
+        "lockbox_used": False,
+        "alternative_models_scored": False,
+        "sample_selection": (
+            "earliest outer-OOS paired decision per preregistered horizon and symbol; "
+            "outcomes never used for selection"
+        ),
+        "numeric_tolerance": 1e-10,
+        "expected_sample_count": len(expected_keys),
+        "observed_sample_count": len(samples),
+        "failed_sample_count": len(failed),
+        "duplicate_sample_key_count": duplicates,
+        "missing_sample_keys": [
+            {"horizon_sec": horizon, "symbol": symbol}
+            for horizon, symbol in missing
+        ],
+        "unexpected_sample_keys": [
+            {"horizon_sec": horizon, "symbol": symbol}
+            for horizon, symbol in unexpected
+        ],
+        "samples": [dict(sample) for sample in samples],
+    }
+
+
 __all__ = (
     "intratrade_drawdown_evidence",
     "nested_cv_evidence",
+    "production_replay_evidence",
     "signal_funnel_evidence",
 )

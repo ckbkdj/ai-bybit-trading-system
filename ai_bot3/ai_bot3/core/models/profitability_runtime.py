@@ -6,7 +6,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -191,6 +191,8 @@ def _latest_global_pit_values(
     names: list[str],
     *,
     decision_at: datetime,
+    maximum_sequence: int | None = None,
+    maximum_invalidation_rowid: int | None = None,
 ) -> tuple[dict[str, float], dict[str, object]]:
     """Resolve one strict as-of macro/flow row from a frozen verified snapshot."""
 
@@ -203,16 +205,27 @@ def _latest_global_pit_values(
         raise ValueError(f"unsupported PIT source kind: {source_kind}")
     requested = tuple(dict.fromkeys(names))
     if source_kind == "flow":
-        maximum_sequence, maximum_invalidation_rowid = source.snapshot_watermarks()
+        current_sequence, current_invalidation_rowid = source.snapshot_watermarks()
+        frozen_sequence = (
+            current_sequence if maximum_sequence is None else int(maximum_sequence)
+        )
+        frozen_invalidation_rowid = (
+            current_invalidation_rowid
+            if maximum_invalidation_rowid is None
+            else int(maximum_invalidation_rowid)
+        )
     else:
-        maximum_sequence = source.maximum_sequence()
-        maximum_invalidation_rowid = 0
+        current_sequence = source.maximum_sequence()
+        frozen_sequence = (
+            current_sequence if maximum_sequence is None else int(maximum_sequence)
+        )
+        frozen_invalidation_rowid = 0
     history, snapshot = _verified_pit_history(
         source_kind,
         str(path),
         requested,
-        maximum_sequence,
-        maximum_invalidation_rowid,
+        frozen_sequence,
+        frozen_invalidation_rowid,
     )
     joined = source.join(
         pd.DataFrame({"decision_at": [pd.Timestamp(decision_at)]}),
@@ -242,7 +255,7 @@ def _latest_global_pit_values(
         "database": str(path),
         "requested_features": list(requested),
         "available_at": availability,
-        "snapshot_maximum_sequence": maximum_sequence,
+        "snapshot_maximum_sequence": frozen_sequence,
         "snapshot_maximum_invalidation_rowid": snapshot.get(
             "snapshot_maximum_invalidation_rowid"
         ),
@@ -265,6 +278,7 @@ def build_current_feature_rows(
     bybit_pit_store_path: Path | None = None,
     macro_pit_store_path: Path | None = None,
     flow_pit_store_path: Path | None = None,
+    pit_snapshot_watermarks: Mapping[str, Mapping[str, int | None]] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, object]]:
     if len(frame) < 49:
         raise ValueError("at least 49 chronological bars are required for alpha inference")
@@ -305,6 +319,11 @@ def build_current_feature_rows(
             macro_pit_store_path,
             required_macro_features,
             decision_at=decision_at,
+            maximum_sequence=(
+                (pit_snapshot_watermarks or {}).get("macro", {}).get(
+                    "maximum_sequence"
+                )
+            ),
         )
     required_flow_features = [
         column for column in model_feature_columns if column in FLOW_FEATURE_CONTRACTS
@@ -319,6 +338,16 @@ def build_current_feature_rows(
             flow_pit_store_path,
             required_flow_features,
             decision_at=decision_at,
+            maximum_sequence=(
+                (pit_snapshot_watermarks or {}).get("flow", {}).get(
+                    "maximum_sequence"
+                )
+            ),
+            maximum_invalidation_rowid=(
+                (pit_snapshot_watermarks or {}).get("flow", {}).get(
+                    "maximum_invalidation_rowid"
+                )
+            ),
         )
     required_bybit_features = []
     registry = default_registry()
@@ -339,6 +368,16 @@ def build_current_feature_rows(
             symbol,
             required_bybit_features,
             decision_at=decision_at,
+            maximum_sequence=(
+                (pit_snapshot_watermarks or {}).get("bybit", {}).get(
+                    "maximum_sequence"
+                )
+            ),
+            maximum_invalidation_rowid=(
+                (pit_snapshot_watermarks or {}).get("bybit", {}).get(
+                    "maximum_invalidation_rowid"
+                )
+            ),
         )
         missing_bybit = sorted(set(required_bybit_features).difference(bybit_values))
         if missing_bybit:
@@ -399,6 +438,31 @@ def build_current_feature_rows(
     }
 
 
+def select_directional_prediction(
+    predictions: Sequence[object],
+) -> tuple[str, object]:
+    if len(predictions) != 2:
+        raise ValueError("runtime expects paired BUY and SELL predictions")
+    candidates = []
+    for side, prediction in zip(("BUY", "SELL"), predictions):
+        direction_ok = (
+            side == "BUY" and prediction.p_up >= prediction.p_down
+        ) or (side == "SELL" and prediction.p_down >= prediction.p_up)
+        if direction_ok:
+            candidates.append((prediction.decision == "TRADE", prediction, side))
+    if not candidates:
+        raise ValueError("direction model produced no consistent side")
+    _, selected, selected_side = max(
+        candidates,
+        key=lambda item: (
+            item[0],
+            item[1].lower_bound_net_edge,
+            item[1].meta_trade_probability,
+        ),
+    )
+    return selected_side, selected
+
+
 def generate_profitability_alpha_prediction(
     frame: pd.DataFrame,
     *,
@@ -413,6 +477,7 @@ def generate_profitability_alpha_prediction(
     profitability_report_path: Path | None = None,
     candidate_manifest_path: Path | None = None,
     strategy_release_id: str | None = None,
+    pit_snapshot_watermarks: Mapping[str, Mapping[str, int | None]] | None = None,
 ) -> dict[str, object]:
     """Run the versioned two-stage Alpha in production, fail-closed by default."""
 
@@ -499,6 +564,7 @@ def generate_profitability_alpha_prediction(
                     else None
                 )
             ),
+            pit_snapshot_watermarks=pit_snapshot_watermarks,
         )
         predictions = model.predict(rows)
 
@@ -529,23 +595,7 @@ def generate_profitability_alpha_prediction(
             if not authorized:
                 authorization_reason = "candidate_bundle_or_lockbox_hash_mismatch"
 
-        candidates = []
-        for side, prediction in zip(("BUY", "SELL"), predictions):
-            direction_ok = (
-                side == "BUY" and prediction.p_up >= prediction.p_down
-            ) or (side == "SELL" and prediction.p_down >= prediction.p_up)
-            if direction_ok:
-                candidates.append((prediction.decision == "TRADE", prediction, side))
-        if not candidates:
-            raise ValueError("direction model produced no consistent side")
-        _, selected, selected_side = max(
-            candidates,
-            key=lambda item: (
-                item[0],
-                item[1].lower_bound_net_edge,
-                item[1].meta_trade_probability,
-            ),
-        )
+        selected_side, selected = select_directional_prediction(predictions)
         shadow_trade = selected.decision == "TRADE" and selected.lower_bound_net_edge > 0
         release_stage = "candidate" if authorized else "rejected"
         strategy_id = strategy_release_id or os.environ.get(
@@ -598,4 +648,5 @@ __all__ = (
     "MAX_EXTERNAL_PANEL_AGE",
     "build_current_feature_rows",
     "generate_profitability_alpha_prediction",
+    "select_directional_prediction",
 )

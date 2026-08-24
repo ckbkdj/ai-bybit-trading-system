@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -77,7 +78,9 @@ def _calibration_evidence() -> dict[str, object]:
     }
 
 
-def _release_evidence_fixture(name: str) -> dict[str, object]:
+def _release_evidence_fixture(
+    name: str, model_sha256: str = "f" * 64
+) -> dict[str, object]:
     if name == "data_coverage_report.json":
         return {
             "status": "PASSED",
@@ -138,6 +141,18 @@ def _release_evidence_fixture(name: str) -> dict[str, object]:
             "complete": True,
             "development": scope,
             "lockbox": scope,
+        }
+    if name == "production_replay_report.json":
+        return {
+            "status": "PASSED",
+            "complete": True,
+            "lockbox_used": False,
+            "alternative_models_scored": False,
+            "expected_sample_count": 25,
+            "observed_sample_count": 25,
+            "failed_sample_count": 0,
+            "final_bundle_models_match_replayed": True,
+            "final_model_bundle_sha256": model_sha256,
         }
     return {"report": name}
 
@@ -438,10 +453,13 @@ def test_candidate_manifest_binds_every_final_evidence_report(tmp_path):
     write_profitability_report(profitability, gate)
     model.write_text("{}", encoding="utf-8")
     evidence = {}
+    model_sha256 = hashlib.sha256(model.read_bytes()).hexdigest()
     for name in REQUIRED_EVIDENCE_REPORTS:
         path = tmp_path / name
         path.write_text(
-            json.dumps(_release_evidence_fixture(name), sort_keys=True),
+            json.dumps(
+                _release_evidence_fixture(name, model_sha256), sort_keys=True
+            ),
             encoding="utf-8",
         )
         evidence[name] = path
@@ -486,10 +504,13 @@ def test_candidate_manifest_release_id_is_derived_from_bound_evidence(tmp_path):
     write_profitability_report(profitability, gate)
     model.write_text("{}", encoding="utf-8")
     evidence = {}
+    model_sha256 = hashlib.sha256(model.read_bytes()).hexdigest()
     for name in REQUIRED_EVIDENCE_REPORTS:
         evidence_path = tmp_path / name
         evidence_path.write_text(
-            json.dumps(_release_evidence_fixture(name), sort_keys=True),
+            json.dumps(
+                _release_evidence_fixture(name, model_sha256), sort_keys=True
+            ),
             encoding="utf-8",
         )
         evidence[name] = evidence_path

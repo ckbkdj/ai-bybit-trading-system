@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT))
 from core.evaluation.release_evidence import (
     intratrade_drawdown_evidence,
     nested_cv_evidence,
+    production_replay_evidence,
     signal_funnel_evidence,
 )
 
@@ -114,3 +115,25 @@ def test_intratrade_drawdown_recomputes_the_full_mtm_curve():
     assert evidence["status"] == "PASSED"
     assert evidence["recomputed_max_drawdown"] == 0.02
     assert evidence["trade_mae"]["maximum"] == 0.02
+
+
+def test_production_replay_requires_one_passing_sample_per_contract_key():
+    evidence = production_replay_evidence(
+        [
+            {"horizon_sec": 180, "symbol": "BTCUSDT", "passed": True},
+            {"horizon_sec": 180, "symbol": "ETHUSDT", "passed": True},
+        ],
+        expected_horizons=[180],
+        expected_symbols=["BTCUSDT", "ETHUSDT"],
+    )
+    assert evidence["status"] == "PASSED"
+
+    failed = production_replay_evidence(
+        [{"horizon_sec": 180, "symbol": "BTCUSDT", "passed": True}],
+        expected_horizons=[180],
+        expected_symbols=["BTCUSDT", "ETHUSDT"],
+    )
+    assert failed["status"] == "FAILED"
+    assert failed["missing_sample_keys"] == [
+        {"horizon_sec": 180, "symbol": "ETHUSDT"}
+    ]

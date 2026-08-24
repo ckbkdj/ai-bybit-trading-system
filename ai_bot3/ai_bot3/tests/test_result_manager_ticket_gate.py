@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import sqlite3
 import sys
@@ -27,7 +28,9 @@ def _iso(point: datetime) -> str:
     return point.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _release_evidence_fixture(name: str) -> dict[str, object]:
+def _release_evidence_fixture(
+    name: str, model_sha256: str = "f" * 64
+) -> dict[str, object]:
     if name == "data_coverage_report.json":
         return {
             "status": "PASSED",
@@ -88,6 +91,18 @@ def _release_evidence_fixture(name: str) -> dict[str, object]:
             "complete": True,
             "development": scope,
             "lockbox": scope,
+        }
+    if name == "production_replay_report.json":
+        return {
+            "status": "PASSED",
+            "complete": True,
+            "lockbox_used": False,
+            "alternative_models_scored": False,
+            "expected_sample_count": 25,
+            "observed_sample_count": 25,
+            "failed_sample_count": 0,
+            "final_bundle_models_match_replayed": True,
+            "final_model_bundle_sha256": model_sha256,
         }
     return {"fixture": name}
 
@@ -171,10 +186,13 @@ def _profitability_release(root: Path) -> tuple[Path, Path, dict]:
     artifact = root / "two-stage-model.json"
     artifact.write_text('{"release_stage":"rejected"}', encoding="utf-8")
     evidence_paths = {}
+    model_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
     for name in REQUIRED_EVIDENCE_REPORTS:
         evidence_path = root / name
         evidence_path.write_text(
-            json.dumps(_release_evidence_fixture(name), sort_keys=True),
+            json.dumps(
+                _release_evidence_fixture(name, model_sha256), sort_keys=True
+            ),
             encoding="utf-8",
         )
         evidence_paths[name] = evidence_path

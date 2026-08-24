@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT))
 from core.features.profitability_technical import TECHNICAL_FEATURE_COLUMNS
 from core.models.profitability_runtime import generate_profitability_alpha_prediction
 from core.models.two_stage import TwoStageAlphaModel, TwoStageConfig
+from core.training.bybit_pit_panel import BybitPITFeatureSource
 from core.providers.bybit_public_pit import BybitPublicPITStore
 from core.providers.coinmetrics_stablecoin_pit import (
     CoinMetricsStablecoinPITStore,
@@ -392,6 +393,52 @@ def test_runtime_uses_fresh_symbol_specific_bybit_pit_features(tmp_path):
     )
     assert wrong_symbol["status"] == "blocked"
     assert "fresh symbol-specific" in wrong_symbol["reason"]
+
+
+def test_runtime_replay_can_freeze_bybit_observation_watermarks(tmp_path):
+    database = tmp_path / "frozen-bybit.sqlite3"
+    store = BybitPublicPITStore(database)
+    decision_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    store.append_feature(
+        event_id="first-book",
+        symbol="BTCUSDT",
+        name="orderbook_spread_bps",
+        value=2.5,
+        unit="bps",
+        event_time=decision_at - timedelta(seconds=2),
+        received_at=decision_at - timedelta(seconds=1),
+        source="bybit.public.orderbook",
+        quality=1.0,
+    )
+    source = BybitPITFeatureSource(database)
+    maximum_sequence, maximum_invalidation_rowid = source.snapshot_watermarks()
+    store.append_feature(
+        event_id="late-imported-book",
+        symbol="BTCUSDT",
+        name="orderbook_spread_bps",
+        value=9.5,
+        unit="bps",
+        event_time=decision_at - timedelta(milliseconds=500),
+        received_at=decision_at - timedelta(milliseconds=250),
+        source="bybit.public.orderbook",
+        quality=1.0,
+    )
+    store.flush()
+
+    frozen, evidence = source.latest(
+        "BTCUSDT",
+        ["orderbook_spread_bps"],
+        decision_at=decision_at,
+        maximum_sequence=maximum_sequence,
+        maximum_invalidation_rowid=maximum_invalidation_rowid,
+    )
+    current, _ = source.latest(
+        "BTCUSDT", ["orderbook_spread_bps"], decision_at=decision_at
+    )
+
+    assert frozen["orderbook_spread_bps"] == 2.5
+    assert current["orderbook_spread_bps"] == 9.5
+    assert evidence["snapshot_maximum_sequence"] == maximum_sequence
 
 
 def test_runtime_loads_verified_macro_and_flow_pit_features(tmp_path):
