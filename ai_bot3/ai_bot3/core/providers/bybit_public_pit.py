@@ -207,6 +207,47 @@ class BybitPublicPITStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_bybit_api_response_batch
                     ON bybit_historical_api_responses(batch_id,response_id);
+                CREATE TABLE IF NOT EXISTS bybit_live_capture_audits(
+                    audit_id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    snapshot_maximum_raw_sequence INTEGER NOT NULL,
+                    snapshot_maximum_feature_sequence INTEGER NOT NULL,
+                    snapshot_maximum_invalidation_rowid INTEGER NOT NULL,
+                    first_received_at TEXT NOT NULL,
+                    last_received_at TEXT NOT NULL,
+                    maximum_gap_sec REAL NOT NULL,
+                    raw_event_count INTEGER NOT NULL,
+                    symbols_json TEXT NOT NULL,
+                    topic_counts_json TEXT NOT NULL,
+                    event_type_counts_json TEXT NOT NULL,
+                    interval_count INTEGER NOT NULL,
+                    longest_interval_sec REAL NOT NULL,
+                    manifest_sha256 TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    error TEXT
+                );
+                CREATE TABLE IF NOT EXISTS bybit_live_capture_intervals(
+                    audit_id TEXT NOT NULL,
+                    interval_index INTEGER NOT NULL,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT NOT NULL,
+                    raw_event_count INTEGER NOT NULL,
+                    PRIMARY KEY(audit_id,interval_index),
+                    FOREIGN KEY(audit_id) REFERENCES bybit_live_capture_audits(audit_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_bybit_live_capture_interval
+                    ON bybit_live_capture_intervals(started_at,ended_at,audit_id);
+                CREATE TABLE IF NOT EXISTS bybit_pit_imports(
+                    import_id TEXT PRIMARY KEY,
+                    imported_at TEXT NOT NULL,
+                    source_database TEXT NOT NULL,
+                    source_audit_id TEXT NOT NULL,
+                    selection_json TEXT NOT NULL,
+                    source_counts_json TEXT NOT NULL,
+                    inserted_counts_json TEXT NOT NULL,
+                    manifest_sha256 TEXT NOT NULL,
+                    status TEXT NOT NULL
+                );
                 """
             )
             feature_columns = {

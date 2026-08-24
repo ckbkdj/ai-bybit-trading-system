@@ -98,6 +98,13 @@ SHORT_FACTOR_COLLECTION_EVIDENCE: Mapping[str, Mapping[str, object]] = {
         ),
     }
 }
+SHORT_FACTOR_LIVE_TOPIC_PREFIXES: Mapping[str, tuple[str, ...]] = {
+    "bybit_orderbook": ("orderbook.",),
+    "public_trades": ("publicTrade.", "orderbook."),
+    "basis_funding_oi": ("tickers.",),
+    "liquidations": ("allLiquidation.",),
+    "execution_quality": ("orderbook.",),
+}
 LEGACY_FACTOR_GROUPS: Mapping[str, tuple[str, ...]] = {
     "legacy_brain_technical": LEGACY_BRAIN_FEATURE_COLUMNS,
 }
@@ -1555,6 +1562,7 @@ def _evaluate_bybit_pit_ablation(
 
     results: dict[str, dict[str, object]] = {}
     coverage = dict(source_evidence.get("feature_coverage") or {})
+    live_capture_audits = list(source_evidence.get("live_capture_audits") or [])
     for group, columns in factor_groups.items():
         collection_evidence = dict(
             SHORT_FACTOR_COLLECTION_EVIDENCE.get(group) or {}
@@ -1576,7 +1584,88 @@ def _evaluate_bybit_pit_ablation(
             if isinstance(item, Mapping)
         ]
         minimum_observed_days = min(observed_days) if observed_days else 0.0
-        if missing_contracts or minimum_observed_days < minimum_history_days:
+        completed_source_days = [
+            int(item.get("longest_consecutive_completed_days", 0))
+            for item in required_coverage
+            if isinstance(item, Mapping)
+        ]
+        minimum_consecutive_completed_days = (
+            min(completed_source_days) if completed_source_days else 0
+        )
+        required_topic_prefixes = SHORT_FACTOR_LIVE_TOPIC_PREFIXES.get(group, ())
+        qualifying_live_audits: list[dict[str, object]] = []
+        for raw_audit in live_capture_audits:
+            if not isinstance(raw_audit, Mapping):
+                continue
+            audit = dict(raw_audit)
+            audit_symbols = {str(value).upper() for value in audit.get("symbols", [])}
+            topic_counts = {
+                str(topic): int(count)
+                for topic, count in dict(audit.get("topic_counts") or {}).items()
+            }
+            topic_contracts_complete = all(
+                any(
+                    topic.startswith(prefix)
+                    and topic.endswith(f".{symbol}")
+                    and count > 0
+                    for topic, count in topic_counts.items()
+                )
+                for symbol in SYMBOLS
+                for prefix in required_topic_prefixes
+            )
+            continuous_days = float(audit.get("longest_interval_sec", 0.0)) / 86_400.0
+            intervals = [
+                item
+                for item in list(audit.get("intervals") or [])
+                if isinstance(item, Mapping)
+            ]
+            audited_feature_overlap_complete = all(
+                any(
+                    (
+                        min(
+                            pd.Timestamp(item["end"]),
+                            pd.Timestamp(interval["ended_at"]),
+                        )
+                        - max(
+                            pd.Timestamp(item["start"]),
+                            pd.Timestamp(interval["started_at"]),
+                        )
+                    ).total_seconds()
+                    / 86_400.0
+                    >= minimum_history_days
+                    for interval in intervals
+                )
+                for item in required_coverage
+                if isinstance(item, Mapping)
+            )
+            if (
+                str(audit.get("status")) == "completed"
+                and set(SYMBOLS).issubset(audit_symbols)
+                and topic_contracts_complete
+                and audited_feature_overlap_complete
+                and float(audit.get("maximum_gap_sec", math.inf)) <= 90.0
+                and continuous_days >= minimum_history_days
+            ):
+                audit["continuous_coverage_days"] = continuous_days
+                qualifying_live_audits.append(audit)
+        live_capture_continuity_complete = bool(qualifying_live_audits)
+        daily_manifest_continuity_complete = bool(
+            completed_source_days
+            and minimum_consecutive_completed_days >= math.ceil(minimum_history_days)
+        )
+        continuity_complete = (
+            live_capture_continuity_complete
+            if group == "liquidations"
+            else (
+                daily_manifest_continuity_complete
+                or live_capture_continuity_complete
+            )
+        )
+        if (
+            missing_contracts
+            or minimum_observed_days < minimum_history_days
+            or not continuity_complete
+        ):
             results[group] = {
                 "cadence": "short",
                 "factor_group": group,
@@ -1593,6 +1682,19 @@ def _evaluate_bybit_pit_ablation(
                 "formal_feature_set": False,
                 "minimum_required_history_days": minimum_history_days,
                 "minimum_observed_history_days": minimum_observed_days,
+                "minimum_consecutive_completed_source_days": (
+                    minimum_consecutive_completed_days
+                ),
+                "daily_manifest_continuity_complete": (
+                    daily_manifest_continuity_complete
+                ),
+                "live_capture_continuity_complete": (
+                    live_capture_continuity_complete
+                ),
+                "qualifying_live_capture_audit_ids": [
+                    str(item["audit_id"]) for item in qualifying_live_audits
+                ],
+                "required_live_topic_prefixes": list(required_topic_prefixes),
                 "missing_symbol_feature_contracts": missing_contracts,
                 "collection_evidence": collection_evidence,
             }
@@ -1733,6 +1835,20 @@ def _evaluate_bybit_pit_ablation(
                 "oos_fold_count": len(baseline_folds),
                 "retained": False,
                 "formal_feature_set": False,
+                "minimum_required_history_days": minimum_history_days,
+                "minimum_observed_history_days": minimum_observed_days,
+                "minimum_consecutive_completed_source_days": (
+                    minimum_consecutive_completed_days
+                ),
+                "daily_manifest_continuity_complete": (
+                    daily_manifest_continuity_complete
+                ),
+                "live_capture_continuity_complete": (
+                    live_capture_continuity_complete
+                ),
+                "qualifying_live_capture_audit_ids": [
+                    str(item["audit_id"]) for item in qualifying_live_audits
+                ],
                 "collection_evidence": collection_evidence,
                 "folds": fold_evidence,
             }
@@ -1744,7 +1860,23 @@ def _evaluate_bybit_pit_ablation(
             fold_evidence=fold_evidence,
             baseline_folds=baseline_folds,
             augmented_folds=augmented_folds,
-            extra={"collection_evidence": collection_evidence},
+            extra={
+                "collection_evidence": collection_evidence,
+                "minimum_required_history_days": minimum_history_days,
+                "minimum_observed_history_days": minimum_observed_days,
+                "minimum_consecutive_completed_source_days": (
+                    minimum_consecutive_completed_days
+                ),
+                "daily_manifest_continuity_complete": (
+                    daily_manifest_continuity_complete
+                ),
+                "live_capture_continuity_complete": (
+                    live_capture_continuity_complete
+                ),
+                "qualifying_live_capture_audit_ids": [
+                    str(item["audit_id"]) for item in qualifying_live_audits
+                ],
+            },
         )
         if insufficient_execution is not None:
             results[group] = insufficient_execution
@@ -1764,6 +1896,20 @@ def _evaluate_bybit_pit_ablation(
             "factors": list(columns),
             "oos_ablation_status": "EVALUATED_OOS",
             "evaluated": True,
+            "minimum_required_history_days": minimum_history_days,
+            "minimum_observed_history_days": minimum_observed_days,
+            "minimum_consecutive_completed_source_days": (
+                minimum_consecutive_completed_days
+            ),
+            "daily_manifest_continuity_complete": (
+                daily_manifest_continuity_complete
+            ),
+            "live_capture_continuity_complete": (
+                live_capture_continuity_complete
+            ),
+            "qualifying_live_capture_audit_ids": [
+                str(item["audit_id"]) for item in qualifying_live_audits
+            ],
             "pit_observation_count": sum(
                 int(item.get("test_rows", 0)) for item in fold_evidence
             ),

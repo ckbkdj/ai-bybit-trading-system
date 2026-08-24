@@ -19,7 +19,10 @@
 ```mermaid
 flowchart TD
     A[旧线上 K 线与 Brain 逻辑<br/>只读复用] --> B[因果技术特征]
-    C[Bybit 公共 WS / 官方 archive / 官方 REST] --> D[Bybit PIT SQLite<br/>event / available / ingested / hash]
+    C[Bybit 公共 WS] --> CA[实时采集 PIT 库<br/>public-only / append-only]
+    CA --> CB[停机后哈希与连续区间审计<br/>只迁移 sealed liquidation evidence]
+    CC[Bybit 官方 archive / 官方 REST] --> D[development PIT 研究库<br/>逐日 manifest / response SHA]
+    CB --> D
     E[参考 data_service canonical + baseline<br/>PASS before/after SHA + 只追加白名单 + 30h lag] --> F[跨资产 PIT returns]
     G[FRED / ALFRED 官方 API<br/>output 4 初值 + output 3 修订] --> H[宏观 vintage PIT SQLite<br/>原始响应哈希]
     AE[美联储 FOMC 官方新闻索引 + 声明正文<br/>页面明确发布时间] --> H
@@ -104,6 +107,10 @@ flowchart TD
 | execution quality | 真实盘口状态派生 | fill probability、expected slippage；没有盘口证据时不得用 OHLCV 猜测代替 |
 
 liquidation 是 forward-only 证据：Bybit 当前公开 `allLiquidation.{symbol}` 只提供 500ms 实时 WS，V5 Market REST 没有公共历史爆仓接口。必须持续采满预先锁定的 180 天；不得用 OHLCV、成交量尖峰或第三方未审计聚合值回填。
+
+覆盖跨度不等于连续性。orderbook/trades/derivatives 由每个 UTC 日的 completed 官方 archive/API manifest 证明，门禁取最短连续完成日数；liquidation 由停机后逐条验证 payload SHA 的 WS 审计证明，原始活动流按最多 90 秒间断切分，门禁取最长连续区间。运行中的 session、只存在首末爆仓事件、或首尾相隔 180 天但中间没有收据，均不能进入 OOS 消融。
+
+实时采集库与历史研究库物理分离。`core/providers/bybit_capture_audit.py` 先把停止后的 capture journal 封成不可变 audit，再以 append-only、冲突即失败的方式仅迁移 liquidation 原始事件、v2 特征、失效记录、session 和连续区间收据；archive/orderbook/trades/API 历史仍留在 development 仓。导入收据保存选择水位、源/新增计数和逻辑 manifest SHA，重复导入必须为零新增。
 
 ### 5.3 中长周期跨资产
 
@@ -213,7 +220,7 @@ stateDiagram-v2
 仍需继续降低的耦合：
 
 - `core/evaluation/profitability_rebuild.py` 目前同时编排标签、因子消融、训练、回测和报告，是主要 orchestration hotspot；行为稳定后应拆成 dataset、ablation、development、lockbox 四个 runner。
-- SQLite 同库同时承担 live capture 和大规模 archive replay 会放大 WAL/锁竞争；产品化应采用采集库与研究快照库分离，再用只读 snapshot/backup 交接。
+- SQLite 同库同时承担 live capture 和大规模 archive replay 会放大 WAL/锁竞争；现已采用采集库与研究库分离，并通过已封存水位的最小化 append-only liquidation evidence import 交接。后续仍应把该交接放入独立作业队列，避免与 archive/API writer 并发。
 - 外部参考 panel 的 2GB 级 SHA 全量校验成本较高；应保留 SHA 门禁，同时增加已验证 artifact receipt/cache，不降低校验标准。
 
 ## 10. 现阶段明确不成立的结论

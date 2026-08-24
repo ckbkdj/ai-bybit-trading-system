@@ -183,6 +183,35 @@ python scripts/backfill_bybit_historical_archive.py `
 - 任何 ret_code、HTTP、分页或 chronology 失败都会使 batch failed；
 - liquidation 不从 OHLCV/REST 伪造。
 
+### 6.1 连续性审计与爆仓证据交接
+
+`feature_coverage.start/end` 只说明首末观测跨度，不能证明中间没有断流。正式短周期消融还必须满足：
+
+- orderbook/trades/funding/OI/basis：每个 symbol-feature 至少 180 个连续 UTC 日都有 `completed` 官方 archive/API manifest；
+- live 因子：封存的原始 WS 日志在 90 秒断流阈值下至少形成 180 天连续区间，并且 5 个 symbol 的所需 topic 都有原始事件；
+- liquidation：只能使用后一种 forward-only WS 连续性证据；事件本身可以稀疏，不能把“某天无爆仓”误判成断流，也不能只看第一笔和最后一笔爆仓；
+- 运行中的 session 不可封存，不可进入 release evidence。
+
+满 180 天后先正常停止 public-only collector，确认没有 `status=running` 的 session，再做逐条 payload SHA 审计：
+
+```powershell
+python scripts/audit_bybit_live_capture.py `
+  --database data/bybit_public_pit.sqlite3 `
+  --maximum-gap-sec 90 `
+  --report model_results/evaluation/bybit_live_capture_audit_report.json
+```
+
+历史 archive/API 与实时 capture 保持物理分库。待 archive 和 derivatives backfill 全部停止后，只把已封存的 liquidation 原始事件、v2 特征、失效记录、session 和连续区间收据追加进 development 仓：
+
+```powershell
+python scripts/merge_bybit_liquidation_capture.py `
+  --source data/bybit_public_pit.sqlite3 `
+  --destination data/bybit_public_pit.prelockbox.sqlite3 `
+  --report model_results/evaluation/bybit_liquidation_capture_import_report.json
+```
+
+合并是幂等的：同一内容重复运行新增数为 0；同 ID 异内容立即失败。它不复制数 GB 无关 live orderbook/trades，也不删除或覆盖任一来源库。禁止在 archive/derivatives writer 仍写 destination 时运行。
+
 ## 7. SQLite WAL 安全恢复
 
 ### 7.1 何时处理

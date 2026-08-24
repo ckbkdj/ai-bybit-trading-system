@@ -46,6 +46,34 @@ BYBIT_FEATURE_ALLOWED_SOURCES: Mapping[str, tuple[str, ...]] = {
 }
 
 
+def _completed_day_continuity(values: Sequence[object]) -> dict[str, object]:
+    days = sorted({pd.Timestamp(value).date() for value in values})
+    if not days:
+        return {
+            "completed_source_day_count": 0,
+            "longest_consecutive_completed_days": 0,
+            "completed_source_day_ratio": 0.0,
+            "missing_source_day_count": 0,
+        }
+    longest = 1
+    current = 1
+    for prior, following in zip(days, days[1:]):
+        if (following - prior).days == 1:
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 1
+    calendar_days = (days[-1] - days[0]).days + 1
+    return {
+        "completed_source_day_count": len(days),
+        "longest_consecutive_completed_days": longest,
+        "completed_source_day_ratio": float(len(days) / calendar_days),
+        "missing_source_day_count": int(calendar_days - len(days)),
+        "first_completed_source_day": days[0].isoformat(),
+        "last_completed_source_day": days[-1].isoformat(),
+    }
+
+
 class BybitPITFeatureSource:
     """Read symbol-partitioned Bybit observations with strict as-of joins."""
 
@@ -399,6 +427,7 @@ class BybitPITFeatureSource:
             frame["provenance_kind"] == "historical_archive_replay"
         ].copy()
         archive_provenance: list[dict[str, object]] = []
+        by_id: dict[str, dict[str, object]] = {}
         if not archive_frame.empty:
             if archive_frame["archive_id"].isna().any():
                 raise RuntimeError("historical archive feature has no archive_id")
@@ -435,6 +464,7 @@ class BybitPITFeatureSource:
         api_frame = frame[frame["provenance_kind"] == "historical_api_replay"].copy()
         api_provenance: list[dict[str, object]] = []
         api_response_provenance: list[dict[str, object]] = []
+        api_by_id: dict[str, dict[str, object]] = {}
         if not api_frame.empty:
             if api_frame["api_batch_id"].isna().any():
                 raise RuntimeError("historical API feature has no api_batch_id")
@@ -509,15 +539,90 @@ class BybitPITFeatureSource:
         )
         rejected_low_quality_count = int((~accepted_quality).sum())
         frame = frame.loc[accepted_quality].copy()
+        live_capture_audits: list[dict[str, object]] = []
+        pit_imports: list[dict[str, object]] = []
+        with closing(self._connect()) as connection:
+            audit_table = connection.execute(
+                """SELECT 1 FROM sqlite_master
+                     WHERE type='table' AND name='bybit_live_capture_audits'"""
+            ).fetchone()
+            if audit_table:
+                audit_rows = connection.execute(
+                    """SELECT audit_id,created_at,snapshot_maximum_raw_sequence,
+                              snapshot_maximum_feature_sequence,
+                              snapshot_maximum_invalidation_rowid,first_received_at,
+                              last_received_at,maximum_gap_sec,raw_event_count,
+                              symbols_json,topic_counts_json,event_type_counts_json,
+                              interval_count,longest_interval_sec,manifest_sha256,status,error
+                         FROM bybit_live_capture_audits
+                        WHERE status='completed'
+                        ORDER BY created_at,audit_id"""
+                ).fetchall()
+                for audit_row in audit_rows:
+                    record = dict(audit_row)
+                    interval_rows = connection.execute(
+                        """SELECT interval_index,started_at,ended_at,raw_event_count
+                             FROM bybit_live_capture_intervals
+                            WHERE audit_id=? ORDER BY interval_index""",
+                        (record["audit_id"],),
+                    ).fetchall()
+                    if len(interval_rows) != int(record["interval_count"]):
+                        raise RuntimeError("live capture audit interval count mismatch")
+                    intervals = [dict(row) for row in interval_rows]
+                    if any(
+                        pd.Timestamp(item["started_at"]) > pd.Timestamp(item["ended_at"])
+                        for item in intervals
+                    ):
+                        raise RuntimeError("live capture audit interval chronology failed")
+                    record["symbols"] = json.loads(str(record.pop("symbols_json")))
+                    record["topic_counts"] = json.loads(
+                        str(record.pop("topic_counts_json"))
+                    )
+                    record["event_type_counts"] = json.loads(
+                        str(record.pop("event_type_counts_json"))
+                    )
+                    record["intervals"] = intervals
+                    live_capture_audits.append(record)
+            import_table = connection.execute(
+                """SELECT 1 FROM sqlite_master
+                     WHERE type='table' AND name='bybit_pit_imports'"""
+            ).fetchone()
+            if import_table:
+                for import_row in connection.execute(
+                    """SELECT import_id,imported_at,source_database,source_audit_id,
+                              selection_json,source_counts_json,inserted_counts_json,
+                              manifest_sha256,status
+                         FROM bybit_pit_imports WHERE status='completed'
+                         ORDER BY imported_at,import_id"""
+                ).fetchall():
+                    record = dict(import_row)
+                    for key in ("selection", "source_counts", "inserted_counts"):
+                        record[key] = json.loads(str(record.pop(f"{key}_json")))
+                    pit_imports.append(record)
         coverage: dict[str, object] = {}
         for (symbol, name), group in frame.groupby(["symbol", "name"], sort=True):
             start = group["available_at"].min()
             end = group["available_at"].max()
+            completed_days: list[object] = []
+            for archive_id in group["archive_id"].dropna().astype(str).unique():
+                if archive_id in by_id:
+                    completed_days.append(by_id[archive_id]["trading_date"])
+            for api_batch_id in group["api_batch_id"].dropna().astype(str).unique():
+                if api_batch_id in api_by_id:
+                    completed_days.append(api_by_id[api_batch_id]["trading_date"])
+            ordered_available = group["available_at"].sort_values()
+            maximum_observation_gap_sec = (
+                float(ordered_available.diff().dt.total_seconds().max())
+                if len(ordered_available) > 1
+                else None
+            )
             coverage[f"{symbol}:{name}"] = {
                 "observations": len(group),
                 "start": start.isoformat().replace("+00:00", "Z"),
                 "end": end.isoformat().replace("+00:00", "Z"),
                 "coverage_days": float((end - start).total_seconds() / 86_400.0),
+                "maximum_observation_gap_sec": maximum_observation_gap_sec,
+                **_completed_day_continuity(completed_days),
                 "maximum_age_sec": self.registry.require(str(name)).maximum_age_sec,
             }
         return frame, {
@@ -554,6 +659,10 @@ class BybitPITFeatureSource:
                 if api_provenance
                 else None
             ),
+            "live_capture_audits": live_capture_audits,
+            "live_capture_audit_count": len(live_capture_audits),
+            "pit_imports": pit_imports,
+            "pit_import_count": len(pit_imports),
             "snapshot_maximum_sequence": frozen_sequence,
             "snapshot_maximum_invalidation_rowid": frozen_invalidation_rowid,
             "minimum_decision_at": sql_timestamp(decision_minimum),
