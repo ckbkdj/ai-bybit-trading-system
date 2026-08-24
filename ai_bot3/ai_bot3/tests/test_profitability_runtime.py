@@ -219,6 +219,32 @@ def test_rejected_shadow_bundle_runs_real_alpha_but_cannot_be_actionable(tmp_pat
     assert alpha["feature_evidence"]["feature_snapshot_sha256"]
 
 
+def test_runtime_cannot_re_date_stale_price_frame_with_a_later_cutoff(tmp_path):
+    market = _market_frame()
+    observed = market.index[-1].to_pydatetime()
+    bundle = _bundle(tmp_path)
+
+    exact = generate_profitability_alpha_prediction(
+        market,
+        symbol="BTCUSDT",
+        mode="scalping",
+        latest_decision_at=observed,
+        model_bundle_path=bundle,
+    )
+    re_dated = generate_profitability_alpha_prediction(
+        market,
+        symbol="BTCUSDT",
+        mode="scalping",
+        latest_decision_at=observed + timedelta(minutes=3),
+        model_bundle_path=bundle,
+    )
+
+    assert exact["status"] == "ok", exact.get("reason")
+    assert re_dated["status"] == "blocked"
+    assert "cannot re-date stale price data" in re_dated["reason"]
+    assert re_dated["actionable"] is False
+
+
 def test_bybit_trained_bundle_rejects_cross_venue_runtime_prices(tmp_path):
     bundle = _bundle(tmp_path)
     payload = json.loads(bundle.read_text(encoding="utf-8"))

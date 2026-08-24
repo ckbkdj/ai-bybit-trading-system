@@ -95,9 +95,12 @@ def _decision_times(frame: pd.DataFrame, latest_decision_at: Any | None) -> pd.S
         raise ValueError("alpha inference frame must be chronological")
     if latest_decision_at is not None:
         latest = _utc(latest_decision_at)
-        if latest < values.iloc[-1].to_pydatetime().astimezone(timezone.utc):
-            raise ValueError("declared data cutoff precedes the last feature row")
-        values.iloc[-1] = pd.Timestamp(latest)
+        observed = values.iloc[-1].to_pydatetime().astimezone(timezone.utc)
+        if latest != observed:
+            raise ValueError(
+                "declared data cutoff must equal the last observed price timestamp; "
+                "runtime cannot re-date stale price data"
+            )
     return values
 
 
