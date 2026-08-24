@@ -357,6 +357,8 @@ runtime 会为新 Alpha 独立抓取 Bybit public linear last-trade Kline，不�
 
 外部面板查询的 as-of 同样取新 Alpha Bybit frame 的最后观测时间，不取旧 Binance 展示 frame。盈利报告、14 份必需证据报告及 candidate manifest 的内容和哈希会在每次候选出票前重新验证；服务启动后任何证据文件发生替换、缺失或语义退化，已有内存授权立即失效，预测进入 rejected lineage，不能继续出票。
 
+出票时的 feature age 不是直接信任 Alpha 在推理开始时保存的 `age_seconds`，而是由 `ResultManager` 使用本次原子保存时间减 Bybit `last_observed_at` 重新计算。真实年龄超过票据策略的 120 秒上限时，即使仍低于对应 K 线周期的采集 freshness 上限，也不能进入候选 active book 或形成 OperationTicket。
+
 ## 9. 报告阅读顺序
 
 按以下顺序审阅：

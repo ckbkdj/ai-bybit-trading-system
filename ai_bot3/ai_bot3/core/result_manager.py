@@ -339,6 +339,8 @@ class ResultManager:
             or observed_age_seconds is None
             or observed_age_seconds < 0
             or observed_age_seconds > expected_maximum_age
+            or observed_age_seconds
+            > self.ticket_builder.policy.config.max_feature_age_sec
             or observed_span_seconds is None
             or not math.isclose(
                 observed_span_seconds,

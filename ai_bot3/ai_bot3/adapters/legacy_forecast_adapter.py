@@ -206,11 +206,11 @@ class LegacyForecastAdapter:
         ).lower()
         if calibration_status not in {"valid", "degraded", "invalid", "unknown"}:
             calibration_status = "degraded"
-        feature_age = (
-            price_path.get("age_seconds")
-            if alpha_qualified
-            else legacy.get("current_price_age_seconds")
-        )
+        if alpha_qualified:
+            saved_at = _timestamp(legacy.get("saved_at"), generated_at)
+            feature_age = max(0.0, (saved_at - data_cutoff).total_seconds())
+        else:
+            feature_age = legacy.get("current_price_age_seconds")
         feature_age_sec = int(_float(feature_age, 2_147_483_647)) if feature_age is not None else 2_147_483_647
         range_guard_value = (
             alpha.get("range_guard_score")

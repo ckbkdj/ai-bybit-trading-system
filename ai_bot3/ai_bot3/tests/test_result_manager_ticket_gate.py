@@ -487,6 +487,7 @@ def test_candidate_ticket_rejects_malformed_edge_or_runtime_price_contract():
         "infinite_interval",
         "invalid_generated_at",
         "future_observation",
+        "delayed_result",
         "broken_observation_span",
         "nonfinite_last_price",
         "invalid_range_guard",
@@ -536,6 +537,18 @@ def test_candidate_ticket_rejects_malformed_edge_or_runtime_price_contract():
                 far_alpha["feature_evidence"]["price_path"][
                     "last_observed_at"
                 ] = _iso(datetime.now(timezone.utc) + timedelta(days=1))
+            elif defect == "delayed_result":
+                last_observed_at = datetime.now(timezone.utc) - timedelta(
+                    minutes=5
+                )
+                price_path = far_alpha["feature_evidence"]["price_path"]
+                price_path["last_observed_at"] = _iso(last_observed_at)
+                price_path["first_observed_at"] = _iso(
+                    last_observed_at - timedelta(seconds=99 * 900)
+                )
+                # This is the age captured before an artificial queue delay.
+                # Authorization must use saved_at - last_observed_at instead.
+                price_path["age_seconds"] = 5.0
             elif defect == "broken_observation_span":
                 far_alpha["feature_evidence"]["price_path"][
                     "first_observed_at"
