@@ -94,9 +94,9 @@ flowchart TB
 | public trades、OFI、CVD | Bybit 官方 public trades 历史归档和实时流 | 交易时可见；主动买卖流 | 官方归档回放与实时采集已实现并用真实文件验算；正式多币种覆盖和消融未完成 |
 | basis、funding、OI、liquidations | Bybit 官方 funding/OI/mark/index 历史接口；实时 liquidation 流；本地 Coinglass wrapper 只作补充 | 使用交易所事件时间和保守 available_at | funding/OI/basis 历史回放已实现并真实验算；liquidation 无官方历史 REST，正式组仍不完整且未进入正式集 |
 | fill probability、slippage | Bybit 私有 ExecutionReceipt + 同时刻盘口；shadow/testnet 成交样本 | 只使用当时可得盘口与后续成交标签 | 历史盘口可计算 top-5 深度扫单完成比例和 VWAP 滑点，但它不是排队成交概率；真实 fill/partial fill 仍缺 shadow/testnet 回执证据 |
-| SPY、QQQ、VIX | 正规证券行情源 | 美股交易时段和发布延迟对齐 | 缺统一 PIT 历史，未进入正式集 |
-| TLT、real yield、UUP | 证券行情 + FRED/ALFRED vintage | 利率和美元环境；宏观值按 vintage | 缺完整 vintage，未进入正式集 |
-| GLD、USO、XLV、IBB、FXI、KWEB、COIN、MSTR | 正规证券行情源 | 跨资产收益按市场收盘/可用时间对齐 | 缺统一 PIT 历史，未进入正式集 |
+| SPY、QQQ、VIX | 参考数据服务基础价格 + FRED VIX vintage | 美股交易时段和发布延迟对齐 | SPY/QQQ 已通过 baseline→canonical 追加式修订审计，VIX 走独立 PIT 仓；只可进入真实 OOS 消融，尚未因稳定增益进入正式集 |
+| TLT、real yield、UUP | 参考数据服务基础价格 + FRED/ALFRED vintage | 利率和美元环境；宏观值按 vintage | TLT/UUP 使用同一追加式价格契约，real yield 走独立 PIT 仓；正式保留仍取决于完整逐组 OOS 消融 |
+| GLD、USO、XLV、IBB、FXI、KWEB、COIN、MSTR | 参考数据服务显式白名单基础价格 | 跨资产收益按市场收盘/可用时间对齐 | 12 个训练标的合计核验 12,574 个历史重叠价格、24 个仅向后新增价格、0 改写、0 旧日期回填；全面板衍生列不受信任，正式保留仍取决于费用后 OOS 消融 |
 | ETF/stablecoin flows | 可审计 ETF 流量和链上/交易所净流数据 | 以官方发布日期或区块确认后的 available_at 为准 | 缺完整 PIT 历史，未进入正式集 |
 | FRED/ALFRED vintage | FRED/ALFRED | 禁止用最终修订值回填历史 | 未接入完整 vintage |
 | Tier A 重大事件 | 分级事件库；官方日历/公告优先 | 记录 published_at、available_at、事件级别 | 当前历史不足，未进入正式集 |

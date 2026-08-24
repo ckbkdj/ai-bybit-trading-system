@@ -8,6 +8,11 @@ from typing import Mapping, Sequence
 
 import pandas as pd
 
+from core.providers.trad_panel_contract import (
+    configured_panel_path,
+    load_revision_controlled_prices,
+)
+
 
 TRAD_PANEL_INSTRUMENTS: Mapping[str, str] = {
     "spy_return": "SPY.US",
@@ -64,6 +69,8 @@ class TradPanelHistorySource:
         self.availability_lag = availability_lag
         self.maximum_age = maximum_age
         self.verify_sha256 = verify_sha256
+        if not verify_sha256:
+            raise ValueError("external market-price hashes may not be disabled")
         if availability_lag < timedelta(hours=24):
             raise ValueError("daily external prices require at least a 24-hour PIT lag")
         if maximum_age <= timedelta(0):
@@ -73,16 +80,19 @@ class TradPanelHistorySource:
 
     @property
     def panel_path(self) -> Path:
-        relative = Path("data/canonical/panel.parquet")
-        config = self.root / "config" / "service.json"
-        try:
-            payload = json.loads(config.read_text(encoding="utf-8"))
-            configured = payload.get("TRAD_SERVICE_CANONICAL_PANEL")
-            if configured:
-                relative = Path(str(configured))
-        except (OSError, ValueError, TypeError):
-            pass
-        return relative.resolve() if relative.is_absolute() else (self.root / relative).resolve()
+        return configured_panel_path(
+            self.root,
+            config_key="TRAD_SERVICE_CANONICAL_PANEL",
+            default_relative="data/canonical/panel.parquet",
+        )
+
+    @property
+    def baseline_path(self) -> Path:
+        return configured_panel_path(
+            self.root,
+            config_key="TRAD_SERVICE_BASELINE_PANEL",
+            default_relative="data/baseline/panel.parquet",
+        )
 
     def _latest_pass(self) -> dict[str, object]:
         records: list[tuple[pd.Timestamp, dict[str, object]]] = []
@@ -104,36 +114,27 @@ class TradPanelHistorySource:
         return max(records, key=lambda item: item[0])[1]
 
     def load(self) -> tuple[pd.DataFrame, dict[str, object]]:
-        try:
-            import pyarrow.dataset as ds
-        except ImportError as exc:  # pragma: no cover
-            raise RuntimeError("pyarrow is required for external PIT factor history") from exc
         panel = self.panel_path
         if not panel.is_file():
             raise FileNotFoundError(panel)
+        baseline = self.baseline_path
+        if not baseline.is_file():
+            raise FileNotFoundError(baseline)
         receipt = self._latest_pass()
         expected_sha = str(receipt.get("canonical_sha_after") or "")
-        actual_sha = _sha256(panel) if self.verify_sha256 else None
+        actual_sha = _sha256(panel)
+        baseline_sha = _sha256(baseline)
         if self.verify_sha256 and (not expected_sha or actual_sha != expected_sha):
             raise RuntimeError("canonical panel hash does not match its latest PASS receipt")
-        dataset = ds.dataset(str(panel), format="parquet")
-        required = {"symbol", "ts", "close"}
-        if missing := sorted(required.difference(dataset.schema.names)):
-            raise RuntimeError(f"canonical panel missing columns: {missing}")
         symbols = sorted(set(self.instruments.values()))
-        table = dataset.to_table(
-            columns=["symbol", "ts", "close"],
-            filter=ds.field("symbol").isin(symbols),
+        raw, revision_evidence = load_revision_controlled_prices(
+            self.root,
+            canonical_path=panel,
+            receipt=receipt,
+            canonical_sha256=actual_sha,
+            baseline_sha256=baseline_sha,
+            symbols=symbols,
         )
-        raw = table.to_pandas()
-        raw["ts"] = pd.to_datetime(raw["ts"], utc=True, errors="coerce")
-        raw["close"] = pd.to_numeric(raw["close"], errors="coerce")
-        raw = raw.dropna(subset=["symbol", "ts", "close"])
-        raw = raw[raw["close"] > 0].copy()
-        conflicts = raw.groupby(["symbol", "ts"])["close"].nunique()
-        if (conflicts > 1).any():
-            raise RuntimeError("external panel contains conflicting base prices")
-        raw = raw.drop_duplicates(["symbol", "ts"], keep="last")
         wide = raw.pivot(index="ts", columns="symbol", values="close").sort_index()
         history = pd.DataFrame(index=wide.index)
         missing_symbols: list[str] = []
@@ -150,9 +151,11 @@ class TradPanelHistorySource:
             "source": "trad_data_service.canonical_panel",
             "panel_path": str(panel),
             "latest_pass_run_id": receipt.get("run_id"),
-            "canonical_sha256": expected_sha,
-            "hash_verified": self.verify_sha256,
-            "selection_policy": "explicit_symbol_allowlist_base_prices_only",
+            "canonical_sha256": actual_sha,
+            "hash_verified": True,
+            "selection_policy": (
+                "explicit_symbol_allowlist_base_prices_only_append_only_revision_controlled"
+            ),
             "availability_lag_seconds": int(self.availability_lag.total_seconds()),
             "maximum_age_seconds": int(self.maximum_age.total_seconds()),
             "row_count": len(history),
@@ -162,6 +165,7 @@ class TradPanelHistorySource:
                 "available_at=panel_ts+conservative_daily_release_lag;"
                 "reject_if_decision_at-available_at>maximum_age"
             ),
+            "revision_control": revision_evidence,
         }
         return history, evidence
 

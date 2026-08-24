@@ -227,6 +227,13 @@ def _external_context(decision_at: datetime, *, status: str = "ok", age_days: in
             "hash_verified": True,
             "latest_pass_run_id": "pass-run",
             "canonical_sha_from_receipt": "a" * 64,
+            "revision_control": {
+                "baseline_sha256": "b" * 64,
+                "receipt_predecessor_hash_verified": True,
+                "append_only_revision_verified": True,
+                "scoped_base_price_audit_status": "PASS",
+                "external_derived_columns_trusted": False,
+            },
             "features": {"cross_asset_spy_ret_1d": 0.01},
         },
     }
@@ -276,6 +283,18 @@ def test_runtime_requires_fresh_healthy_external_panel_only_when_in_contract(tmp
     )
     assert stale["status"] == "blocked"
     assert "external panel is stale" in stale["reason"]
+
+    unversioned_context = _external_context(decision_at)
+    del unversioned_context["data"]["revision_control"]
+    unversioned = generate_profitability_alpha_prediction(
+        market,
+        symbol="BTCUSDT",
+        mode="scalping",
+        model_bundle_path=external_bundle,
+        external_panel_context=unversioned_context,
+    )
+    assert unversioned["status"] == "blocked"
+    assert "revision-control evidence is missing" in unversioned["reason"]
 
 
 def test_runtime_fails_closed_when_horizon_model_is_modified(tmp_path):

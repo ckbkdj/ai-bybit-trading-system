@@ -122,6 +122,17 @@ def _external_values(
         raise ValueError("external panel is stale at the inference cutoff")
     if data.get("hash_verified") is not True:
         raise ValueError("external panel hash is not verified")
+    revision_control = data.get("revision_control")
+    if not isinstance(revision_control, Mapping):
+        raise ValueError("external panel revision-control evidence is missing")
+    if revision_control.get("receipt_predecessor_hash_verified") is not True:
+        raise ValueError("external panel predecessor hash is not verified")
+    if revision_control.get("append_only_revision_verified") is not True:
+        raise ValueError("external panel history is not append-only verified")
+    if revision_control.get("scoped_base_price_audit_status") != "PASS":
+        raise ValueError("external base-price quality audit did not pass")
+    if revision_control.get("external_derived_columns_trusted") is not False:
+        raise ValueError("external panel derived-column exclusion is not proven")
     raw = data.get("features")
     if not isinstance(raw, Mapping):
         raise ValueError("external panel feature payload is missing")
@@ -138,6 +149,10 @@ def _external_values(
         "latest_pass_run_id": data.get("latest_pass_run_id"),
         "canonical_sha256": data.get("canonical_sha_from_receipt"),
         "hash_verified": True,
+        "baseline_sha256": revision_control.get("baseline_sha256"),
+        "receipt_predecessor_hash_verified": True,
+        "append_only_revision_verified": True,
+        "scoped_base_price_audit_status": "PASS",
         "age_seconds": age.total_seconds(),
         "maximum_age_seconds": MAX_EXTERNAL_PANEL_AGE.total_seconds(),
     }

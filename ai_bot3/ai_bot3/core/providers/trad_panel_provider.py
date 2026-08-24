@@ -7,6 +7,9 @@ execution feed.  This adapter therefore has deliberately narrow behaviour:
   ``asset_family``); none of the thousands of precomputed factors are trusted;
 * instruments are selected by an explicit symbol allow-list because historical
   ``asset_family`` labels are not stable enough to be a trading contract;
+* canonical and predecessor baseline hashes are bound to one successful
+  promotion receipt, and allow-listed history must be append-only;
+* a SHA-bound quality audit is re-read and scoped to panel keys/base prices;
 * observations are delayed before they become available to prevent look-ahead;
 * the result is always marked shadow-only until a separate PIT/OOS ablation has
   approved these columns for model training and live fusion.
@@ -26,6 +29,11 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
 from .base import Provider, ProviderResult, ProviderStatus
+from .trad_panel_contract import (
+    configured_panel_path,
+    load_revision_controlled_prices,
+    verify_scoped_base_price_audit,
+)
 
 
 DEFAULT_INSTRUMENTS: Dict[str, str] = {
@@ -101,28 +109,38 @@ class TradPanelProvider(Provider[Dict[str, Any]]):
         self.availability_lag = availability_lag
         self.instruments = dict(instruments or DEFAULT_INSTRUMENTS)
         self.verify_sha256 = (
-            str(os.getenv("TRAD_PANEL_VERIFY_SHA256", "false")).strip().lower()
+            str(os.getenv("TRAD_PANEL_VERIFY_SHA256", "true")).strip().lower()
             in {"1", "true", "yes", "on"}
             if verify_sha256 is None
             else bool(verify_sha256)
         )
+        if not self.verify_sha256:
+            raise ValueError("external market-price hashes may not be disabled")
         self.stale_after = stale_after
-        self._rows_cache: tuple[tuple[int, int], list[Dict[str, Any]]] | None = None
+        self._rows_cache: (
+            tuple[tuple[int, int, int, int], list[Dict[str, Any]]] | None
+        ) = None
         self._verified_hash_cache: tuple[tuple[int, int], str] | None = None
+        self._verified_baseline_hash_cache: tuple[tuple[int, int], str] | None = None
+        self._revision_evidence_cache: (
+            tuple[tuple[int, int, int, int], Dict[str, Any]] | None
+        ) = None
 
     @property
     def panel_path(self) -> Path:
-        config_path = self.root / "config" / "service.json"
-        relative = Path("data/canonical/panel.parquet")
-        try:
-            payload = json.loads(config_path.read_text(encoding="utf-8"))
-            configured = payload.get("TRAD_SERVICE_CANONICAL_PANEL")
-            if configured:
-                candidate = Path(str(configured))
-                relative = candidate if not candidate.is_absolute() else candidate
-        except (OSError, ValueError, TypeError):
-            pass
-        return relative.resolve() if relative.is_absolute() else (self.root / relative).resolve()
+        return configured_panel_path(
+            self.root,
+            config_key="TRAD_SERVICE_CANONICAL_PANEL",
+            default_relative="data/canonical/panel.parquet",
+        )
+
+    @property
+    def baseline_path(self) -> Path:
+        return configured_panel_path(
+            self.root,
+            config_key="TRAD_SERVICE_BASELINE_PANEL",
+            default_relative="data/baseline/panel.parquet",
+        )
 
     @property
     def runs_dir(self) -> Path:
@@ -146,29 +164,48 @@ class TradPanelProvider(Provider[Dict[str, Any]]):
         passed = [payload for _, payload in records if payload.get("status") == "PASS"]
         return PanelRunState(latest=latest, latest_pass=passed[-1] if passed else None)
 
-    def _read_rows(self, cutoff: datetime) -> list[Dict[str, Any]]:
-        try:
-            import pyarrow.dataset as ds
-        except ImportError as exc:  # pragma: no cover - exercised on minimal installs
-            raise RuntimeError("pyarrow is required for TRAD_DATA_SERVICE_ROOT") from exc
-
+    def _read_rows(
+        self,
+        cutoff: datetime,
+        *,
+        receipt: Dict[str, Any],
+        canonical_sha256: str,
+        baseline_sha256: str,
+    ) -> tuple[list[Dict[str, Any]], Dict[str, Any]]:
         panel_stat = self.panel_path.stat()
-        fingerprint = (int(panel_stat.st_mtime_ns), int(panel_stat.st_size))
+        baseline_stat = self.baseline_path.stat()
+        fingerprint = (
+            int(panel_stat.st_mtime_ns),
+            int(panel_stat.st_size),
+            int(baseline_stat.st_mtime_ns),
+            int(baseline_stat.st_size),
+        )
         if self._rows_cache is not None and self._rows_cache[0] == fingerprint:
-            return [row for row in self._rows_cache[1] if row["observed_at"] <= cutoff]
+            evidence = (
+                dict(self._revision_evidence_cache[1])
+                if self._revision_evidence_cache is not None
+                else {}
+            )
+            evidence.update(
+                verify_scoped_base_price_audit(self.root, canonical_sha256)
+            )
+            return (
+                [row for row in self._rows_cache[1] if row["observed_at"] <= cutoff],
+                evidence,
+            )
 
-        dataset = ds.dataset(str(self.panel_path), format="parquet")
-        required = {"symbol", "ts", "close", "asset_family"}
-        missing = sorted(required.difference(dataset.schema.names))
-        if missing:
-            raise RuntimeError(f"canonical panel missing columns: {missing}")
         symbols = sorted(set(self.instruments.values()))
-        table = dataset.to_table(
-            columns=["symbol", "ts", "close", "asset_family"],
-            filter=ds.field("symbol").isin(symbols),
+        prices, revision_evidence = load_revision_controlled_prices(
+            self.root,
+            canonical_path=self.panel_path,
+            receipt=receipt,
+            canonical_sha256=canonical_sha256,
+            baseline_sha256=baseline_sha256,
+            symbols=symbols,
+            extra_columns=("asset_family",),
         )
         rows = []
-        for row in table.to_pylist():
+        for row in prices.to_dict(orient="records"):
             observed_at = _parse_time(row.get("ts"))
             if observed_at is None:
                 continue
@@ -185,7 +222,11 @@ class TradPanelProvider(Provider[Dict[str, Any]]):
                 "asset_family": str(row.get("asset_family") or ""),
             })
         self._rows_cache = (fingerprint, rows)
-        return [row for row in rows if row["observed_at"] <= cutoff]
+        self._revision_evidence_cache = (fingerprint, dict(revision_evidence))
+        return (
+            [row for row in rows if row["observed_at"] <= cutoff],
+            dict(revision_evidence),
+        )
 
     @staticmethod
     def _series_by_symbol(rows: Iterable[Dict[str, Any]]) -> Dict[str, list[Dict[str, Any]]]:
@@ -213,26 +254,51 @@ class TradPanelProvider(Provider[Dict[str, Any]]):
             panel = self.panel_path
             if not panel.is_file():
                 raise RuntimeError(f"canonical panel not found: {panel}")
+            baseline = self.baseline_path
+            if not baseline.is_file():
+                raise RuntimeError(f"baseline panel not found: {baseline}")
             run_state = self.inspect_runs()
             if run_state.latest_pass is None:
                 raise RuntimeError("no successful promotion receipt found")
 
             expected_sha = str(run_state.latest_pass.get("canonical_sha_after") or "")
-            if self.verify_sha256:
-                if not expected_sha:
-                    raise RuntimeError("latest PASS receipt has no canonical_sha_after")
-                stat = panel.stat()
-                fingerprint = (int(stat.st_mtime_ns), int(stat.st_size))
-                if (
-                    self._verified_hash_cache is not None
-                    and self._verified_hash_cache[0] == fingerprint
-                ):
-                    actual_sha = self._verified_hash_cache[1]
-                else:
-                    actual_sha = _sha256(panel)
-                    self._verified_hash_cache = (fingerprint, actual_sha)
-                if actual_sha != expected_sha:
-                    raise RuntimeError("canonical panel hash does not match latest PASS receipt")
+            if not expected_sha:
+                raise RuntimeError("latest PASS receipt has no canonical_sha_after")
+            stat = panel.stat()
+            fingerprint = (int(stat.st_mtime_ns), int(stat.st_size))
+            if (
+                self._verified_hash_cache is not None
+                and self._verified_hash_cache[0] == fingerprint
+            ):
+                actual_sha = self._verified_hash_cache[1]
+            else:
+                actual_sha = _sha256(panel)
+                self._verified_hash_cache = (fingerprint, actual_sha)
+            if actual_sha != expected_sha:
+                raise RuntimeError("canonical panel hash does not match latest PASS receipt")
+            baseline_stat = baseline.stat()
+            baseline_fingerprint = (
+                int(baseline_stat.st_mtime_ns),
+                int(baseline_stat.st_size),
+            )
+            if (
+                self._verified_baseline_hash_cache is not None
+                and self._verified_baseline_hash_cache[0] == baseline_fingerprint
+            ):
+                baseline_sha = self._verified_baseline_hash_cache[1]
+            else:
+                baseline_sha = _sha256(baseline)
+                self._verified_baseline_hash_cache = (
+                    baseline_fingerprint,
+                    baseline_sha,
+                )
+            expected_baseline_sha = str(
+                run_state.latest_pass.get("canonical_sha_before") or ""
+            )
+            if not expected_baseline_sha or baseline_sha != expected_baseline_sha:
+                raise RuntimeError(
+                    "baseline panel hash does not match the PASS receipt predecessor"
+                )
 
             status = ProviderStatus.OK
             latest = run_state.latest
@@ -244,7 +310,12 @@ class TradPanelProvider(Provider[Dict[str, Any]]):
                 if latest.get("canonical_sha_after") not in (None, "", expected_sha):
                     raise RuntimeError("failed run reports an unexpected canonical hash")
 
-            rows = self._read_rows(cutoff)
+            rows, revision_evidence = self._read_rows(
+                cutoff,
+                receipt=run_state.latest_pass,
+                canonical_sha256=actual_sha,
+                baseline_sha256=baseline_sha,
+            )
             grouped = self._series_by_symbol(rows)
             features: Dict[str, float] = {}
             observations: Dict[str, str] = {}
@@ -290,8 +361,11 @@ class TradPanelProvider(Provider[Dict[str, Any]]):
                 "latest_run_id": latest.get("run_id") if latest else None,
                 "latest_pass_run_id": run_state.latest_pass.get("run_id"),
                 "canonical_sha_from_receipt": expected_sha,
-                "hash_verified": self.verify_sha256,
-                "selection_policy": "explicit_symbol_allowlist",
+                "hash_verified": True,
+                "selection_policy": (
+                    "explicit_symbol_allowlist_base_prices_only_append_only_revision_controlled"
+                ),
+                "revision_control": revision_evidence,
                 "fusion_eligible": False,
                 "fusion_blocker": "shadow_only_pending_pit_oos_ablation",
             }

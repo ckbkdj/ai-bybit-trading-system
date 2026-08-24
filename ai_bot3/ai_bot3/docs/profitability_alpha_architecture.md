@@ -20,7 +20,7 @@
 flowchart TD
     A[旧线上 K 线与 Brain 逻辑<br/>只读复用] --> B[因果技术特征]
     C[Bybit 公共 WS / 官方 archive / 官方 REST] --> D[Bybit PIT SQLite<br/>event / available / ingested / hash]
-    E[参考 data_service canonical panel<br/>PASS SHA + 显式资产白名单 + 30h lag] --> F[跨资产 PIT returns]
+    E[参考 data_service canonical + baseline<br/>PASS before/after SHA + 只追加白名单 + 30h lag] --> F[跨资产 PIT returns]
     G[FRED / ALFRED 官方 API<br/>output 4 初值 + output 3 修订] --> H[宏观 vintage PIT SQLite<br/>原始响应哈希]
     AE[美联储 FOMC 官方新闻索引 + 声明正文<br/>页面明确发布时间] --> H
     AC[Coin Metrics Community API<br/>USDC + USDT SplyCur] --> AD[稳定币发行 flow PIT SQLite<br/>48h lag + 原始响应哈希]
@@ -104,7 +104,7 @@ flowchart TD
 
 ### 5.3 中长周期跨资产
 
-参考服务仅接纳 canonical panel 中显式白名单的基础价格，并核验最近一次 PASS SHA：
+参考服务仅接纳 canonical panel 中显式白名单的基础价格。接入时同时核验最近一次 PASS 收据的 `canonical_sha_before`/`canonical_sha_after`、baseline/canonical 文件哈希，并逐行证明允许标的只追加新日期、没有改写或回填旧价格：
 
 - SPY、QQQ；
 - TLT、UUP；
@@ -113,7 +113,7 @@ flowchart TD
 - FXI、KWEB；
 - COIN、MSTR。
 
-日频值使用 30 小时保守可用延迟。当前值、公式衍生列、无 PIT 的 MCP 列不得回填历史。
+日频值使用 30 小时保守可用延迟。当前值、公式衍生列、无 PIT 的 MCP 列不得回填历史。SHA 绑定的全面板审计可以因为未使用的衍生列而失败，但 `symbol/ts/close` 范围内出现任何问题都会失败关闭；运行时还会重新读取该审计，不能靠进程缓存绕过后来新增的问题。价格水平不作为模型输入，只生成相邻市场收盘收益。
 
 ### 5.4 FRED / ALFRED vintage
 

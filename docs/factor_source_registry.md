@@ -18,7 +18,7 @@
 | LLM 辅助 | 结构化 score、summary | 配置中的内网 OpenAI-compatible/Qwen 端点 | 请求只携带结构化快照；失败返回中性 | 仅为辅助因子，不能单独出票、调仓、绕过风险门禁 |
 | 在线校准 | bias、scale、adaptive threshold、direction confidence | `online_learning.sqlite3` 中已到期预测 | 只有 settled 样本达到 min_samples 才是 `valid` | 现在会显式输出 `valid/insufficient_samples/disabled`；没有 valid 就不出票 |
 | range guard | scaler 空间训练范围违例率与最大超界 | 当前 LSTM 输入和训练期 scaler | 每次推理 | 不再误称 OOD；它只是范围报警。缺 scaler 或非有限值时失败关闭 |
-| 跨资产影子上下文 | SPY/QQQ/TLT/GLD/USO/UUP/GBTC/COIN 的 1/5/20 日收益 | `D:\lh\trad_data_service_20260821\data_service\data\canonical\panel.parquet`，只读四列 | `ts <= as_of-30h`，并校验最后 PASS 发布收据 SHA | 已真实跑通但 `fusion_eligible=false`；只做研究/影子记录，不影响方向或出票 |
+| 跨资产影子上下文 | SPY/QQQ/TLT/UUP/GLD/USO/XLV/IBB/FXI/KWEB/COIN/MSTR（运行时另观察 GBTC）的 1/5/20 日收益 | `D:\lh\trad_data_service_20260821\data_service` 的 canonical + baseline，只读 `symbol/ts/close/asset_family` | `ts <= as_of-30h`；PASS before/after SHA；允许标的逐行只追加；SHA 绑定基础价格范围审计 | 真实核验 12 个训练标的 12,574 个重叠价格、24 个新增价格、0 改写、0 历史回填；全面板 19 个未使用衍生列问题仍记为 FAIL，基础价格子契约 PASS。最新更新任务 BLOCKED，因此实时结果为 degraded，正式签名若要求该组就必须 NO_TRADE |
 | Bybit 执行快照 | mark/bid/ask、instrument rules、账户、仓位、订单、fill、服务器时钟 | Bybit V5 公共与私有接口 | 决策前/执行中实时核对 | 是最终执行真值；Binance 只是预测市场，短周期必须有 basis 证据 |
 
 ## 已实现计算，但尚未证明为在线生产输入

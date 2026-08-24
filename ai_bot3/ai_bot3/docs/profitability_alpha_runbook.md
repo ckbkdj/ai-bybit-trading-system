@@ -216,6 +216,8 @@ python -c "import sqlite3; c=sqlite3.connect(r'data/bybit_public_pit.sqlite3', t
 
 在 development 阶段接入真实跨资产和 macro PIT；Bybit 历史未完整前可先省略 `--bybit-pit-store` 做中长周期研究，但短周期因子组会失败关闭：
 
+`--trad-panel-root` 不是“给一个 Parquet 就接受”。该根目录必须同时具有 canonical、baseline、最近 PASS 发布收据和匹配 canonical SHA 的质量审计；before/after 哈希不一致、允许标的历史价格改写、旧日期回填或基础价格审计问题都会直接终止实验。当前参考服务最近一次更新任务为 `BLOCKED`，所以实时 provider 保持 `degraded`；即使某个正式模型将来保留跨资产组，运行时也会返回 `NO_TRADE`，直到数据服务恢复健康更新。
+
 ```powershell
 python scripts/run_profitability_rebuild.py `
   --trad-panel-root D:\lh\trad_data_service_20260821\data_service `
