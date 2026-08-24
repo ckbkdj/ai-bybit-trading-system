@@ -108,6 +108,37 @@ def _release_evidence_fixture(name: str) -> dict[str, object]:
                 "alternative_models_scored": False,
             },
         }
+    if name == "nested_cv_report.json":
+        return {
+            "status": "PASSED",
+            "complete": True,
+            "outer_oos_used_for_tuning": False,
+        }
+    if name == "signal_funnel_report.json":
+        return {
+            "status": "PASSED",
+            "complete": True,
+            "development": {
+                "status": "PASSED",
+                "zero_signal_or_trade_result_accepted": False,
+            },
+            "lockbox": {
+                "status": "PASSED",
+                "zero_signal_or_trade_result_accepted": False,
+            },
+        }
+    if name == "intratrade_drawdown_report.json":
+        scope = {
+            "status": "PASSED",
+            "mark_to_market_used": True,
+            "equity_observation_count": 10,
+        }
+        return {
+            "status": "PASSED",
+            "complete": True,
+            "development": scope,
+            "lockbox": scope,
+        }
     return {"report": name}
 
 

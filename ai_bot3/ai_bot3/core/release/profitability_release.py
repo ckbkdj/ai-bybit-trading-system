@@ -21,6 +21,9 @@ REQUIRED_EVIDENCE_REPORTS = (
     "missing_intervals_report.json",
     "independent_timestamp_count_report.json",
     "calibration_coverage_report.json",
+    "nested_cv_report.json",
+    "signal_funnel_report.json",
+    "intratrade_drawdown_report.json",
 )
 
 
@@ -38,6 +41,9 @@ def _evidence_semantic_failure(name: str, path: Path) -> str | None:
         "missing_intervals_report.json",
         "independent_timestamp_count_report.json",
         "calibration_coverage_report.json",
+        "nested_cv_report.json",
+        "signal_funnel_report.json",
+        "intratrade_drawdown_report.json",
     }:
         return None
     try:
@@ -86,6 +92,38 @@ def _evidence_semantic_failure(name: str, path: Path) -> str | None:
             lockbox.get("alternative_models_scored")
         ):
             return "lockbox_calibration_policy_violated"
+    elif name == "nested_cv_report.json":
+        if payload.get("status") != "PASSED" or not bool(payload.get("complete")):
+            return "nested_cv_incomplete"
+        if payload.get("outer_oos_used_for_tuning") is not False:
+            return "outer_oos_used_for_tuning"
+    elif name == "signal_funnel_report.json":
+        development = payload.get("development")
+        lockbox = payload.get("lockbox")
+        if payload.get("status") != "PASSED" or not bool(payload.get("complete")):
+            return "signal_funnel_incomplete"
+        if not isinstance(development, Mapping) or not isinstance(lockbox, Mapping):
+            return "signal_funnel_scopes_missing"
+        if development.get("status") != "PASSED" or lockbox.get("status") != "PASSED":
+            return "zero_signal_or_trade_evidence"
+        if bool(development.get("zero_signal_or_trade_result_accepted")) or bool(
+            lockbox.get("zero_signal_or_trade_result_accepted")
+        ):
+            return "zero_signal_or_trade_policy_violated"
+    elif name == "intratrade_drawdown_report.json":
+        development = payload.get("development")
+        lockbox = payload.get("lockbox")
+        if payload.get("status") != "PASSED" or not bool(payload.get("complete")):
+            return "intratrade_drawdown_incomplete"
+        if not isinstance(development, Mapping) or not isinstance(lockbox, Mapping):
+            return "intratrade_drawdown_scopes_missing"
+        for scope, evidence in (("development", development), ("lockbox", lockbox)):
+            if evidence.get("status") != "PASSED":
+                return f"{scope}_intratrade_drawdown_failed"
+            if not bool(evidence.get("mark_to_market_used")) or int(
+                evidence.get("equity_observation_count", 0)
+            ) <= 0:
+                return f"{scope}_mark_to_market_incomplete"
     return None
 
 

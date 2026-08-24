@@ -26,6 +26,11 @@ from core.evaluation.calibration_coverage import (
     directional_calibration_rows,
     evaluate_quantile_coverage,
 )
+from core.evaluation.release_evidence import (
+    intratrade_drawdown_evidence,
+    nested_cv_evidence,
+    signal_funnel_evidence,
+)
 from core.evaluation.statistical_governance import (
     TrialLedger,
     TrialRecord,
@@ -3328,6 +3333,16 @@ class ProfitabilityRebuild:
             calibration_coverage_evidence=development_calibration_evidence,
             thresholds=ProfitabilityThresholds(),
         )
+        development_nested_cv_evidence = nested_cv_evidence(walk_forward)
+        development_signal_funnel_evidence = signal_funnel_evidence(
+            eligible_walk_forward,
+            development_report,
+            scope="development_outer_oos",
+        )
+        development_intratrade_drawdown_evidence = intratrade_drawdown_evidence(
+            development_report,
+            scope="development_outer_oos",
+        )
         oos_timestamp_evidence = {}
         for horizon in HORIZONS_SEC:
             timestamps = pd.to_datetime(
@@ -3382,6 +3397,38 @@ class ProfitabilityRebuild:
                     "status": "SEALED_NOT_OPENED",
                     "used_for_calibration_or_tuning": False,
                 },
+            },
+        )
+        _atomic_json(
+            output / "nested_cv_report.json",
+            {
+                "trial_id": self.trial_id,
+                "code_commit": self.config.code_commit,
+                **development_nested_cv_evidence,
+            },
+        )
+        _atomic_json(
+            output / "signal_funnel_report.json",
+            {
+                "schema_version": "profitability-signal-funnel.v1",
+                "trial_id": self.trial_id,
+                "code_commit": self.config.code_commit,
+                "status": "LOCKBOX_NOT_EVALUATED",
+                "complete": False,
+                "development": development_signal_funnel_evidence,
+                "lockbox": {"status": "SEALED_NOT_OPENED"},
+            },
+        )
+        _atomic_json(
+            output / "intratrade_drawdown_report.json",
+            {
+                "schema_version": "profitability-intratrade-drawdown.v1",
+                "trial_id": self.trial_id,
+                "code_commit": self.config.code_commit,
+                "status": "LOCKBOX_NOT_EVALUATED",
+                "complete": False,
+                "development": development_intratrade_drawdown_evidence,
+                "lockbox": {"status": "SEALED_NOT_OPENED"},
             },
         )
         _atomic_json(
@@ -3723,6 +3770,7 @@ class ProfitabilityRebuild:
         lockbox_calibration_rows_by_horizon: dict[
             int, list[dict[str, object]]
         ] = {horizon: [] for horizon in development_eligible_horizons}
+        lockbox_prediction_gates_by_horizon: dict[int, dict[str, object]] = {}
         lockbox_bybit_evidence_by_horizon: dict[int, dict[str, object]] = {}
         for horizon in development_eligible_horizons:
             lockbox_parts: list[pd.DataFrame] = []
@@ -3880,6 +3928,15 @@ class ProfitabilityRebuild:
                 lockbox_panel
             )
             lockbox_predictions = final_models[horizon].predict(lockbox_panel)
+            lockbox_prediction_gates_by_horizon[horizon] = (
+                prediction_gate_diagnostics(
+                    lockbox_panel,
+                    lockbox_predictions,
+                    meta_threshold=final_models[
+                        horizon
+                    ].config.meta_trade_probability,
+                )
+            )
             horizon_signals = _signals_from_predictions(
                 lockbox_panel, lockbox_predictions, horizon
             )
@@ -4012,6 +4069,31 @@ class ProfitabilityRebuild:
         ]
         lockbox_report = backtest.run(lockbox_signals, market)
         stressed_report = backtest.run(lockbox_signals, market, cost_multiplier=2.0)
+        lockbox_signal_funnel_inputs = [
+            {
+                "horizon_sec": horizon,
+                "fold_id": "single_use_lockbox",
+                "prediction_gate": lockbox_prediction_gates_by_horizon.get(
+                    horizon, {}
+                ),
+                "signals": len(lockbox_signals_by_horizon[horizon]),
+                "trades": len(
+                    horizon_lockbox_reports.get(horizon, {})
+                    .get("normal_cost", {})
+                    .get("trades", [])
+                ),
+            }
+            for horizon in development_eligible_horizons
+        ]
+        lockbox_signal_funnel_evidence = signal_funnel_evidence(
+            lockbox_signal_funnel_inputs,
+            lockbox_report,
+            scope="single_use_lockbox",
+        )
+        lockbox_intratrade_drawdown_evidence = intratrade_drawdown_evidence(
+            lockbox_report,
+            scope="single_use_lockbox",
+        )
         lockbox_execution_evidence = _execution_release_evidence(lockbox_report)
         lockbox_candidate_execution_evidence_complete = bool(
             lockbox_execution_evidence[
@@ -4088,6 +4170,38 @@ class ProfitabilityRebuild:
                     "used_for_calibration_or_tuning": False,
                     "alternative_models_scored": False,
                 },
+            },
+        )
+        signal_funnel_complete = bool(
+            development_signal_funnel_evidence.get("status") == "PASSED"
+            and lockbox_signal_funnel_evidence.get("status") == "PASSED"
+        )
+        _atomic_json(
+            output / "signal_funnel_report.json",
+            {
+                "schema_version": "profitability-signal-funnel.v1",
+                "trial_id": self.trial_id,
+                "code_commit": self.config.code_commit,
+                "status": "PASSED" if signal_funnel_complete else "FAILED",
+                "complete": signal_funnel_complete,
+                "development": development_signal_funnel_evidence,
+                "lockbox": lockbox_signal_funnel_evidence,
+            },
+        )
+        intratrade_drawdown_complete = bool(
+            development_intratrade_drawdown_evidence.get("status") == "PASSED"
+            and lockbox_intratrade_drawdown_evidence.get("status") == "PASSED"
+        )
+        _atomic_json(
+            output / "intratrade_drawdown_report.json",
+            {
+                "schema_version": "profitability-intratrade-drawdown.v1",
+                "trial_id": self.trial_id,
+                "code_commit": self.config.code_commit,
+                "status": "PASSED" if intratrade_drawdown_complete else "FAILED",
+                "complete": intratrade_drawdown_complete,
+                "development": development_intratrade_drawdown_evidence,
+                "lockbox": lockbox_intratrade_drawdown_evidence,
             },
         )
         _atomic_json(
@@ -4274,6 +4388,9 @@ class ProfitabilityRebuild:
                         "missing_intervals_report.json",
                         "independent_timestamp_count_report.json",
                         "calibration_coverage_report.json",
+                        "nested_cv_report.json",
+                        "signal_funnel_report.json",
+                        "intratrade_drawdown_report.json",
                     )
                 },
             )
@@ -4374,6 +4491,39 @@ def write_failed_outputs(output_dir: Path, *, reason: str) -> ProfitabilityGateR
                     "used_for_calibration_or_tuning": False,
                     "alternative_models_scored": False,
                 },
+            },
+        ),
+        (
+            "nested_cv_report.json",
+            {
+                "schema_version": "profitability-nested-cv.v1",
+                "status": "FAILED",
+                "complete": False,
+                "reason": reason,
+                "outer_oos_used_for_tuning": False,
+                "folds": [],
+            },
+        ),
+        (
+            "signal_funnel_report.json",
+            {
+                "schema_version": "profitability-signal-funnel.v1",
+                "status": "FAILED",
+                "complete": False,
+                "reason": reason,
+                "development": {"status": "INCOMPLETE"},
+                "lockbox": {"status": "SEALED_NOT_OPENED"},
+            },
+        ),
+        (
+            "intratrade_drawdown_report.json",
+            {
+                "schema_version": "profitability-intratrade-drawdown.v1",
+                "status": "FAILED",
+                "complete": False,
+                "reason": reason,
+                "development": {"status": "INCOMPLETE"},
+                "lockbox": {"status": "SEALED_NOT_OPENED"},
             },
         ),
     ):
