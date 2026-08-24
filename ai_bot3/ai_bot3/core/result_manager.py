@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional
 import asyncio
 
 from adapters.legacy_forecast_adapter import LegacyForecastAdapter
+from contracts.horizons import horizon_for_mode
 from core.control_plane import ControlPlaneRepository
 from core.decision.ticket_builder import TicketBuilder
 from core.release.profitability_release import verify_candidate_authorization
@@ -197,7 +198,9 @@ class ResultManager:
                 self.candidate_release_manifest_path.read_text(encoding="utf-8")
             )
 
-    def _brain_authorized_for_ticket(self, prediction: Dict[str, Any]) -> bool:
+    def _brain_authorized_for_ticket(
+        self, prediction: Dict[str, Any], mode: str
+    ) -> bool:
         # Name retained for compatibility; authorization now belongs to the
         # two-stage profitability model. Brain is always a rejected baseline.
         if self.required_brain_release_stage == "live":
@@ -212,6 +215,12 @@ class ResultManager:
         if str(alpha.get("release_stage")) != "candidate":
             return False
         if str(alpha.get("profitability_gate")) != "PASSED":
+            return False
+        try:
+            expected_horizon = horizon_for_mode(mode)
+            if int(alpha.get("horizon_sec")) != expected_horizon:
+                return False
+        except (TypeError, ValueError):
             return False
         if float(alpha.get("lower_bound_net_edge_bps") or 0.0) <= 0:
             return False
@@ -228,6 +237,11 @@ class ResultManager:
             or price_path.get("runtime_price_source")
             != "bybit_linear_last_trade_kline"
             or price_path.get("same_venue") is not True
+            or price_path.get("continuous") is not True
+            or price_path.get("ohlcv_contract_valid") is not True
+            or int(price_path.get("observed_bar_count") or 0) < 49
+            or int(price_path.get("interval_sec") or 0) != expected_horizon
+            or price_path.get("candidate_freshness_verified") is not True
         ):
             return False
         if not self.profitability_authorized or not self.profitability_manifest:
@@ -270,7 +284,9 @@ class ResultManager:
             await asyncio.to_thread(self.control_plane.publish, forecast, None)
             ticket = None
             portfolio_intent = None
-            if self.tickets_enabled and self._brain_authorized_for_ticket(normalized):
+            if self.tickets_enabled and self._brain_authorized_for_ticket(
+                normalized, mode
+            ):
                 reference_price = (
                     normalized.get("current_price")
                     or normalized.get("kline_last_price")

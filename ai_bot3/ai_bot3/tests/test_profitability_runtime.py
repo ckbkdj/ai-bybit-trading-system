@@ -245,6 +245,60 @@ def test_runtime_cannot_re_date_stale_price_frame_with_a_later_cutoff(tmp_path):
     assert re_dated["actionable"] is False
 
 
+def test_runtime_rechecks_price_continuity_and_ohlcv_contract(tmp_path):
+    bundle = _bundle(tmp_path)
+    market = _market_frame()
+    discontinuous = market.drop(market.index[-10]).copy()
+    invalid_ohlcv = market.copy()
+    invalid_ohlcv.loc[invalid_ohlcv.index[-1], "high"] = (
+        invalid_ohlcv.loc[invalid_ohlcv.index[-1], "close"] * 0.5
+    )
+
+    gap_result = generate_profitability_alpha_prediction(
+        discontinuous,
+        symbol="BTCUSDT",
+        mode="scalping",
+        model_bundle_path=bundle,
+    )
+    ohlcv_result = generate_profitability_alpha_prediction(
+        invalid_ohlcv,
+        symbol="BTCUSDT",
+        mode="scalping",
+        model_bundle_path=bundle,
+    )
+
+    assert gap_result["status"] == "blocked"
+    assert "discontinuous" in gap_result["reason"]
+    assert ohlcv_result["status"] == "blocked"
+    assert "OHLCV market-data contract" in ohlcv_result["reason"]
+
+
+def test_candidate_runtime_rejects_an_old_price_frame_at_model_boundary(tmp_path):
+    bundle = _bundle(tmp_path)
+    payload = json.loads(bundle.read_text(encoding="utf-8"))
+    payload.update(
+        {
+            "kline_source": "bybit",
+            "release_stage": "candidate",
+            "profitability_gate": "PASSED",
+            "approved_horizons": [180],
+        }
+    )
+    bundle.write_text(json.dumps(payload), encoding="utf-8")
+
+    alpha = generate_profitability_alpha_prediction(
+        _market_frame(datetime(2025, 1, 1, tzinfo=timezone.utc)),
+        symbol="BTCUSDT",
+        mode="scalping",
+        input_price_source="bybit_linear_last_trade_kline",
+        model_bundle_path=bundle,
+    )
+
+    assert alpha["status"] == "blocked"
+    assert "stale or future-dated" in alpha["reason"]
+    assert alpha["actionable"] is False
+
+
 def test_bybit_trained_bundle_rejects_cross_venue_runtime_prices(tmp_path):
     bundle = _bundle(tmp_path)
     payload = json.loads(bundle.read_text(encoding="utf-8"))
@@ -270,12 +324,15 @@ def test_bybit_trained_bundle_rejects_cross_venue_runtime_prices(tmp_path):
     assert mismatched["status"] == "blocked"
     assert "requires a fresh Bybit" in mismatched["reason"]
     assert verified["status"] == "ok"
-    assert verified["feature_evidence"]["price_path"] == {
-        "status": "verified",
-        "training_kline_source": "bybit",
-        "runtime_price_source": "bybit_linear_last_trade_kline",
-        "same_venue": True,
-    }
+    evidence = verified["feature_evidence"]["price_path"]
+    assert evidence["status"] == "verified"
+    assert evidence["training_kline_source"] == "bybit"
+    assert evidence["runtime_price_source"] == "bybit_linear_last_trade_kline"
+    assert evidence["same_venue"] is True
+    assert evidence["continuous"] is True
+    assert evidence["ohlcv_contract_valid"] is True
+    assert evidence["interval_sec"] == 180
+    assert evidence["observed_bar_count"] == len(market)
 
 
 def _external_context(decision_at: datetime, *, status: str = "ok", age_days: int = 1):

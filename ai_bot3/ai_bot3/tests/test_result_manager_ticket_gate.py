@@ -250,7 +250,12 @@ def _prediction(stage: str, release_id: str = "sr_result_gate_test_001") -> dict
     }
 
 
-def _authorized_alpha(manifest: dict, release_id: str = "sr_result_gate_test_001") -> dict:
+def _authorized_alpha(
+    manifest: dict,
+    release_id: str = "sr_result_gate_test_001",
+    *,
+    horizon_sec: int,
+) -> dict:
     return {
         "model_family": "profitability_two_stage",
         "model_bundle_id": "profitability-two-stage-test",
@@ -260,6 +265,7 @@ def _authorized_alpha(manifest: dict, release_id: str = "sr_result_gate_test_001
         "lockbox_fingerprint": manifest["lockbox_fingerprint"],
         "profitability_gate": "PASSED",
         "release_stage": "candidate",
+        "horizon_sec": horizon_sec,
         "decision": "TRADE",
         "actionable": True,
         "direction": "long",
@@ -276,6 +282,11 @@ def _authorized_alpha(manifest: dict, release_id: str = "sr_result_gate_test_001
                 "training_kline_source": "bybit",
                 "runtime_price_source": "bybit_linear_last_trade_kline",
                 "same_venue": True,
+                "continuous": True,
+                "ohlcv_contract_valid": True,
+                "observed_bar_count": 100,
+                "interval_sec": horizon_sec,
+                "candidate_freshness_verified": True,
             }
         },
         "return_quantiles_bps": {
@@ -413,13 +424,47 @@ def test_verified_profitability_release_can_create_candidate_ticket_only():
             candidate_release_manifest_path=manifest_path,
         )
         near = _prediction("rejected")
-        near["alpha_prediction"] = _authorized_alpha(manifest)
+        near["alpha_prediction"] = _authorized_alpha(manifest, horizon_sec=180)
         far = _prediction("rejected")
-        far["alpha_prediction"] = _authorized_alpha(manifest)
+        far["alpha_prediction"] = _authorized_alpha(manifest, horizon_sec=900)
         asyncio.run(manager.save_result("BTCUSDT", "scalping", near))
         assert _counts(db) == (1, 0)
         asyncio.run(manager.save_result("BTCUSDT", "mid_short", far))
         assert _counts(db) == (2, 1)
+
+
+def test_candidate_ticket_rejects_horizon_or_runtime_price_contract_mismatch():
+    for defect in ("wrong_horizon", "unverified_grid"):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db = root / "control.sqlite3"
+            report, manifest_path, manifest = _profitability_release(root)
+            manager = ResultManager(
+                root / "results",
+                control_plane_db=db,
+                tickets_enabled=True,
+                required_brain_release_stage="candidate",
+                strategy_release_bundle=_bundle("candidate"),
+                profitability_report_path=report,
+                candidate_release_manifest_path=manifest_path,
+            )
+            near = _prediction("rejected")
+            near["alpha_prediction"] = _authorized_alpha(
+                manifest, horizon_sec=180
+            )
+            far = _prediction("rejected")
+            far_alpha = _authorized_alpha(
+                manifest,
+                horizon_sec=180 if defect == "wrong_horizon" else 900,
+            )
+            if defect == "unverified_grid":
+                far_alpha["feature_evidence"]["price_path"]["continuous"] = False
+            far["alpha_prediction"] = far_alpha
+
+            asyncio.run(manager.save_result("BTCUSDT", "scalping", near))
+            asyncio.run(manager.save_result("BTCUSDT", "mid_short", far))
+
+            assert _counts(db) == (2, 0)
 
 
 def test_prediction_file_is_atomic_and_read_does_not_refresh_its_age():

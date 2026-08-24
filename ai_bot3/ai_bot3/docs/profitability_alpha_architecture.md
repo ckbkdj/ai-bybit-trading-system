@@ -195,6 +195,7 @@ FOMC 采集不能用会议日历日期猜测 14:00，也不能把 minutes、impl
 19. 正式标签、训练、事件回测和生产推理必须使用 Bybit 同交易所 last-trade Kline。每根 `MarketBar`、每个标签和每笔回测交易都携带 `price_source/price_observed`；模型 bundle 绑定 `kline_source=bybit`。生产运行若收到 Binance frame、Bybit 断档或陈旧数据，Alpha 与 `ResultManager` 必须双重失败关闭。
 20. 因子消融禁止 complete-case 选样。某 fold 的任一已安排 train/OOS 行缺少因子时，该 fold 必须记录 `FAILED_INCOMPLETE_FACTOR_COVERAGE`；不能删除缺失行后比较 baseline/augmented，也不能让研究阶段只看有值子集、最终训练做均值填补、生产阶段再因缺失拒绝。稳定币日序列从共同可用日起必须连续到请求结束日；周度 fund flow 的首部、内部、尾部缺口均不得超过其 15 天 staleness 合约。
 21. production replay 或外部调用传入的 `latest_decision_at` 必须与价格 frame 最后一条真实观测时间完全一致。禁止用更晚的声明时间覆盖最后一根 K 线时间，否则会把陈旧价格伪装成新鲜数据，并使 Bybit/macro/flow 的 as-of join 读取到价格形成以后才可用的因子。
+22. 正式 Alpha runtime 必须在模型边界重新验证至少 49 根价格的严格周期网格、有限且合法的 OHLCV；不能只信任上游抓取器或 `input_price_source` 字符串。candidate 包还必须再次按周期检查最后价格年龄，陈旧或未来时间一律 `NO_TRADE`。
 
 ## 7. 事件回测和回撤
 

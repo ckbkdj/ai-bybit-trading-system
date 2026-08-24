@@ -42,6 +42,13 @@ EXTERNAL_FEATURE_ALIASES: Mapping[str, str] = {
 }
 
 MAX_EXTERNAL_PANEL_AGE = timedelta(days=7)
+MAX_CANDIDATE_KLINE_AGE: Mapping[int, timedelta] = {
+    180: timedelta(minutes=10),
+    900: timedelta(minutes=45),
+    7200: timedelta(hours=4),
+    14400: timedelta(hours=8),
+    86400: timedelta(hours=36),
+}
 
 
 def _utc(value: Any) -> datetime:
@@ -102,6 +109,48 @@ def _decision_times(frame: pd.DataFrame, latest_decision_at: Any | None) -> pd.S
                 "runtime cannot re-date stale price data"
             )
     return values
+
+
+def _validate_price_frame(
+    frame: pd.DataFrame,
+    *,
+    horizon_sec: int,
+    latest_decision_at: Any | None,
+) -> tuple[pd.Series, dict[str, object]]:
+    """Recheck the price contract at the model boundary, not only in fetchers."""
+
+    required = ("open", "high", "low", "close", "volume")
+    missing = [column for column in required if column not in frame]
+    if missing:
+        raise ValueError(f"alpha price frame is missing OHLCV columns: {missing}")
+    decision_times = _decision_times(frame, latest_decision_at)
+    gaps = decision_times.diff().dropna().dt.total_seconds()
+    if gaps.empty or not np.isclose(gaps.to_numpy(float), float(horizon_sec), atol=1e-6).all():
+        raise ValueError("alpha price frame is discontinuous or off the signed horizon grid")
+    numeric = frame.loc[:, required].apply(pd.to_numeric, errors="coerce")
+    values = numeric.to_numpy(float)
+    if not np.isfinite(values).all():
+        raise ValueError("alpha price frame contains non-finite OHLCV values")
+    if (
+        (numeric[["open", "high", "low", "close"]] <= 0).any().any()
+        or (numeric["volume"] < 0).any()
+        or (numeric["high"] < numeric[["open", "close"]].max(axis=1)).any()
+        or (numeric["low"] > numeric[["open", "close"]].min(axis=1)).any()
+        or (numeric["high"] < numeric["low"]).any()
+    ):
+        raise ValueError("alpha price frame violates the OHLCV market-data contract")
+    return decision_times, {
+        "continuous": True,
+        "interval_sec": int(horizon_sec),
+        "observed_bar_count": len(frame),
+        "first_observed_at": _iso(
+            decision_times.iloc[0].to_pydatetime().astimezone(timezone.utc)
+        ),
+        "last_observed_at": _iso(
+            decision_times.iloc[-1].to_pydatetime().astimezone(timezone.utc)
+        ),
+        "ohlcv_contract_valid": True,
+    }
 
 
 def _external_values(
@@ -285,8 +334,12 @@ def build_current_feature_rows(
 ) -> tuple[pd.DataFrame, dict[str, object]]:
     if len(frame) < 49:
         raise ValueError("at least 49 chronological bars are required for alpha inference")
+    decision_times, price_frame_evidence = _validate_price_frame(
+        frame,
+        horizon_sec=horizon_sec,
+        latest_decision_at=latest_decision_at,
+    )
     history = engineer_profitability_features(frame.reset_index(drop=True))
-    decision_times = _decision_times(frame, latest_decision_at)
     history["symbol"] = symbol.strip().upper()
     history["decision_at"] = decision_times
     history["regime"] = causal_regime_labels(history).to_numpy()
@@ -434,6 +487,7 @@ def build_current_feature_rows(
     return pd.DataFrame(rows), {
         "decision_at": _iso(decision_at),
         "feature_snapshot_sha256": snapshot_hash,
+        "price_frame": price_frame_evidence,
         "external_panel": external_evidence,
         "macro_pit": macro_evidence,
         "flow_pit": flow_evidence,
@@ -536,6 +590,21 @@ def generate_profitability_alpha_prediction(
             raise ValueError(
                 "Bybit-trained Alpha requires a fresh Bybit last-trade kline frame"
             )
+        candidate_age_seconds: float | None = None
+        candidate_maximum_age_seconds: float | None = None
+        if bundle.get("release_stage") == "candidate":
+            candidate_times = _decision_times(frame, latest_decision_at)
+            candidate_last = candidate_times.iloc[-1].to_pydatetime().astimezone(
+                timezone.utc
+            )
+            candidate_age = datetime.now(timezone.utc) - candidate_last
+            maximum_age = MAX_CANDIDATE_KLINE_AGE[horizon]
+            candidate_age_seconds = candidate_age.total_seconds()
+            candidate_maximum_age_seconds = maximum_age.total_seconds()
+            if candidate_age < timedelta(0) or candidate_age > maximum_age:
+                raise ValueError(
+                    "candidate price frame is stale or future-dated at the Alpha boundary"
+                )
         relative = Path(str(models[str(horizon)]))
         if relative.is_absolute():
             raise ValueError("model path must be relative to its signed bundle")
@@ -594,6 +663,15 @@ def generate_profitability_alpha_prediction(
                 bundle_kline_source == "bybit"
                 and runtime_price_source == "bybit_linear_last_trade_kline"
             ),
+            "candidate_freshness_verified": bool(
+                bundle.get("release_stage") == "candidate"
+                and candidate_age_seconds is not None
+                and candidate_maximum_age_seconds is not None
+                and 0.0 <= candidate_age_seconds <= candidate_maximum_age_seconds
+            ),
+            "age_seconds": candidate_age_seconds,
+            "maximum_age_seconds": candidate_maximum_age_seconds,
+            **dict(feature_evidence["price_frame"]),
         }
         predictions = model.predict(rows)
 

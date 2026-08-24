@@ -353,7 +353,7 @@ $env:MACRO_PIT_STORE='D:\Money\ai_bot3\ai_bot3\data\macro_pit.sqlite3'
 $env:FLOW_PIT_STORE='D:\Money\ai_bot3\ai_bot3\data\flow_pit.sqlite3'
 ```
 
-runtime 会为新 Alpha 独立抓取 Bybit public linear last-trade Kline，不复用旧 Brain 的 Binance frame；随后校验训练/推理同为 Bybit、Kline 新鲜且连续、模型和 bundle 哈希、逐列 staleness、`available_at <= decision_at`、原始响应长度/SHA 和 candidate manifest。production replay 显式传入的决策截止必须与 frame 最后一条真实价格时间完全一致，不能把更晚时间覆盖到旧 K 线上制造虚假新鲜度。任一条件不满足都只输出 `NO_TRADE`，不得回退 Binance、Brain 或默认值补位。`ResultManager` 会再次核验 `feature_evidence.price_path.same_venue=true` 后才可能形成 OperationTicket。
+runtime 会为新 Alpha 独立抓取 Bybit public linear last-trade Kline，不复用旧 Brain 的 Binance frame；随后在模型边界重新校验至少 49 根严格周期网格、OHLCV 合法性、训练/推理同为 Bybit、candidate 最后价格年龄、模型和 bundle 哈希、逐列 staleness、`available_at <= decision_at`、原始响应长度/SHA 和 candidate manifest。production replay 显式传入的决策截止必须与 frame 最后一条真实价格时间完全一致，不能把更晚时间覆盖到旧 K 线上制造虚假新鲜度。任一条件不满足都只输出 `NO_TRADE`，不得回退 Binance、Brain 或默认值补位。`ResultManager` 会再次核验 `feature_evidence.price_path.same_venue=true` 与 runtime 重检证据后才可能形成 OperationTicket。
 
 ## 9. 报告阅读顺序
 
