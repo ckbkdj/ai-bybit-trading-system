@@ -10,7 +10,7 @@
         },
         "leverage_cap": {
           "exclusiveMinimum": 0,
-          "maximum": 100,
+          "maximum": 2,
           "title": "Leverage Cap",
           "type": "number"
         },
@@ -39,7 +39,7 @@
           "title": "Reduce Fraction"
         },
         "risk_budget_pct": {
-          "maximum": 0.1,
+          "maximum": 0.0025,
           "minimum": 0,
           "title": "Risk Budget Pct",
           "type": "number"
@@ -88,7 +88,7 @@
         },
         "leverage_cap": {
           "exclusiveMinimum": 0,
-          "maximum": 100,
+          "maximum": 2,
           "title": "Leverage Cap",
           "type": "number"
         },
@@ -117,7 +117,7 @@
           "title": "Reduce Fraction"
         },
         "risk_budget_pct": {
-          "maximum": 0.1,
+          "maximum": 0.0025,
           "minimum": 0,
           "title": "Risk Budget Pct",
           "type": "number"
@@ -173,7 +173,7 @@
         },
         "leverage_cap": {
           "exclusiveMinimum": 0,
-          "maximum": 100,
+          "maximum": 2,
           "title": "Leverage Cap",
           "type": "number"
         },
@@ -202,7 +202,7 @@
           "title": "Reduce Fraction"
         },
         "risk_budget_pct": {
-          "maximum": 0.1,
+          "maximum": 0.0025,
           "minimum": 0,
           "title": "Risk Budget Pct",
           "type": "number"
@@ -258,7 +258,7 @@
         },
         "leverage_cap": {
           "exclusiveMinimum": 0,
-          "maximum": 100,
+          "maximum": 2,
           "title": "Leverage Cap",
           "type": "number"
         },
@@ -287,7 +287,7 @@
           "title": "Reduce Fraction"
         },
         "risk_budget_pct": {
-          "maximum": 0.1,
+          "maximum": 0.0025,
           "minimum": 0,
           "title": "Risk Budget Pct",
           "type": "number"
@@ -343,7 +343,7 @@
         },
         "leverage_cap": {
           "exclusiveMinimum": 0,
-          "maximum": 100,
+          "maximum": 2,
           "title": "Leverage Cap",
           "type": "number"
         },
@@ -364,7 +364,7 @@
           "type": "number"
         },
         "risk_budget_pct": {
-          "maximum": 0.1,
+          "maximum": 0.0025,
           "minimum": 0,
           "title": "Risk Budget Pct",
           "type": "number"
@@ -421,7 +421,7 @@
         },
         "leverage_cap": {
           "exclusiveMinimum": 0,
-          "maximum": 100,
+          "maximum": 2,
           "title": "Leverage Cap",
           "type": "number"
         },
@@ -450,7 +450,7 @@
           "title": "Reduce Fraction"
         },
         "risk_budget_pct": {
-          "maximum": 0.1,
+          "maximum": 0.0025,
           "minimum": 0,
           "title": "Risk Budget Pct",
           "type": "number"

@@ -37,7 +37,7 @@ class PortfolioIntent(ContractModel):
     target_net_exposure_pct: float = Field(ge=-1, le=1)
     target_long_exposure_pct: float = Field(ge=0, le=1)
     target_short_exposure_pct: float = Field(ge=0, le=1)
-    risk_budget_pct: float = Field(ge=0, le=0.1)
+    risk_budget_pct: float = Field(ge=0, le=0.0025)
     max_turnover_pct: float = Field(ge=0, le=1)
     hedge_mode: Literal["DISABLED", "EXPLICIT"] = "DISABLED"
     hedge_owner_id: str | None = Field(default=None, min_length=8, max_length=120)

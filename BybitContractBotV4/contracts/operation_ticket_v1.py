@@ -23,9 +23,9 @@ class TicketInstrument(ContractModel):
 class IntentCore(ContractModel):
     side: Literal["BUY", "SELL"]
     target_exposure_pct: float = Field(ge=0, le=1)
-    risk_budget_pct: float = Field(ge=0, le=0.1)
+    risk_budget_pct: float = Field(ge=0, le=0.0025)
     max_notional_usdt: float = Field(gt=0)
-    leverage_cap: float = Field(gt=0, le=100)
+    leverage_cap: float = Field(gt=0, le=2)
     reduce_fraction: Optional[float] = Field(default=None, gt=0, le=1)
     target_order_link_id: Optional[str] = Field(default=None, min_length=8, max_length=36)
 

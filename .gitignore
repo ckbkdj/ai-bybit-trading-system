@@ -18,7 +18,13 @@ ai_bot3/ai_bot3/config.yml.bak_*
 **/.venv/
 .test-deps/
 .test-deps312/
+.dependency-audit/
 **/node_modules/
+
+# Locally generated audit attestations (CI uploads them as immutable artifacts)
+truth-regression.json
+supply-chain-audit.json
+pip-audit.json
 
 # Large model, market-data and runtime outputs
 ai_bot3/ai_bot3/data/

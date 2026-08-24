@@ -81,6 +81,7 @@ class BybitRuntimeContext:
         used = numeric(account.get("totalInitialMargin"), usdt.get("used") or max(0, equity - free))
         unrealised = numeric(account.get("totalPerpUPL"), 0)
         runtime = self.store.risk_runtime()
+        metrics: dict[str, object] = {"realised_pnl_week": 0.0}
         metrics_healthy = self.mode == "shadow"
         metrics_provider = getattr(self.account_client, "get_daily_risk_metrics", None)
         if callable(metrics_provider):
@@ -104,6 +105,7 @@ class BybitRuntimeContext:
             margin_used_usdt=used,
             realised_pnl_today=float(runtime.get("realised_pnl") or 0),
             unrealised_pnl=unrealised,
+            realised_pnl_week=float(metrics.get("realised_pnl_week") or 0),
             consecutive_losses=int(runtime.get("consecutive_losses") or 0),
             cooldown_until=cooldown,
             equity_high_water_usdt=high_water,

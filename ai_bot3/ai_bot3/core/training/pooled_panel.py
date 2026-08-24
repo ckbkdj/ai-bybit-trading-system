@@ -1,22 +1,16 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+import json
+from array import array
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from typing import Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 
-
-HORIZONS_SEC: tuple[int, ...] = (180, 900, 7200, 14400, 86400)
-HORIZON_TIMEFRAME: Mapping[int, str] = {
-    180: "3m",
-    900: "15m",
-    7200: "2h",
-    14400: "4h",
-    86400: "1d",
-}
+from contracts.horizons import HORIZONS_SEC, HORIZON_TIMEFRAME
 
 REQUIRED_CONTEXT_COLUMNS = (
     "symbol",
@@ -34,11 +28,45 @@ REQUIRED_CONTEXT_COLUMNS = (
 )
 
 
+def causal_regime_labels(
+    frame: pd.DataFrame,
+    *,
+    minimum_history: int = 8,
+    high_volatility_quantile: float = 0.70,
+) -> pd.Series:
+    """Classify each row using only volatility observations strictly before it."""
+
+    if minimum_history <= 0 or not 0 < high_volatility_quantile < 1:
+        raise ValueError("invalid causal regime configuration")
+    required = {"symbol", "decision_at", "volatility"}
+    if not required.issubset(frame.columns):
+        raise ValueError(f"causal regime requires columns: {sorted(required)}")
+    ordered = frame[["symbol", "decision_at", "volatility"]].copy()
+    ordered["_original_index"] = np.arange(len(ordered))
+    ordered["decision_at"] = _as_utc(ordered["decision_at"], "decision_at")
+    ordered["volatility"] = pd.to_numeric(ordered["volatility"], errors="coerce")
+    ordered = ordered.sort_values(["symbol", "decision_at", "_original_index"])
+    threshold = ordered.groupby("symbol", sort=False)["volatility"].transform(
+        lambda values: values.shift(1).expanding(min_periods=minimum_history).quantile(
+            high_volatility_quantile
+        )
+    )
+    labels = np.where(
+        threshold.isna(),
+        "insufficient_history",
+        np.where(ordered["volatility"] > threshold, "high_volatility", "normal"),
+    )
+    result = pd.Series(labels, index=ordered["_original_index"].to_numpy(), dtype="object")
+    return result.sort_index().reset_index(drop=True)
+
+
 @dataclass(frozen=True)
 class WalkForwardFold:
     fold_id: str
-    train_indices: tuple[int, ...]
-    test_indices: tuple[int, ...]
+    # Unsigned packed arrays retain the existing Sequence[int] contract while
+    # avoiding millions of boxed Python integers on real pooled panels.
+    train_indices: Sequence[int]
+    test_indices: Sequence[int]
     train_start: str
     train_end: str
     test_start: str
@@ -53,8 +81,79 @@ class HorizonDataset:
     development: pd.DataFrame
     lockbox: pd.DataFrame
     folds: tuple[WalkForwardFold, ...]
-    lockbox_fingerprint: str
+    development_fingerprint: str
+    lockbox_fingerprint: str | None
     lockbox_start: str
+    lockbox_labels_materialized: bool = True
+
+
+def split_factor_research_and_evaluation(
+    dataset: HorizonDataset,
+    *,
+    minimum_folds_per_stage: int = 2,
+) -> tuple[HorizonDataset, HorizonDataset, dict[str, object]]:
+    """Freeze factor research before the outer evaluation OOS begins.
+
+    Factor retention is a model-selection decision.  It therefore cannot use
+    the same outer folds later reported as the development performance
+    estimate.  The chronological fold schedule is split without inspecting
+    labels or returns: the first block is available only to factor ablation and
+    the second block is available only to the frozen-feature evaluation.
+    """
+
+    if minimum_folds_per_stage < 2:
+        raise ValueError("each development stage requires at least two folds")
+    folds = tuple(dataset.folds)
+    required = minimum_folds_per_stage * 2
+    if len(folds) < required:
+        raise ValueError(
+            f"at least {required} walk-forward folds are required to isolate "
+            "factor research from outer evaluation"
+        )
+    split_position = len(folds) // 2
+    research_folds = folds[:split_position]
+    evaluation_folds = folds[split_position:]
+    if min(len(research_folds), len(evaluation_folds)) < minimum_folds_per_stage:
+        raise ValueError("factor research/evaluation fold partition is too small")
+
+    research_end = pd.to_datetime(
+        research_folds[-1].test_end, utc=True, errors="raise"
+    )
+    evaluation_start = pd.to_datetime(
+        evaluation_folds[0].test_start, utc=True, errors="raise"
+    )
+    required_embargo_sec = max(
+        int(research_folds[-1].embargo_sec),
+        int(evaluation_folds[0].embargo_sec),
+    )
+    if evaluation_start < research_end + timedelta(seconds=required_embargo_sec):
+        raise ValueError("factor research and evaluation folds violate embargo")
+
+    research_test_indices = {
+        int(index) for fold in research_folds for index in fold.test_indices
+    }
+    evaluation_test_indices = {
+        int(index) for fold in evaluation_folds for index in fold.test_indices
+    }
+    if research_test_indices.intersection(evaluation_test_indices):
+        raise ValueError("factor research and evaluation OOS rows overlap")
+
+    research = replace(dataset, folds=research_folds)
+    evaluation = replace(dataset, folds=evaluation_folds)
+    evidence = {
+        "policy": "chronological_disjoint_oos_factor_research_then_frozen_feature_evaluation",
+        "partition_uses_labels_or_returns": False,
+        "factor_research_fold_ids": [fold.fold_id for fold in research_folds],
+        "evaluation_fold_ids": [fold.fold_id for fold in evaluation_folds],
+        "factor_research_fold_count": len(research_folds),
+        "evaluation_fold_count": len(evaluation_folds),
+        "factor_research_oos_end": research_end.isoformat().replace("+00:00", "Z"),
+        "evaluation_oos_start": evaluation_start.isoformat().replace("+00:00", "Z"),
+        "required_stage_embargo_sec": required_embargo_sec,
+        "oos_test_row_overlap_count": 0,
+        "evaluation_oos_used_for_factor_selection": False,
+    }
+    return research, evaluation, evidence
 
 
 def _as_utc(series: pd.Series, name: str) -> pd.Series:
@@ -65,17 +164,22 @@ def _as_utc(series: pd.Series, name: str) -> pd.Series:
 
 
 def _frame_fingerprint(frame: pd.DataFrame) -> str:
-    columns = [
-        column
-        for column in ("symbol", "horizon_sec", "decision_at", "label_available_at", "net_return")
-        if column in frame
-    ]
+    """Fingerprint labels, features, PIT timestamps and schema without huge JSON."""
+
+    columns = sorted(str(column) for column in frame.columns)
     payload = frame[columns].copy()
-    for column in ("decision_at", "label_available_at"):
-        if column in payload:
-            payload[column] = pd.to_datetime(payload[column], utc=True).astype(str)
-    encoded = payload.to_json(orient="records", date_format="iso", double_precision=12)
-    return hashlib.sha256(encoded.encode()).hexdigest()
+    for column in columns:
+        if isinstance(payload[column].dtype, pd.DatetimeTZDtype):
+            payload[column] = pd.to_datetime(payload[column], utc=True).astype("int64")
+    digest = hashlib.sha256()
+    schema = [(column, str(payload[column].dtype)) for column in columns]
+    digest.update(json.dumps(schema, separators=(",", ":")).encode("utf-8"))
+    digest.update(
+        pd.util.hash_pandas_object(payload, index=False, categorize=True)
+        .to_numpy(dtype="uint64")
+        .tobytes()
+    )
+    return digest.hexdigest()
 
 
 class PooledPanelBuilder:
@@ -119,8 +223,14 @@ class PooledPanelBuilder:
             raise ValueError("symbol is required")
         data["symbol"] = data["symbol"].astype(str).str.upper()
         if "liquidity" not in data:
-            close = pd.to_numeric(data.get("close"), errors="coerce")
-            volume = pd.to_numeric(data.get("volume"), errors="coerce").fillna(0.0)
+            close = pd.to_numeric(
+                data["close"] if "close" in data else pd.Series(0.0, index=data.index),
+                errors="coerce",
+            ).fillna(0.0)
+            volume = pd.to_numeric(
+                data["volume"] if "volume" in data else pd.Series(0.0, index=data.index),
+                errors="coerce",
+            ).fillna(0.0)
             data["liquidity"] = (close * volume).clip(lower=0.0)
         if "volatility" not in data:
             close = pd.to_numeric(data.get("close"), errors="coerce")
@@ -140,9 +250,7 @@ class PooledPanelBuilder:
                 [hour < 8, hour < 16], ["asia", "europe"], default="americas"
             )
         if "regime" not in data:
-            vol = pd.to_numeric(data["volatility"], errors="coerce").fillna(0.0)
-            threshold = float(vol.quantile(0.70)) if len(vol) else 0.0
-            data["regime"] = np.where(vol > threshold, "high_volatility", "normal")
+            data["regime"] = causal_regime_labels(data).to_numpy()
         return data
 
     @staticmethod
@@ -200,9 +308,51 @@ class PooledPanelBuilder:
             development=development,
             lockbox=lockbox,
             folds=folds,
+            development_fingerprint=_frame_fingerprint(development),
             lockbox_fingerprint=_frame_fingerprint(lockbox),
             lockbox_start=lockbox_start.isoformat().replace("+00:00", "Z"),
+            lockbox_labels_materialized=True,
         )
+
+    def build_sealed_development(
+        self,
+        frame: pd.DataFrame,
+        horizon_sec: int,
+        *,
+        lockbox_start: object,
+    ) -> HorizonDataset:
+        """Build folds without materializing or fingerprinting lockbox labels."""
+
+        data = self.validate(frame, horizon_sec)
+        boundary = pd.to_datetime(lockbox_start, utc=True, errors="coerce")
+        if pd.isna(boundary):
+            raise ValueError("sealed lockbox boundary is invalid")
+        purge = int(round(horizon_sec * self.purge_multiplier))
+        embargo = int(round(horizon_sec * self.embargo_multiplier))
+        development_cutoff = boundary - timedelta(seconds=purge)
+        development = data[
+            (data["decision_at"] < development_cutoff)
+            & (data["label_available_at"] < boundary)
+        ].copy().reset_index(drop=True)
+        if len(development) < self.minimum_train_rows + self.minimum_test_rows:
+            raise ValueError("sealed development panel is too small")
+        folds = self._walk_forward_folds(development, horizon_sec, purge, embargo)
+        if not folds:
+            raise ValueError("no valid sealed-development walk-forward folds")
+        return HorizonDataset(
+            horizon_sec=horizon_sec,
+            development=development,
+            lockbox=pd.DataFrame(columns=development.columns),
+            folds=folds,
+            development_fingerprint=_frame_fingerprint(development),
+            lockbox_fingerprint=None,
+            lockbox_start=boundary.isoformat().replace("+00:00", "Z"),
+            lockbox_labels_materialized=False,
+        )
+
+    @staticmethod
+    def fingerprint(frame: pd.DataFrame) -> str:
+        return _frame_fingerprint(frame)
 
     def _walk_forward_folds(
         self,
@@ -229,8 +379,14 @@ class PooledPanelBuilder:
                 (development["decision_at"] >= test_start)
                 & (development["decision_at"] <= test_end)
             )
-            train_indices = tuple(int(value) for value in development.index[train_mask])
-            test_indices = tuple(int(value) for value in development.index[test_mask])
+            if len(development) >= 2**32:
+                raise ValueError("walk-forward panel exceeds packed index capacity")
+            train_indices = array(
+                "I", (int(value) for value in development.index[train_mask])
+            )
+            test_indices = array(
+                "I", (int(value) for value in development.index[test_mask])
+            )
             if len(train_indices) >= self.minimum_train_rows and len(test_indices) >= self.minimum_test_rows:
                 folds.append(
                     WalkForwardFold(
@@ -262,9 +418,16 @@ def dataset_manifest(dataset: HorizonDataset) -> dict[str, object]:
     return {
         "horizon_sec": dataset.horizon_sec,
         "development_rows": len(dataset.development),
+        "development_fingerprint": dataset.development_fingerprint,
         "lockbox_rows": len(dataset.lockbox),
         "lockbox_start": dataset.lockbox_start,
         "lockbox_fingerprint": dataset.lockbox_fingerprint,
+        "lockbox_labels_materialized": dataset.lockbox_labels_materialized,
+        "lockbox_status": (
+            "MATERIALIZED"
+            if dataset.lockbox_labels_materialized
+            else "SEALED_UNLABELED"
+        ),
         "folds": [
             {
                 "fold_id": fold.fold_id,
@@ -288,5 +451,7 @@ __all__: Sequence[str] = (
     "HorizonDataset",
     "PooledPanelBuilder",
     "WalkForwardFold",
+    "causal_regime_labels",
     "dataset_manifest",
+    "split_factor_research_and_evaluation",
 )

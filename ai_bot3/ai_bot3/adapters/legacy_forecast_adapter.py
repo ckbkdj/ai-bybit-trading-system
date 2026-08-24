@@ -5,15 +5,7 @@ from typing import Any, Mapping
 
 from contracts.common import deterministic_id
 from contracts.forecast_v1 import ForecastEnvelope
-
-
-MODE_HORIZONS = {
-    "scalping": 15 * 60,
-    "mid_short": 4 * 60 * 60,
-    "trend": 2 * 60 * 60,
-    "trend_swing": 24 * 60 * 60,
-    "swing": 7 * 24 * 60 * 60,
-}
+from contracts.horizons import MODE_HORIZONS
 
 
 def _timestamp(value: Any, fallback: datetime) -> datetime:
@@ -46,26 +38,47 @@ def _float(value: Any, default: float = 0.0) -> float:
 class LegacyForecastAdapter:
     """Deterministically converts the existing result JSON into v1 without hiding inference."""
 
-    def adapt(self, symbol: str, mode: str, legacy: Mapping[str, Any]) -> ForecastEnvelope:
+    def adapt(
+        self,
+        symbol: str,
+        mode: str,
+        legacy: Mapping[str, Any],
+        *,
+        execution_authorized: bool = False,
+    ) -> ForecastEnvelope:
         normalized_symbol = symbol.strip().upper()
         generated_at = _timestamp(legacy.get("generated_at"), datetime.now(timezone.utc))
-        data_cutoff = _timestamp(
-            legacy.get("latest_kline_ts") or legacy.get("data_cutoff") or generated_at,
-            generated_at,
-        )
-        if data_cutoff > generated_at:
-            data_cutoff = generated_at
-        horizon = int(legacy.get("horizon_sec") or MODE_HORIZONS.get(mode, 3600))
-
         alpha = legacy.get("alpha_prediction") if isinstance(legacy.get("alpha_prediction"), Mapping) else {}
         alpha_stage = str(alpha.get("release_stage") or "rejected").lower()
-        alpha_qualified = (
+        alpha_claims_candidate = (
             str(alpha.get("model_family") or "") == "profitability_two_stage"
             and bool(alpha.get("actionable"))
             and str(alpha.get("decision") or "").upper() == "TRADE"
             and alpha_stage == "candidate"
             and str(alpha.get("profitability_gate") or "").upper() == "PASSED"
         )
+        alpha_qualified = alpha_claims_candidate and execution_authorized
+        feature_evidence = (
+            alpha.get("feature_evidence")
+            if isinstance(alpha.get("feature_evidence"), Mapping)
+            else {}
+        )
+        price_path = (
+            feature_evidence.get("price_path")
+            if isinstance(feature_evidence.get("price_path"), Mapping)
+            else {}
+        )
+        if alpha_qualified:
+            data_cutoff = _timestamp(price_path.get("last_observed_at"), generated_at)
+            horizon = int(alpha.get("horizon_sec"))
+        else:
+            data_cutoff = _timestamp(
+                legacy.get("latest_kline_ts") or legacy.get("data_cutoff") or generated_at,
+                generated_at,
+            )
+            horizon = int(legacy.get("horizon_sec") or MODE_HORIZONS.get(mode, 3600))
+        if data_cutoff > generated_at:
+            data_cutoff = generated_at
         brain = legacy.get("brain_prediction") if isinstance(legacy.get("brain_prediction"), Mapping) else {}
         brain_direction = str(brain.get("direction") or "flat").lower()
         brain_stage = str(brain.get("release_stage") or "unreviewed").lower()
@@ -136,15 +149,36 @@ class LegacyForecastAdapter:
         )
         if not isinstance(quantiles, Mapping):
             quantiles = None
-        source_status = str(legacy.get("data_source_status") or "degraded").lower()
+        source_status = str(
+            "ok"
+            if alpha_qualified
+            else legacy.get("data_source_status") or "degraded"
+        ).lower()
         if source_status not in {"ok", "degraded", "missing", "error"}:
             source_status = "degraded"
-        reliable = legacy.get("data_source_reliable") is True and source_status == "ok"
-        quality = _float((legacy.get("context_completeness") or {}).get("score") if isinstance(legacy.get("context_completeness"), dict) else legacy.get("context_completeness"), 0.75 if reliable else 0.5)
+        reliable = bool(
+            alpha_qualified
+            or (
+                legacy.get("data_source_reliable") is True
+                and source_status == "ok"
+            )
+        )
+        quality = (
+            1.0
+            if alpha_qualified
+            else _float(
+                (legacy.get("context_completeness") or {}).get("score")
+                if isinstance(legacy.get("context_completeness"), dict)
+                else legacy.get("context_completeness"),
+                0.75 if reliable else 0.5,
+            )
+        )
         quality = max(0.0, min(1.0, quality))
         warnings = ["legacy_inferred_direction_distribution"]
         if alpha_qualified:
             warnings.append(f"profitability_two_stage_signal:{alpha_stage}")
+        elif alpha_claims_candidate:
+            warnings.append("profitability_candidate_execution_authorization_denied")
         if brain_stage in {"candidate", "live"}:
             warnings.append("stale_brain_release_ignored")
         if not reliable:
@@ -165,18 +199,44 @@ class LegacyForecastAdapter:
             )
             or f"legacy-{mode}"
         )
-        calibration_status = str(legacy.get("calibration_status") or "unknown").lower()
+        calibration_status = str(
+            "valid"
+            if alpha_qualified
+            else legacy.get("calibration_status") or "unknown"
+        ).lower()
         if calibration_status not in {"valid", "degraded", "invalid", "unknown"}:
             calibration_status = "degraded"
-        feature_age = legacy.get("current_price_age_seconds")
+        if alpha_qualified:
+            saved_at = _timestamp(legacy.get("saved_at"), generated_at)
+            feature_age = max(0.0, (saved_at - data_cutoff).total_seconds())
+        else:
+            feature_age = legacy.get("current_price_age_seconds")
         feature_age_sec = int(_float(feature_age, 2_147_483_647)) if feature_age is not None else 2_147_483_647
+        range_guard_value = (
+            alpha.get("range_guard_score")
+            if alpha_qualified
+            else (
+                legacy.get("range_guard_score")
+                if legacy.get("range_guard_score") is not None
+                else legacy.get("out_of_distribution_score")
+            )
+        )
+        factor_scores = dict(
+            (alpha.get("factor_scores") or {})
+            if alpha_qualified
+            else (legacy.get("factor_scores") or {})
+        )
         return ForecastEnvelope.model_validate(
             {
                 "forecast_id": forecast_id,
                 "revision": int(legacy.get("revision") or 1),
                 "instrument": {
                     "symbol": normalized_symbol,
-                    "exchange": str(legacy.get("forecast_market") or "binance").lower(),
+                    "exchange": (
+                        "bybit"
+                        if alpha_qualified
+                        else str(legacy.get("forecast_market") or "binance").lower()
+                    ),
                 },
                 "time": {
                     "created_at": generated_at,
@@ -199,7 +259,14 @@ class LegacyForecastAdapter:
                     ),
                 },
                 "regime": {
-                    "market_regime": str(legacy.get("market_regime") or "unknown"),
+                    "market_regime": str(
+                        (
+                            alpha.get("market_regime")
+                            if alpha_qualified
+                            else legacy.get("market_regime")
+                        )
+                        or "unknown"
+                    ),
                     "liquidity_regime": str(legacy.get("liquidity_regime") or "unknown"),
                     "event_regime": str(legacy.get("event_regime") or "normal"),
                 },
@@ -212,9 +279,7 @@ class LegacyForecastAdapter:
                         min(
                             1.0,
                             _float(
-                                legacy.get("range_guard_score")
-                                if legacy.get("range_guard_score") is not None
-                                else legacy.get("out_of_distribution_score"),
+                                range_guard_value,
                                 1.0,
                             ),
                         ),
@@ -232,14 +297,18 @@ class LegacyForecastAdapter:
                         else "degraded" if calibration_status in {"degraded", "unknown"} else "invalid"
                     ),
                 },
-                "factor_scores": dict(legacy.get("factor_scores") or {}),
+                "factor_scores": factor_scores,
                 "evidence": {"warnings": warnings},
                 "lineage": {
                     "strategy_release_id": str(
                         (
                             alpha.get("strategy_release_id")
                             if alpha_qualified
-                            else legacy.get("strategy_release_id")
+                            else (
+                                f"rejected-alpha-{normalized_symbol}-{mode}"
+                                if alpha_claims_candidate
+                                else legacy.get("strategy_release_id")
+                            )
                         )
                         or f"legacy-{model_bundle}"
                     ),
