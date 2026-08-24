@@ -66,6 +66,34 @@ def test_short_horizon_coverage_cannot_silently_collapse_to_six_or_31_days(tmp_p
     assert config.max_bars_per_symbol >= 175_200
 
 
+def test_each_horizon_enforces_the_preregistered_history_floor():
+    assert MINIMUM_COVERAGE_DAYS == {
+        "3m": 180.0,
+        "15m": 365.0,
+        "2h": 1095.0,
+        "4h": 1095.0,
+        "1d": 1825.0,
+    }
+    intervals = {
+        "3m": 180,
+        "15m": 900,
+        "2h": 7200,
+        "4h": 14_400,
+        "1d": 86_400,
+    }
+    for timeframe, required_days in MINIMUM_COVERAGE_DAYS.items():
+        with pytest.raises(ValueError, match="below required"):
+            validate_source_coverage(
+                _frame(int(required_days) - 2, intervals[timeframe]),
+                timeframe,
+            )
+        evidence = validate_source_coverage(
+            _frame(int(required_days) + 1, intervals[timeframe]),
+            timeframe,
+        )
+        assert evidence["coverage_gate"] == "PASSED"
+
+
 def test_nominal_history_span_cannot_hide_a_missing_kline():
     frame = _frame(181, 180).drop(index=100).reset_index(drop=True)
 

@@ -70,10 +70,10 @@ from core.training.pit_factor_panel import TradPanelHistorySource
 SYMBOLS: tuple[str, ...] = ("BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "1000PEPEUSDT")
 MINIMUM_COVERAGE_DAYS: Mapping[str, float] = {
     "3m": 180.0,
-    "15m": 180.0,
-    "2h": 730.0,
-    "4h": 730.0,
-    "1d": 1095.0,
+    "15m": 365.0,
+    "2h": 1095.0,
+    "4h": 1095.0,
+    "1d": 1825.0,
 }
 TIMEFRAME_INTERVAL_SEC: Mapping[str, int] = {
     timeframe: horizon for horizon, timeframe in HORIZON_TIMEFRAME.items()
