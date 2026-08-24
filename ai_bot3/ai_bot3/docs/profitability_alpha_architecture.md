@@ -184,6 +184,7 @@ FOMC 采集不能用会议日历日期猜测 14:00，也不能把 minutes、impl
 13. max-holding 到点若落在 OHLC bar 内，不允许用到点前的旧 close 冒充到点成交价。标签只能使用最后一个真实完成 close 并记录它的实际 `exit_at`；若没有可用完成 bar，则保持 `NO_EXIT_OBSERVATION`，不能发明零收益或虚假退出时间。
 14. K 线数据库的稳定 SHA-256、大小和修改时间共同进入 trial ID 与 source evidence；不能只靠路径或文件元数据区分实验。development 通过后在 lockbox 打开前重新哈希，lockbox 路径评分完成后再次重新哈希，任一阶段内容或元数据变化都终止 trial，不得用混合快照生成候选证据。
 15. 封存 development 与 lockbox 边界之间固定 purge 一个完整 horizon，并同时要求 development 标签在边界前可用。不能只凭早止盈标签较早 available 就把靠近 lockbox 的重叠样本纳入训练；该筛选必须与结果无关。
+16. development 预检只允许查询 K 线时间网格以预注册边界；OHLCV 在 SQL 读取层截断到 lockbox 之前。production replay 同样按其 development OOS 决策时间截断查询，禁止先加载/工程化 lockbox 价格再在 DataFrame 中过滤。完整 lockbox OHLCV 只有 development 全门禁通过并写入 claim 后才可读取。
 
 ## 7. 事件回测和回撤
 

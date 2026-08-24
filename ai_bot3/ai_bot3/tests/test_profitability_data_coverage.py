@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import sys
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -15,6 +16,7 @@ sys.path.insert(0, str(ROOT))
 
 from core.evaluation.profitability_rebuild import (
     BYBIT_EXECUTION_EVIDENCE_FEATURES,
+    KlinePanelSource,
     MINIMUM_COVERAGE_DAYS,
     ProfitabilityRebuild,
     ProfitabilityRebuildConfig,
@@ -46,6 +48,59 @@ def _frame(days: int, interval_sec: int) -> pd.DataFrame:
             "close_at": opens + pd.Timedelta(seconds=interval_sec),
         }
     )
+
+
+def test_kline_preflight_reads_only_timestamps_and_development_reads_stop_at_boundary(
+    tmp_path: Path,
+):
+    database = tmp_path / "kline.sqlite3"
+    start = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """CREATE TABLE raw_kline(
+                   symbol TEXT,timeframe TEXT,source TEXT,open_time INTEGER,
+                   close_time INTEGER,open REAL,high REAL,low REAL,close REAL,
+                   volume REAL,fetched_at TEXT
+               )"""
+        )
+        for index in range(3):
+            open_at = start + timedelta(minutes=3 * index)
+            close_at = open_at + timedelta(minutes=3)
+            connection.execute(
+                "INSERT INTO raw_kline VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "BTCUSDT",
+                    "3m",
+                    "binance",
+                    int(open_at.timestamp() * 1_000),
+                    int(close_at.timestamp() * 1_000),
+                    100.0 + index,
+                    101.0 + index,
+                    99.0 + index,
+                    100.5 + index,
+                    1_000.0,
+                    "2026-01-01T00:00:00Z",
+                ),
+            )
+        connection.commit()
+
+    source = KlinePanelSource(database)
+    timestamps = source.load_timestamps("BTCUSDT", "3m", 100)
+    assert len(timestamps) == 3
+    assert not {"open", "high", "low", "close", "volume"}.intersection(
+        timestamps.columns
+    )
+
+    boundary = start + timedelta(minutes=6)
+    development = source.load_before(
+        "BTCUSDT",
+        "3m",
+        100,
+        close_at_or_before=boundary,
+    )
+    assert len(development) == 2
+    assert development["close_at"].max() == pd.Timestamp(boundary)
+    assert development["close"].tolist() == [100.5, 101.5]
 
 
 def test_short_horizon_coverage_cannot_silently_collapse_to_six_or_31_days(tmp_path):

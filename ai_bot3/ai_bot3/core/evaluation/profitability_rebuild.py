@@ -521,6 +521,90 @@ class KlinePanelSource:
         frame["close_at"] = pd.to_datetime(frame["close_time"], unit="ms", utc=True)
         return frame.reset_index(drop=True)
 
+    def load_timestamps(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int,
+    ) -> pd.DataFrame:
+        """Read only the immutable time grid used to pre-register boundaries."""
+
+        uri = f"file:{self.path.resolve().as_posix()}?mode=ro"
+        query = """
+            SELECT symbol,timeframe,source,open_time,close_time
+              FROM (
+                    SELECT symbol,timeframe,source,open_time,close_time
+                      FROM raw_kline
+                     WHERE symbol=? AND timeframe=? AND source='binance'
+                     ORDER BY open_time DESC
+                     LIMIT ?
+              )
+             ORDER BY open_time
+        """
+        with closing(sqlite3.connect(uri, uri=True)) as connection:
+            frame = pd.read_sql_query(
+                query,
+                connection,
+                params=(symbol, timeframe, int(limit)),
+            )
+        if frame.empty:
+            raise ValueError(f"no bars for {symbol} {timeframe}")
+        frame["open_at"] = pd.to_datetime(
+            frame["open_time"], unit="ms", utc=True
+        )
+        frame["close_at"] = pd.to_datetime(
+            frame["close_time"], unit="ms", utc=True
+        )
+        return frame.reset_index(drop=True)
+
+    def load_before(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int,
+        *,
+        close_at_or_before: object,
+    ) -> pd.DataFrame:
+        """Read OHLCV only through a pre-registered PIT boundary."""
+
+        cutoff = pd.to_datetime(close_at_or_before, utc=True, errors="coerce")
+        if pd.isna(cutoff):
+            raise ValueError("kline close boundary is invalid")
+        cutoff_ms = int(pd.Timestamp(cutoff).value // 1_000_000)
+        uri = f"file:{self.path.resolve().as_posix()}?mode=ro"
+        query = """
+            SELECT symbol,timeframe,source,open_time,close_time,open,high,low,close,volume,fetched_at
+              FROM (
+                    SELECT symbol,timeframe,source,open_time,close_time,open,high,low,close,volume,fetched_at
+                      FROM raw_kline
+                     WHERE symbol=? AND timeframe=? AND source='binance'
+                       AND close_time<=?
+                     ORDER BY open_time DESC
+                     LIMIT ?
+              )
+             ORDER BY open_time
+        """
+        with closing(sqlite3.connect(uri, uri=True)) as connection:
+            frame = pd.read_sql_query(
+                query,
+                connection,
+                params=(symbol, timeframe, cutoff_ms, int(limit)),
+            )
+        if frame.empty:
+            raise ValueError(
+                f"no bars for {symbol} {timeframe} before the PIT boundary"
+            )
+        for column in ("open", "high", "low", "close", "volume"):
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        frame = frame.dropna(subset=["open", "high", "low", "close", "volume"])
+        frame["open_at"] = pd.to_datetime(
+            frame["open_time"], unit="ms", utc=True
+        )
+        frame["close_at"] = pd.to_datetime(
+            frame["close_time"], unit="ms", utc=True
+        )
+        return frame.reset_index(drop=True)
+
     def listing_evidence(
         self, symbol: str, timeframe: str
     ) -> dict[str, object] | None:
@@ -1097,12 +1181,12 @@ def _run_production_replay(
                 decision_at = pd.to_datetime(
                     offline_rows.loc[0, "decision_at"], utc=True, errors="raise"
                 ).to_pydatetime()
-                raw = source.load(
+                raw = source.load_before(
                     symbol,
                     HORIZON_TIMEFRAME[horizon],
                     max_bars_per_symbol,
+                    close_at_or_before=decision_at,
                 )
-                raw = raw[raw["close_at"] <= decision_at].reset_index(drop=True)
                 external_context = _external_replay_context(
                     offline_rows.iloc[0],
                     model_feature_columns=features,
@@ -3078,7 +3162,7 @@ class ProfitabilityRebuild:
                 series_id = f"{symbol}:{horizon}"
                 frame: pd.DataFrame | None = None
                 try:
-                    frame = self.source.load(
+                    frame = self.source.load_timestamps(
                         symbol, timeframe, self.config.max_bars_per_symbol
                     )
                     audit = audit_source_coverage(
@@ -3203,13 +3287,14 @@ class ProfitabilityRebuild:
                 if horizon == 180:
                     bybit_pit_evidence = horizon_evidence
             for symbol in SYMBOLS:
-                frame = self.source.load(
-                    symbol, timeframe, self.config.max_bars_per_symbol
+                frame = self.source.load_before(
+                    symbol,
+                    timeframe,
+                    self.config.max_bars_per_symbol,
+                    close_at_or_before=lockbox_start,
                 )
                 enriched = _engineer_features(frame)
-                development_enriched = enriched[
-                    enriched["close_at"] <= lockbox_start
-                ].reset_index(drop=True)
+                development_enriched = enriched.reset_index(drop=True)
                 development_bars = _market_bars(development_enriched)
                 if bybit_history is not None and horizon_evidence is not None:
                     symbol_history = (
