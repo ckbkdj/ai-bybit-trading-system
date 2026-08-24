@@ -15,7 +15,10 @@ from core.providers.bybit_capture_audit import (
     audit_live_capture,
     merge_audited_liquidation_capture,
 )
-from core.providers.bybit_public_pit import BybitPublicPITStore
+from core.providers.bybit_public_pit import (
+    BYBIT_PUBLIC_LINEAR_WS,
+    BybitPublicPITStore,
+)
 from core.training.bybit_pit_panel import (
     BybitPITFeatureSource,
     _completed_day_continuity,
@@ -102,6 +105,114 @@ def test_running_capture_cannot_be_sealed(tmp_path):
         assert "running capture sessions" in str(exc)
     else:
         raise AssertionError("a running capture session was accepted as sealed evidence")
+
+
+def test_capture_audit_rejects_non_official_endpoint(tmp_path):
+    store = BybitPublicPITStore(tmp_path / "wrong-endpoint.sqlite3")
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    store.start_session(
+        "wrong-endpoint",
+        endpoint="wss://example.com/not-bybit",
+        symbols=("BTCUSDT",),
+        started_at=now,
+    )
+    store.append_raw(
+        event_id="wrong-endpoint-event",
+        session_id="wrong-endpoint",
+        topic="publicTrade.BTCUSDT",
+        symbol="BTCUSDT",
+        event_type="trade",
+        exchange_time=now,
+        received_at=now,
+        payload={"trade": 1},
+    )
+    store.end_session(
+        "wrong-endpoint", ended_at=now + timedelta(seconds=1), status="completed"
+    )
+    try:
+        audit_live_capture(store)
+    except RuntimeError as exc:
+        assert "non-official" in str(exc)
+    else:
+        raise AssertionError("a non-official endpoint was accepted as capture evidence")
+
+
+def test_capture_audit_rejects_orphan_and_mistyped_raw_events(tmp_path):
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    orphan = BybitPublicPITStore(tmp_path / "orphan.sqlite3")
+    orphan.append_raw(
+        event_id="orphan",
+        session_id="missing-session",
+        topic="publicTrade.BTCUSDT",
+        symbol="BTCUSDT",
+        event_type="trade",
+        exchange_time=now,
+        received_at=now,
+        payload={"trade": 1},
+    )
+    try:
+        audit_live_capture(orphan)
+    except RuntimeError as exc:
+        assert "without a session contract" in str(exc)
+    else:
+        raise AssertionError("an orphan raw event was accepted as capture evidence")
+
+    mistyped = BybitPublicPITStore(tmp_path / "mistyped.sqlite3")
+    mistyped.start_session(
+        "mistyped",
+        endpoint=BYBIT_PUBLIC_LINEAR_WS,
+        symbols=("BTCUSDT",),
+        started_at=now,
+    )
+    mistyped.append_raw(
+        event_id="mistyped-event",
+        session_id="mistyped",
+        topic="publicTrade.BTCUSDT",
+        symbol="BTCUSDT",
+        event_type="ticker",
+        exchange_time=now,
+        received_at=now,
+        payload={"trade": 1},
+    )
+    mistyped.end_session(
+        "mistyped", ended_at=now + timedelta(seconds=1), status="completed"
+    )
+    try:
+        audit_live_capture(mistyped)
+    except RuntimeError as exc:
+        assert "topic/type contract" in str(exc)
+    else:
+        raise AssertionError("a mistyped raw event was accepted as capture evidence")
+
+
+def test_capture_audit_rejects_stale_raw_event(tmp_path):
+    store = BybitPublicPITStore(tmp_path / "stale.sqlite3")
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    store.start_session(
+        "stale",
+        endpoint=BYBIT_PUBLIC_LINEAR_WS,
+        symbols=("BTCUSDT",),
+        started_at=now - timedelta(seconds=20),
+    )
+    store.append_raw(
+        event_id="stale-event",
+        session_id="stale",
+        topic="publicTrade.BTCUSDT",
+        symbol="BTCUSDT",
+        event_type="trade",
+        exchange_time=now - timedelta(seconds=11),
+        received_at=now,
+        payload={"trade": 1},
+    )
+    store.end_session(
+        "stale", ended_at=now + timedelta(seconds=1), status="completed"
+    )
+    try:
+        audit_live_capture(store)
+    except RuntimeError as exc:
+        assert "lag contract" in str(exc)
+    else:
+        raise AssertionError("a stale raw event was accepted as capture evidence")
 
 
 def test_audited_liquidations_merge_append_only_and_unlock_continuity(tmp_path):

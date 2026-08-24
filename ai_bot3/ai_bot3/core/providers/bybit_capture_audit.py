@@ -10,7 +10,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
-from core.providers.bybit_public_pit import BybitPublicPITStore, CaptureConflict
+from core.providers.bybit_public_pit import (
+    BYBIT_PUBLIC_LINEAR_WS,
+    BybitPublicPITStore,
+    CaptureConflict,
+)
 
 
 def _canonical(value: object) -> str:
@@ -28,6 +32,16 @@ def _timestamp(value: object) -> datetime:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError("stored capture timestamp has no timezone")
     return parsed.astimezone(timezone.utc)
+
+
+def _topic_event_type(topic: str, symbol: str) -> str | None:
+    contracts = (
+        (topic.startswith("orderbook.") and topic.endswith(f".{symbol}"), "orderbook"),
+        (topic == f"publicTrade.{symbol}", "trade"),
+        (topic == f"allLiquidation.{symbol}", "liquidation"),
+        (topic == f"tickers.{symbol}", "ticker"),
+    )
+    return next((event_type for matches, event_type in contracts if matches), None)
 
 
 @dataclass(frozen=True)
@@ -116,6 +130,37 @@ def audit_live_capture(
                   ORDER BY started_at,session_id"""
         ).fetchall()
 
+        session_contracts: dict[str, dict[str, object]] = {}
+        session_manifest = hashlib.sha256()
+        for row in sessions:
+            record = dict(row)
+            session_id = str(record["session_id"])
+            if str(record["endpoint"]) != BYBIT_PUBLIC_LINEAR_WS:
+                raise RuntimeError("capture audit found a non-official Bybit endpoint")
+            if str(record["status"]) not in {"completed", "disconnected", "failed"}:
+                raise RuntimeError("capture audit found an invalid sealed session status")
+            if record["ended_at"] is None:
+                raise RuntimeError("sealed capture session has no ended_at")
+            started_at = _timestamp(record["started_at"])
+            ended_at = _timestamp(record["ended_at"])
+            if started_at > ended_at:
+                raise RuntimeError("capture session chronology is reversed")
+            try:
+                subscribed_symbols = {
+                    str(value).strip().upper()
+                    for value in json.loads(str(record["symbols_json"]))
+                }
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("capture session symbols contract is invalid") from exc
+            if not subscribed_symbols or "" in subscribed_symbols:
+                raise RuntimeError("capture session has no subscribed symbols")
+            session_contracts[session_id] = {
+                "started_at": started_at,
+                "ended_at": ended_at,
+                "symbols": subscribed_symbols,
+            }
+            session_manifest.update(_canonical(record).encode("utf-8"))
+
         digest = hashlib.sha256()
         for row in sessions:
             digest.update(_canonical(dict(row)).encode("utf-8"))
@@ -132,17 +177,34 @@ def audit_live_capture(
         for session in sessions:
             rows = source.execute(
                 """SELECT sequence,event_id,session_id,topic,symbol,event_type,
-                          received_at,payload_json,payload_sha256
+                          exchange_time,received_at,payload_json,payload_sha256
                      FROM bybit_raw_public_events
                     WHERE session_id=? AND sequence<=?
                     ORDER BY received_at,sequence""",
                 (session["session_id"], maximum_raw),
             )
             for row in rows:
+                contract = session_contracts[str(row["session_id"])]
                 encoded = str(row["payload_json"]).encode("utf-8")
                 if hashlib.sha256(encoded).hexdigest() != str(row["payload_sha256"]):
                     raise CaptureConflict("raw public event payload hash mismatch")
                 received = _timestamp(row["received_at"])
+                exchange_time = _timestamp(row["exchange_time"])
+                if not (
+                    contract["started_at"] <= received <= contract["ended_at"]
+                ):
+                    raise RuntimeError("raw event lies outside its capture session")
+                lag_sec = (received - exchange_time).total_seconds()
+                if lag_sec > 10.0 or lag_sec < -2.0:
+                    raise RuntimeError("raw event violates the public stream lag contract")
+                symbol = str(row["symbol"]).strip().upper()
+                if symbol not in contract["symbols"]:
+                    raise RuntimeError("raw event symbol was not subscribed by its session")
+                topic = str(row["topic"])
+                event_type = str(row["event_type"])
+                topic_contract = _topic_event_type(topic, symbol)
+                if topic_contract is None or event_type != topic_contract:
+                    raise RuntimeError("raw event topic/type contract is invalid")
                 if prior_received is not None and received < prior_received:
                     raise RuntimeError("capture sessions overlap or raw chronology is reversed")
                 if (
@@ -163,9 +225,9 @@ def audit_live_capture(
                 interval_events += 1
                 prior_received = received
                 raw_event_count += 1
-                topic_counts[str(row["topic"])] += 1
-                event_type_counts[str(row["event_type"])] += 1
-                symbols.add(str(row["symbol"]).upper())
+                topic_counts[topic] += 1
+                event_type_counts[event_type] += 1
+                symbols.add(symbol)
                 digest.update(
                     _canonical(
                         {
@@ -180,6 +242,14 @@ def audit_live_capture(
                         }
                     ).encode("utf-8")
                 )
+        journal_count = int(
+            source.execute(
+                "SELECT COUNT(*) FROM bybit_raw_public_events WHERE sequence<=?",
+                (maximum_raw,),
+            ).fetchone()[0]
+        )
+        if raw_event_count != journal_count:
+            raise RuntimeError("capture audit found raw events without a session contract")
         if interval_start is not None and interval_end is not None:
             intervals.append(
                 {
@@ -237,6 +307,14 @@ def audit_live_capture(
             "SELECT 1 FROM bybit_capture_sessions WHERE status='running' LIMIT 1"
         ).fetchone():
             raise CaptureConflict("a capture session started while audit was being sealed")
+        sealed_session_manifest = hashlib.sha256()
+        for row in destination.execute(
+            """SELECT session_id,endpoint,symbols_json,started_at,ended_at,status,error
+                 FROM bybit_capture_sessions ORDER BY started_at,session_id"""
+        ).fetchall():
+            sealed_session_manifest.update(_canonical(dict(row)).encode("utf-8"))
+        if sealed_session_manifest.digest() != session_manifest.digest():
+            raise CaptureConflict("capture sessions changed while audit was running")
         existing = destination.execute(
             "SELECT manifest_sha256 FROM bybit_live_capture_audits WHERE audit_id=?",
             (audit_id,),
