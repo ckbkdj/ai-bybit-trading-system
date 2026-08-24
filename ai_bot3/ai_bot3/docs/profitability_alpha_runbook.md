@@ -248,6 +248,15 @@ live_count=0
 首末成交日之间的无交易日按零收益计入；不足 20 个日簇、缺少 UTC 退出时间，或
 moving-block bootstrap 的 95% 下界不大于零，都不得通过。
 
+`execution_cost_report.json` 必须分别核对：
+
+- `official_pit_cost_inputs_complete`：每笔交易的 entry/exit spread、depth 和持仓 funding 都有官方 PIT provenance；
+- `proxy_execution_cost_trade_count`：必须为 0；
+- `shadow_or_testnet_fill_receipts_complete`：必须有独立 OOS 成交回执；
+- `queue_position_and_latency_calibration_complete`：必须用这些回执完成校准。
+
+官方历史盘口可以替换 OHLCV spread/depth 代理，但不能独自满足后两项。
+
 ## 10. 因子消融验收
 
 每个 baseline/augmented arm 至少满足代码中预先锁定的 OOS trade/fold 下限。只有以下条件同时满足才 retained：

@@ -96,6 +96,12 @@ class TradeRecord:
     exit_fill_price: float
     filled_quantity: float
     market_key: str
+    execution_cost_evidence_complete: bool
+    entry_spread_source: str
+    entry_depth_source: str
+    exit_spread_source: str
+    exit_depth_source: str
+    funding_source: str
 
     def to_dict(self) -> dict[str, object]:
         payload = asdict(self)
@@ -136,6 +142,9 @@ class EventDrivenReport:
     total_slippage_cost: float
     total_funding_cost: float
     cancel_fill_race_count: int
+    execution_cost_evidence_complete: bool
+    direct_execution_cost_trade_count: int
+    proxy_execution_cost_trade_count: int
     intrabar_path_used: bool = True
     mark_to_market_used: bool = True
     equity_curve: tuple[EquityPoint, ...] = ()
@@ -445,6 +454,12 @@ class EventDrivenBacktest:
                 exit_fill_price=float(label.exit_fill_price),
                 filled_quantity=float(label.filled_quantity),
                 market_key=signal.market_key or signal.symbol.upper(),
+                execution_cost_evidence_complete=label.execution_cost_evidence_complete,
+                entry_spread_source=label.entry_spread_source,
+                entry_depth_source=label.entry_depth_source,
+                exit_spread_source=label.exit_spread_source,
+                exit_depth_source=label.exit_depth_source,
+                funding_source=label.funding_source,
             )
             trades.append(trade)
             pending.append(trade)
@@ -467,6 +482,14 @@ class EventDrivenBacktest:
             total_slippage_cost=sum(trade.slippage_cost for trade in trades),
             total_funding_cost=sum(trade.funding_cost for trade in trades),
             cancel_fill_race_count=sum(trade.cancel_fill_race for trade in trades),
+            execution_cost_evidence_complete=bool(trades)
+            and all(trade.execution_cost_evidence_complete for trade in trades),
+            direct_execution_cost_trade_count=sum(
+                trade.execution_cost_evidence_complete for trade in trades
+            ),
+            proxy_execution_cost_trade_count=sum(
+                not trade.execution_cost_evidence_complete for trade in trades
+            ),
             equity_curve=equity_curve,
             maximum_gross_exposure_usdt=max(
                 (point.gross_exposure_usdt for point in equity_curve), default=0.0

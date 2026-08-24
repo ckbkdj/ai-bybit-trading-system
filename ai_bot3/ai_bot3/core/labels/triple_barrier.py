@@ -47,6 +47,12 @@ class MarketBar:
     depth_usdt: float | None = None
     volatility_bps: float | None = None
     funding_bps: float = 0.0
+    spread_source: str = "ohlcv_proxy"
+    depth_source: str = "ohlcv_proxy"
+    funding_source: str = "zero_proxy"
+    spread_observed: bool = False
+    depth_observed: bool = False
+    funding_observed: bool = False
 
     def __post_init__(self) -> None:
         open_time = _utc(self.open_time)
@@ -61,6 +67,11 @@ class MarketBar:
             raise ValueError("invalid OHLC envelope")
         if self.volume < 0:
             raise ValueError("volume cannot be negative")
+        if not all(
+            str(value).strip()
+            for value in (self.spread_source, self.depth_source, self.funding_source)
+        ):
+            raise ValueError("execution cost provenance sources cannot be empty")
 
 
 @dataclass(frozen=True)
@@ -147,6 +158,12 @@ class TripleBarrierLabel:
     max_holding_sec: int
     path_observations: int
     pit_valid: bool
+    execution_cost_evidence_complete: bool
+    entry_spread_source: str
+    entry_depth_source: str
+    exit_spread_source: str
+    exit_depth_source: str
+    funding_source: str
 
     def to_dict(self) -> dict[str, object]:
         payload = asdict(self)
@@ -337,6 +354,16 @@ def build_triple_barrier_label(
     funding_bps = sum(bar.funding_bps for bar in path if bar.close_time <= exit_bar.close_time)
     funding_return = direction * funding_bps / 10_000.0
     net_return = gross_return - fee_return - slippage_return - funding_return
+    funding_path = [bar for bar in path if bar.close_time <= exit_bar.close_time]
+    execution_cost_evidence_complete = bool(
+        entry_bar.spread_observed
+        and entry_bar.depth_observed
+        and exit_bar.spread_observed
+        and exit_bar.depth_observed
+        and funding_path
+        and all(bar.funding_observed for bar in funding_path)
+    )
+    funding_sources = sorted({bar.funding_source for bar in funding_path})
     label_id = hashlib.sha256(
         f"{spec.symbol}|{spec.side}|{_utc(spec.signal_at).isoformat()}|{entry_fill_at.isoformat()}|{exit_at.isoformat()}".encode()
     ).hexdigest()[:32]
@@ -368,6 +395,12 @@ def build_triple_barrier_label(
         max_holding_sec=spec.max_holding_sec,
         path_observations=len(path),
         pit_valid=True,
+        execution_cost_evidence_complete=execution_cost_evidence_complete,
+        entry_spread_source=entry_bar.spread_source,
+        entry_depth_source=entry_bar.depth_source,
+        exit_spread_source=exit_bar.spread_source,
+        exit_depth_source=exit_bar.depth_source,
+        funding_source="+".join(funding_sources) if funding_sources else "unobserved",
     )
 
 
@@ -409,6 +442,12 @@ def _empty_label(
         max_holding_sec=spec.max_holding_sec,
         path_observations=0,
         pit_valid=True,
+        execution_cost_evidence_complete=False,
+        entry_spread_source="unfilled",
+        entry_depth_source="unfilled",
+        exit_spread_source="unfilled",
+        exit_depth_source="unfilled",
+        funding_source="unfilled",
     )
 
 

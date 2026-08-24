@@ -160,6 +160,13 @@ flowchart TD
 - 每个市场观测点对所有持仓 mark-to-market，计算真实盘中组合 drawdown。
 - 同日跨币种和重叠持仓在统计门禁中属于同一组合收益簇，不能重复增加有效样本数。
 
+执行成本证据分两层，不能混写：
+
+1. `official_pit_cost_inputs_complete` 要求 entry/exit 使用在 bar open 前已可用的 Bybit 官方盘口 spread/depth，并且持仓路径覆盖完整的官方 settled funding history；OHLCV 只负责保守 barrier path，不能证明盘口成本。
+2. `shadow_or_testnet_fill_receipts_complete` 和 `queue_position_and_latency_calibration_complete` 要求独立、不可变的 OOS shadow/testnet 成交回执。历史归档中的 `fill_probability` 只是盘口深度探针，不是自有订单真实成交证明。
+
+任一层缺失时 `execution_evidence_complete=false`。
+
 没有真实盘口/成交的 shadow 证据时，`execution_evidence_complete=false`，即便回测盈利也不能晋升。
 
 ## 8. 发布状态机

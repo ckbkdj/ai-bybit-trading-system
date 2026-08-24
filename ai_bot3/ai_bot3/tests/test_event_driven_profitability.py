@@ -19,6 +19,7 @@ def _bar(
     close: float,
     *,
     symbol: str = "BTCUSDT",
+    observed_execution_costs: bool = False,
 ) -> MarketBar:
     return MarketBar(
         symbol=symbol,
@@ -34,6 +35,20 @@ def _bar(
         depth_usdt=20_000,
         volatility_bps=25,
         funding_bps=0.2,
+        spread_source=(
+            "bybit.public.orderbook" if observed_execution_costs else "ohlcv_proxy"
+        ),
+        depth_source=(
+            "bybit.public.orderbook" if observed_execution_costs else "ohlcv_proxy"
+        ),
+        funding_source=(
+            "bybit.public.funding_history"
+            if observed_execution_costs
+            else "zero_proxy"
+        ),
+        spread_observed=observed_execution_costs,
+        depth_observed=observed_execution_costs,
+        funding_observed=observed_execution_costs,
     )
 
 
@@ -69,6 +84,41 @@ def test_event_driven_backtest_uses_fills_intrabar_path_and_all_costs():
     assert trade.fee_cost > 0 and trade.slippage_cost > 0 and trade.funding_cost > 0
     assert trade.net_pnl < trade.gross_pnl
     assert trade.notional_usdt <= 10_000
+    assert report.execution_cost_evidence_complete is False
+    assert report.proxy_execution_cost_trade_count == 1
+
+
+def test_event_driven_backtest_propagates_direct_cost_provenance():
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    signal = SignalEvent(
+        signal_id="alpha-direct-cost-1",
+        symbol="BTCUSDT",
+        side="BUY",
+        decision_at=start,
+        reference_price=100.0,
+        lower_bound_net_edge=0.001,
+        take_profit_bps=100,
+        stop_loss_bps=100,
+        max_holding_sec=180,
+    )
+    bars = [
+        _bar(start, 102, 99.5, 101.5, observed_execution_costs=True),
+        _bar(
+            start + timedelta(minutes=1),
+            102,
+            99.5,
+            101.5,
+            observed_execution_costs=True,
+        ),
+    ]
+    report = EventDrivenBacktest().run([signal], {"BTCUSDT": bars})
+    assert len(report.trades) == 1
+    assert report.execution_cost_evidence_complete is True
+    assert report.direct_execution_cost_trade_count == 1
+    assert report.proxy_execution_cost_trade_count == 0
+    trade = report.trades[0]
+    assert trade.entry_spread_source == "bybit.public.orderbook"
+    assert trade.funding_source == "bybit.public.funding_history"
 
 
 def test_event_driven_backtest_fails_closed_on_nonpositive_edge():

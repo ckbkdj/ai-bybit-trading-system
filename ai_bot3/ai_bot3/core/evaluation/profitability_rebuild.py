@@ -45,6 +45,9 @@ from core.training.pooled_panel import (
     dataset_manifest,
 )
 from core.training.nested_walk_forward import NestedWalkForwardSelector
+from core.training.bybit_execution_bars import (
+    enrich_market_bars_with_bybit_execution_pit,
+)
 from core.training.bybit_pit_panel import BybitPITFeatureSource
 from core.training.macro_pit_panel import (
     MACRO_FEATURE_CONTRACTS,
@@ -1244,6 +1247,32 @@ class ProfitabilityRebuild:
         panels: dict[int, pd.DataFrame] = {}
         market: dict[str, Sequence[MarketBar]] = {}
         source_evidence: dict[str, object] = {}
+        bybit_source: BybitPITFeatureSource | None = None
+        bybit_history: pd.DataFrame | None = None
+        bybit_history_by_symbol: dict[str, pd.DataFrame] = {}
+        bybit_names: tuple[str, ...] = ()
+        bybit_pit_evidence: dict[str, object] | None = None
+        execution_bar_evidence: dict[str, object] = {}
+        if self.config.bybit_pit_store_path is not None:
+            bybit_names = tuple(
+                dict.fromkeys(
+                    name
+                    for columns in SHORT_FACTOR_GROUPS.values()
+                    for name in columns
+                )
+            )
+            bybit_source = BybitPITFeatureSource(self.config.bybit_pit_store_path)
+            bybit_history, bybit_pit_evidence = bybit_source.load(
+                bybit_names,
+                maximum_sequence=self.bybit_pit_snapshot_maximum_sequence,
+            )
+            bybit_history_by_symbol = {
+                symbol: bybit_history[
+                    bybit_history["symbol"].astype(str).str.upper() == symbol
+                ].copy()
+                for symbol in SYMBOLS
+            }
+            source_evidence["bybit_public_pit"] = bybit_pit_evidence
         prepared_history: dict[int, dict[str, tuple[pd.DataFrame, Sequence[MarketBar]]]] = {}
         lockbox_start_by_horizon: dict[int, datetime] = {}
         for horizon in HORIZONS_SEC:
@@ -1256,6 +1285,18 @@ class ProfitabilityRebuild:
                 coverage = validate_source_coverage(frame, timeframe)
                 enriched = _engineer_features(frame)
                 bars = _market_bars(enriched)
+                if (
+                    bybit_source is not None
+                    and bybit_pit_evidence is not None
+                    and bybit_history is not None
+                ):
+                    bars, bar_evidence = enrich_market_bars_with_bybit_execution_pit(
+                        bars,
+                        source=bybit_source,
+                        history=bybit_history_by_symbol[symbol],
+                        source_evidence=bybit_pit_evidence,
+                    )
+                    execution_bar_evidence[f"{symbol}:{horizon}"] = bar_evidence
                 market[f"{symbol}:{horizon}"] = bars
                 prepared_history[horizon][symbol] = (enriched, bars)
                 decision_times.append(enriched["close_at"])
@@ -1297,6 +1338,8 @@ class ProfitabilityRebuild:
                     )
                 )
             panels[horizon] = pd.DataFrame(rows)
+        if execution_bar_evidence:
+            source_evidence["bybit_execution_bars"] = execution_bar_evidence
 
         trad_source: TradPanelHistorySource | None = None
         trad_history: pd.DataFrame | None = None
@@ -1351,28 +1394,11 @@ class ProfitabilityRebuild:
                 )
             source_evidence["coinmetrics_stablecoin_pit"] = flow_pit_evidence
 
-        bybit_source: BybitPITFeatureSource | None = None
-        bybit_history: pd.DataFrame | None = None
-        bybit_names: tuple[str, ...] = ()
-        bybit_pit_evidence: dict[str, object] | None = None
-        if self.config.bybit_pit_store_path is not None:
-            bybit_names = tuple(
-                dict.fromkeys(
-                    name
-                    for columns in SHORT_FACTOR_GROUPS.values()
-                    for name in columns
-                )
-            )
-            bybit_source = BybitPITFeatureSource(self.config.bybit_pit_store_path)
-            bybit_history, bybit_pit_evidence = bybit_source.load(
-                bybit_names,
-                maximum_sequence=self.bybit_pit_snapshot_maximum_sequence,
-            )
+        if bybit_source is not None and bybit_history is not None:
             for horizon in (180, 900):
                 panels[horizon] = bybit_source.join(
                     panels[horizon], names=bybit_names, history=bybit_history
                 )
-            source_evidence["bybit_public_pit"] = bybit_pit_evidence
 
         splitter = PooledPanelBuilder(
             lockbox_fraction=self.config.lockbox_fraction,
@@ -1591,7 +1617,31 @@ class ProfitabilityRebuild:
         development_stress = backtest.run(
             development_signals, market, cost_multiplier=2.0
         )
-        execution_evidence_complete = False
+        execution_evidence = {
+            "official_pit_cost_inputs_complete": (
+                development_report.execution_cost_evidence_complete
+            ),
+            "direct_execution_cost_trade_count": (
+                development_report.direct_execution_cost_trade_count
+            ),
+            "proxy_execution_cost_trade_count": (
+                development_report.proxy_execution_cost_trade_count
+            ),
+            "shadow_or_testnet_fill_receipts_complete": False,
+            "shadow_or_testnet_fill_receipt_count": 0,
+            "queue_position_and_latency_calibration_complete": False,
+            "historical_archive_claim": (
+                "official PIT spread/depth/funding inputs; not realized own-order fills"
+            ),
+            "blocker": (
+                "requires immutable OOS shadow/testnet fill receipts and queue/latency calibration"
+            ),
+        }
+        execution_evidence_complete = bool(
+            execution_evidence["official_pit_cost_inputs_complete"]
+            and execution_evidence["shadow_or_testnet_fill_receipts_complete"]
+            and execution_evidence["queue_position_and_latency_calibration_complete"]
+        )
         development_gate = evaluate_development_gate(
             development_report.trades,
             walk_forward,
@@ -1626,12 +1676,25 @@ class ProfitabilityRebuild:
             {
                 "evaluation_scope": "development_oos",
                 "execution_evidence_complete": execution_evidence_complete,
+                "execution_evidence": execution_evidence,
                 "normal_cost": development_report.to_dict(include_trades=False),
                 "two_x_cost": development_stress.to_dict(include_trades=False),
                 "limitations": [
-                    "historical spread/depth/fill inputs are conservative OHLCV-derived proxies",
-                    "PIT Bybit orderbook and public-trade histories are not present in the current store",
-                    "therefore execution evidence cannot authorize opening a new lockbox",
+                    *(
+                        []
+                        if development_report.proxy_execution_cost_trade_count == 0
+                        else [
+                            "one or more trades still use OHLCV-derived execution cost proxies"
+                        ]
+                    ),
+                    *(
+                        []
+                        if bybit_pit_evidence is not None
+                        else ["no PIT Bybit public execution source was supplied"]
+                    ),
+                    "official historical public data is not realized own-order fill evidence",
+                    "immutable OOS shadow/testnet receipts and queue/latency calibration are incomplete",
+                    "execution evidence cannot authorize opening a new lockbox",
                 ],
             },
         )
