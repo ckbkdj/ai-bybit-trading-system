@@ -19,6 +19,7 @@ from core.evaluation.profitability_gate import (
     write_profitability_report,
 )
 from core.evaluation.profitability_rebuild import (
+    _precommitted_statistical_trial_count,
     _require_precommitted_horizon_gates,
     write_failed_outputs,
 )
@@ -52,6 +53,18 @@ def _profitable_trades() -> list[dict[str, object]]:
     return output
 
 
+def _statistical_evidence() -> dict[str, object]:
+    return {
+        "complete": True,
+        "deflated_sharpe_probability": 0.97,
+        "probability_of_backtest_overfitting": 0.01,
+        "number_of_trials": 25,
+        "strategy_count": 4,
+        "combination_count": 70,
+        "return_unit": "utc_calendar_day_portfolio_net_return",
+    }
+
+
 def test_profitability_gate_passes_only_complete_stable_evidence():
     gate = evaluate_profitability_gate(
         _profitable_trades(),
@@ -62,6 +75,7 @@ def test_profitability_gate_passes_only_complete_stable_evidence():
         mark_to_market_evidence_complete=True,
         execution_evidence_complete=True,
         factor_ablation_complete=True,
+        statistical_overfit_evidence=_statistical_evidence(),
     )
     assert gate.profitability_gate == "PASSED"
     assert gate.stage == "candidate"
@@ -84,6 +98,8 @@ def test_profitability_thresholds_cannot_be_relaxed():
         ("minimum_net_return", -0.0001),
         ("minimum_profit_factor", 1.1999),
         ("minimum_fee_adjusted_win_rate", 0.5199),
+        ("minimum_deflated_sharpe_probability", 0.9499),
+        ("maximum_cscv_pbo", 0.0501),
         ("maximum_drawdown", 0.030001),
         ("minimum_bootstrap_expectancy", -0.0001),
         ("minimum_two_x_cost_net_return", -0.000001),
@@ -99,6 +115,15 @@ def test_profitability_thresholds_cannot_be_relaxed():
             ProfitabilityThresholds(**{field: value})
 
 
+def test_statistical_trial_count_includes_every_factor_arm_and_prior_pipeline():
+    audit = _precommitted_statistical_trial_count(2, 1)
+
+    assert audit["final_model_variant_count"] == 10
+    assert audit["ablation_horizon_arm_count"] == 90
+    assert audit["current_pipeline_variant_count"] == 190
+    assert audit["number_of_trials"] == 380
+
+
 def test_profitability_gate_defaults_missing_release_evidence_to_failed():
     gate = evaluate_profitability_gate(
         _profitable_trades(),
@@ -112,6 +137,8 @@ def test_profitability_gate_defaults_missing_release_evidence_to_failed():
     assert gate.profitability_gate == "FAILED"
     assert "execution_evidence" in gate.blockers
     assert "factor_ablation" in gate.blockers
+    assert "deflated_sharpe_ratio" in gate.blockers
+    assert "cscv_probability_of_backtest_overfitting" in gate.blockers
 
 
 def test_profitability_gate_enforces_net_win_rate_and_nonnegative_cost_stress():
@@ -127,6 +154,7 @@ def test_profitability_gate_enforces_net_win_rate_and_nonnegative_cost_stress():
         mark_to_market_evidence_complete=True,
         execution_evidence_complete=True,
         factor_ablation_complete=True,
+        statistical_overfit_evidence=_statistical_evidence(),
     )
 
     assert gate.profitability_gate == "FAILED"
@@ -146,6 +174,7 @@ def test_horizon_scope_requires_30_trades_while_portfolio_requires_100():
         mark_to_market_evidence_complete=True,
         execution_evidence_complete=True,
         factor_ablation_complete=True,
+        statistical_overfit_evidence=_statistical_evidence(),
         gate_scope="horizon",
     )
     portfolio = evaluate_profitability_gate(
@@ -157,6 +186,7 @@ def test_horizon_scope_requires_30_trades_while_portfolio_requires_100():
         mark_to_market_evidence_complete=True,
         execution_evidence_complete=True,
         factor_ablation_complete=True,
+        statistical_overfit_evidence=_statistical_evidence(),
     )
 
     assert horizon.checks["minimum_trades"]["passed"] is True
@@ -175,6 +205,7 @@ def test_portfolio_profit_cannot_authorize_a_failed_precommitted_horizon():
         mark_to_market_evidence_complete=True,
         execution_evidence_complete=True,
         factor_ablation_complete=True,
+        statistical_overfit_evidence=_statistical_evidence(),
     )
     failed_horizon = evaluate_profitability_gate(
         [],
@@ -214,6 +245,7 @@ def test_profitability_gate_does_not_treat_correlated_trades_as_independent():
         mark_to_market_evidence_complete=True,
         execution_evidence_complete=True,
         factor_ablation_complete=True,
+        statistical_overfit_evidence=_statistical_evidence(),
     )
     assert gate.profitability_gate == "FAILED"
     assert "independent_return_clusters" in gate.blockers
@@ -315,6 +347,7 @@ def test_candidate_manifest_binds_every_final_evidence_report(tmp_path):
         mark_to_market_evidence_complete=True,
         execution_evidence_complete=True,
         factor_ablation_complete=True,
+        statistical_overfit_evidence=_statistical_evidence(),
     )
     profitability = tmp_path / "profitability_report.json"
     model = tmp_path / "model.json"
@@ -358,6 +391,7 @@ def test_candidate_manifest_release_id_is_derived_from_bound_evidence(tmp_path):
         mark_to_market_evidence_complete=True,
         execution_evidence_complete=True,
         factor_ablation_complete=True,
+        statistical_overfit_evidence=_statistical_evidence(),
     )
     profitability = tmp_path / "profitability_report.json"
     model = tmp_path / "model.json"
@@ -420,6 +454,7 @@ def test_development_gate_can_pass_without_creating_a_candidate_or_opening_lockb
         mark_to_market_evidence_complete=True,
         execution_evidence_complete=True,
         factor_ablation_complete=True,
+        statistical_overfit_evidence=_statistical_evidence(),
     )
     assert development.profitability_gate == "PASSED"
     assert development.stage == "development_validated"

@@ -22,7 +22,12 @@ from core.evaluation.profitability_gate import (
     write_profitability_report,
 )
 from core.evaluation.ablation import compare_factor_groups
-from core.evaluation.statistical_governance import TrialLedger, TrialRecord
+from core.evaluation.statistical_governance import (
+    TrialLedger,
+    TrialRecord,
+    final_evaluation_statistical_evidence,
+    statistical_overfit_evidence,
+)
 from core.features.profitability_technical import (
     LEGACY_BRAIN_FEATURE_COLUMNS,
     TECHNICAL_FEATURE_COLUMNS,
@@ -142,6 +147,34 @@ ABLATION_RESEARCH_TAIL_PENALTY = 0.50
 BYBIT_EXECUTION_EVIDENCE_FEATURES = tuple(
     dict.fromkeys((*ORDERBOOK_EXECUTION_FEATURES, "funding_rate"))
 )
+
+
+def _precommitted_statistical_trial_count(
+    candidate_config_count: int,
+    historical_pipeline_trial_count: int,
+) -> dict[str, int]:
+    """Count every pre-registered model/factor arm before OOS is scored."""
+
+    if candidate_config_count < 2 or historical_pipeline_trial_count < 0:
+        raise ValueError("invalid statistical trial-count inputs")
+    final_model_variants = candidate_config_count * len(HORIZONS_SEC)
+    ablation_horizon_arms = 2 * (
+        len(LEGACY_FACTOR_GROUPS) * len(HORIZONS_SEC)
+        + len(SHORT_FACTOR_GROUPS) * 2
+        + len(LONG_FACTOR_GROUPS) * 3
+    )
+    current_pipeline_variants = (
+        final_model_variants + candidate_config_count * ablation_horizon_arms
+    )
+    total = current_pipeline_variants * (historical_pipeline_trial_count + 1)
+    return {
+        "candidate_config_count": candidate_config_count,
+        "final_model_variant_count": final_model_variants,
+        "ablation_horizon_arm_count": ablation_horizon_arms,
+        "current_pipeline_variant_count": current_pipeline_variants,
+        "historical_pipeline_trial_count": historical_pipeline_trial_count,
+        "number_of_trials": total,
+    }
 
 
 def _bybit_names_for_horizon(
@@ -2594,6 +2627,27 @@ class ProfitabilityRebuild:
                 meta_trade_probability=0.62,
             ),
         )
+        candidate_config_ids = {
+            _hash_payload(asdict(config))[:16]: config for config in candidate_configs
+        }
+        historical_pipeline_trial_count = self.ledger.trial_count(
+            "profitability_two_stage"
+        )
+        statistical_trial_audit = _precommitted_statistical_trial_count(
+            len(candidate_configs), historical_pipeline_trial_count
+        )
+        self.ledger.append_event(
+            self.trial_id,
+            "running",
+            {
+                "phase": "statistical_governance_preregistered",
+                **statistical_trial_audit,
+                "candidate_config_ids": sorted(candidate_config_ids),
+                "dsr_minimum_probability": 0.95,
+                "cscv_maximum_pbo": 0.05,
+                "cscv_partitions": 8,
+            },
+        )
         selector = NestedWalkForwardSelector(candidate_configs, inner_folds=3)
         backtest = EventDrivenBacktest(BacktestConfig())
         ablation_backtest = EventDrivenBacktest(
@@ -2750,6 +2804,15 @@ class ProfitabilityRebuild:
             model_feature_columns_by_horizon[horizon] = FEATURE_COLUMNS + tuple(
                 dict.fromkeys(retained_factor_columns)
             )
+        variant_signals_by_horizon: dict[
+            int, dict[str, list[SignalEvent]]
+        ] = {
+            horizon: {config_id: [] for config_id in candidate_config_ids}
+            for horizon in HORIZONS_SEC
+        }
+        development_evaluation_timestamps_by_horizon: dict[int, list[object]] = {
+            horizon: [] for horizon in HORIZONS_SEC
+        }
         for horizon, dataset in release_datasets.items():
             model_feature_columns = model_feature_columns_by_horizon[horizon]
             for fold in dataset.folds:
@@ -2765,6 +2828,44 @@ class ProfitabilityRebuild:
                 )
                 development_signals_by_horizon[horizon].extend(signals)
                 report = backtest.run(signals, market)
+                development_evaluation_timestamps_by_horizon[horizon].extend(
+                    test["decision_at"].tolist()
+                )
+                selected_config_id = _hash_payload(
+                    asdict(selection.selected_config)
+                )[:16]
+                for config_id, config in candidate_config_ids.items():
+                    if config_id == selected_config_id:
+                        variant_predictions = predictions
+                        variant_signals = signals
+                        variant_report = report
+                    else:
+                        variant_model = TwoStageAlphaModel(config).fit(
+                            train, model_feature_columns
+                        )
+                        variant_predictions = variant_model.predict(test)
+                        variant_signals = _signals_from_predictions(
+                            test, variant_predictions, horizon
+                        )
+                        variant_report = backtest.run(variant_signals, market)
+                    variant_signals_by_horizon[horizon][config_id].extend(
+                        variant_signals
+                    )
+                    self.ledger.append_event(
+                        self.trial_id,
+                        "running",
+                        {
+                            "phase": "outer_walk_forward_variant_scored",
+                            "horizon_sec": horizon,
+                            "fold_id": fold.fold_id,
+                            "config_id": config_id,
+                            "selected_by_inner_oos": config_id == selected_config_id,
+                            "outer_oos_used_for_tuning": False,
+                            "signals": len(variant_signals),
+                            "trades": len(variant_report.trades),
+                            "net_return": variant_report.net_return,
+                        },
+                    )
                 self.ledger.append_event(
                     self.trial_id,
                     "running",
@@ -2794,12 +2895,17 @@ class ProfitabilityRebuild:
                         "nested_selection": dict(selection.audit),
                         "inner_candidate_results": list(selection.candidate_results),
                         "outer_oos_used_for_tuning": False,
+                        "statistical_variant_config_ids": sorted(
+                            candidate_config_ids
+                        ),
                         "formal_feature_columns": list(model_feature_columns),
                     }
                 )
 
         horizon_development_gates: dict[int, ProfitabilityGateResult] = {}
         horizon_development_reports: dict[int, dict[str, object]] = {}
+        horizon_development_statistical_evidence: dict[int, dict[str, object]] = {}
+        horizon_variant_reports: dict[int, dict[str, object]] = {}
         for horizon in HORIZONS_SEC:
             horizon_signals = development_signals_by_horizon[horizon]
             horizon_report = backtest.run(horizon_signals, market)
@@ -2808,6 +2914,20 @@ class ProfitabilityRebuild:
             )
             horizon_execution_evidence = _execution_release_evidence(
                 horizon_report
+            )
+            variant_reports = {
+                config_id: backtest.run(signals, market)
+                for config_id, signals in variant_signals_by_horizon[horizon].items()
+            }
+            horizon_variant_reports[horizon] = variant_reports
+            horizon_statistical_evidence = statistical_overfit_evidence(
+                horizon_report,
+                tuple(variant_reports[config_id] for config_id in sorted(variant_reports)),
+                development_evaluation_timestamps_by_horizon[horizon],
+                number_of_trials=int(statistical_trial_audit["number_of_trials"]),
+            )
+            horizon_development_statistical_evidence[horizon] = (
+                horizon_statistical_evidence
             )
             horizon_gate = evaluate_development_gate(
                 horizon_report.trades,
@@ -2828,6 +2948,7 @@ class ProfitabilityRebuild:
                 factor_ablation_complete=bool(
                     factor_report["all_required_groups_evaluated"]
                 ),
+                statistical_overfit_evidence=horizon_statistical_evidence,
                 gate_scope="horizon",
                 thresholds=ProfitabilityThresholds(),
             )
@@ -2839,6 +2960,11 @@ class ProfitabilityRebuild:
                 "direct_execution_release_dataset": (
                     release_dataset_evidence[horizon]
                 ),
+                "statistical_overfit_evidence": horizon_statistical_evidence,
+                "pre_registered_variant_results": {
+                    config_id: report.to_dict(include_trades=False)
+                    for config_id, report in variant_reports.items()
+                },
             }
             self.ledger.append_event(
                 self.trial_id,
@@ -2848,6 +2974,12 @@ class ProfitabilityRebuild:
                     "horizon_sec": horizon,
                     "profitability_gate": horizon_gate.profitability_gate,
                     "blockers": list(horizon_gate.blockers),
+                    "deflated_sharpe_probability": horizon_statistical_evidence.get(
+                        "deflated_sharpe_probability"
+                    ),
+                    "cscv_pbo": horizon_statistical_evidence.get(
+                        "probability_of_backtest_overfitting"
+                    ),
                 },
             )
         development_eligible_horizons = tuple(
@@ -2875,6 +3007,31 @@ class ProfitabilityRebuild:
                 "candidate_backtest_execution_evidence_complete"
             ]
         )
+        portfolio_variant_reports = {
+            config_id: backtest.run(
+                [
+                    signal
+                    for horizon in development_eligible_horizons
+                    for signal in variant_signals_by_horizon[horizon][config_id]
+                ],
+                market,
+            )
+            for config_id in sorted(candidate_config_ids)
+        }
+        portfolio_evaluation_timestamps = [
+            value
+            for horizon in development_eligible_horizons
+            for value in development_evaluation_timestamps_by_horizon[horizon]
+        ]
+        development_statistical_evidence = statistical_overfit_evidence(
+            development_report,
+            tuple(
+                portfolio_variant_reports[config_id]
+                for config_id in sorted(portfolio_variant_reports)
+            ),
+            portfolio_evaluation_timestamps,
+            number_of_trials=int(statistical_trial_audit["number_of_trials"]),
+        )
         development_gate = evaluate_development_gate(
             development_report.trades,
             eligible_walk_forward,
@@ -2884,6 +3041,7 @@ class ProfitabilityRebuild:
             mark_to_market_evidence_complete=development_report.mark_to_market_used,
             execution_evidence_complete=candidate_execution_evidence_complete,
             factor_ablation_complete=bool(factor_report["all_required_groups_evaluated"]),
+            statistical_overfit_evidence=development_statistical_evidence,
             thresholds=ProfitabilityThresholds(),
         )
         output = self.config.output_dir
@@ -2918,6 +3076,47 @@ class ProfitabilityRebuild:
             },
         )
         _atomic_json(output / "factor_ablation_report.json", factor_report)
+        _atomic_json(
+            output / "statistical_overfit_report.json",
+            {
+                "trial_id": self.trial_id,
+                "code_commit": self.config.code_commit,
+                "data_snapshot_fingerprint": _hash_payload(source_evidence),
+                "feature_schema_hash": _hash_payload(
+                    model_feature_columns_by_horizon
+                ),
+                "statistical_policy_hash": _hash_payload(
+                    {
+                        "candidate_configs": [
+                            asdict(config) for config in candidate_configs
+                        ],
+                        "trial_count_audit": statistical_trial_audit,
+                        "dsr_minimum_probability": 0.95,
+                        "cscv_maximum_pbo": 0.05,
+                        "cscv_partitions": 8,
+                    }
+                ),
+                "evaluation_scope": "development_outer_oos",
+                "thresholds": {
+                    "minimum_deflated_sharpe_probability": 0.95,
+                    "maximum_cscv_probability_of_backtest_overfitting": 0.05,
+                },
+                "trial_count_audit": statistical_trial_audit,
+                "portfolio": development_statistical_evidence,
+                "horizons": {
+                    str(horizon): evidence
+                    for horizon, evidence in horizon_development_statistical_evidence.items()
+                },
+                "lockbox_policy": (
+                    "DSR is recomputed once on the selected lockbox path; CSCV/PBO remains "
+                    "frozen on development and alternative variants are never scored on lockbox"
+                ),
+                "sources": [
+                    "https://www.davidhbailey.com/dhbpapers/deflated-sharpe.pdf",
+                    "https://www.davidhbailey.com/dhbpapers/backtest-prob.pdf",
+                ],
+            },
+        )
         _atomic_json(
             output / "execution_cost_report.json",
             {
@@ -3181,6 +3380,9 @@ class ProfitabilityRebuild:
         lockbox_signals_by_horizon: dict[int, list[SignalEvent]] = {
             horizon: [] for horizon in development_eligible_horizons
         }
+        lockbox_evaluation_timestamps_by_horizon: dict[int, list[object]] = {
+            horizon: [] for horizon in development_eligible_horizons
+        }
         lockbox_bybit_evidence_by_horizon: dict[int, dict[str, object]] = {}
         for horizon in development_eligible_horizons:
             lockbox_parts: list[pd.DataFrame] = []
@@ -3331,6 +3533,9 @@ class ProfitabilityRebuild:
             lockbox_panel = PooledPanelBuilder.validate(
                 lockbox_panel, horizon
             )
+            lockbox_evaluation_timestamps_by_horizon[horizon].extend(
+                lockbox_panel["decision_at"].tolist()
+            )
             lockbox_panel_fingerprints[horizon] = PooledPanelBuilder.fingerprint(
                 lockbox_panel
             )
@@ -3372,6 +3577,7 @@ class ProfitabilityRebuild:
 
         horizon_lockbox_gates: dict[int, ProfitabilityGateResult] = {}
         horizon_lockbox_reports: dict[int, dict[str, object]] = {}
+        horizon_lockbox_statistical_evidence: dict[int, dict[str, object]] = {}
         for horizon in development_eligible_horizons:
             horizon_signals = lockbox_signals_by_horizon[horizon]
             horizon_report = backtest.run(horizon_signals, market)
@@ -3380,6 +3586,17 @@ class ProfitabilityRebuild:
             )
             horizon_execution_evidence = _execution_release_evidence(
                 horizon_report
+            )
+            horizon_statistical_evidence = final_evaluation_statistical_evidence(
+                horizon_report,
+                lockbox_evaluation_timestamps_by_horizon[horizon],
+                number_of_trials=int(statistical_trial_audit["number_of_trials"]),
+                frozen_development_evidence=(
+                    horizon_development_statistical_evidence[horizon]
+                ),
+            )
+            horizon_lockbox_statistical_evidence[horizon] = (
+                horizon_statistical_evidence
             )
             horizon_gate = evaluate_profitability_gate(
                 horizon_report.trades,
@@ -3400,6 +3617,7 @@ class ProfitabilityRebuild:
                 factor_ablation_complete=bool(
                     factor_report["all_required_groups_evaluated"]
                 ),
+                statistical_overfit_evidence=horizon_statistical_evidence,
                 gate_scope="horizon",
                 thresholds=ProfitabilityThresholds(),
             )
@@ -3408,6 +3626,7 @@ class ProfitabilityRebuild:
                 "gate": horizon_gate.to_dict(),
                 "normal_cost": horizon_report.to_dict(include_trades=True),
                 "two_x_cost": horizon_stress.to_dict(include_trades=False),
+                "statistical_overfit_evidence": horizon_statistical_evidence,
             }
             self.ledger.append_event(
                 self.trial_id,
@@ -3417,6 +3636,12 @@ class ProfitabilityRebuild:
                     "horizon_sec": horizon,
                     "profitability_gate": horizon_gate.profitability_gate,
                     "blockers": list(horizon_gate.blockers),
+                    "deflated_sharpe_probability": horizon_statistical_evidence.get(
+                        "deflated_sharpe_probability"
+                    ),
+                    "frozen_development_cscv_pbo": horizon_statistical_evidence.get(
+                        "probability_of_backtest_overfitting"
+                    ),
                 },
             )
         lockbox_signals = [
@@ -3432,6 +3657,16 @@ class ProfitabilityRebuild:
                 "candidate_backtest_execution_evidence_complete"
             ]
         )
+        lockbox_statistical_evidence = final_evaluation_statistical_evidence(
+            lockbox_report,
+            [
+                value
+                for horizon in development_eligible_horizons
+                for value in lockbox_evaluation_timestamps_by_horizon[horizon]
+            ],
+            number_of_trials=int(statistical_trial_audit["number_of_trials"]),
+            frozen_development_evidence=development_statistical_evidence,
+        )
         gate = evaluate_profitability_gate(
             lockbox_report.trades,
             eligible_walk_forward,
@@ -3443,6 +3678,7 @@ class ProfitabilityRebuild:
                 lockbox_candidate_execution_evidence_complete
             ),
             factor_ablation_complete=bool(factor_report["all_required_groups_evaluated"]),
+            statistical_overfit_evidence=lockbox_statistical_evidence,
             thresholds=ProfitabilityThresholds(),
         )
         gate = _require_precommitted_horizon_gates(
@@ -3468,6 +3704,7 @@ class ProfitabilityRebuild:
                     for horizon, evidence in lockbox_bybit_evidence_by_horizon.items()
                 },
                 "execution_evidence": lockbox_execution_evidence,
+                "statistical_overfit_evidence": lockbox_statistical_evidence,
                 "development_eligible_horizons": list(
                     development_eligible_horizons
                 ),
@@ -3480,6 +3717,58 @@ class ProfitabilityRebuild:
                 },
                 "final_development_selection": final_selection,
                 "result": lockbox_report.to_dict(include_trades=True),
+            },
+        )
+        _atomic_json(
+            output / "statistical_overfit_report.json",
+            {
+                "trial_id": self.trial_id,
+                "code_commit": self.config.code_commit,
+                "data_snapshot_fingerprint": _hash_payload(
+                    {
+                        "development": source_evidence,
+                        "lockbox": lockbox_source_identity,
+                    }
+                ),
+                "feature_schema_hash": _hash_payload(
+                    model_feature_columns_by_horizon
+                ),
+                "statistical_policy_hash": _hash_payload(
+                    {
+                        "candidate_configs": [
+                            asdict(config) for config in candidate_configs
+                        ],
+                        "trial_count_audit": statistical_trial_audit,
+                        "dsr_minimum_probability": 0.95,
+                        "cscv_maximum_pbo": 0.05,
+                        "cscv_partitions": 8,
+                    }
+                ),
+                "evaluation_scope": "development_and_single_use_lockbox",
+                "thresholds": {
+                    "minimum_deflated_sharpe_probability": 0.95,
+                    "maximum_cscv_probability_of_backtest_overfitting": 0.05,
+                },
+                "trial_count_audit": statistical_trial_audit,
+                "development": {
+                    "portfolio": development_statistical_evidence,
+                    "horizons": {
+                        str(horizon): evidence
+                        for horizon, evidence in horizon_development_statistical_evidence.items()
+                    },
+                },
+                "lockbox": {
+                    "portfolio": lockbox_statistical_evidence,
+                    "horizons": {
+                        str(horizon): evidence
+                        for horizon, evidence in horizon_lockbox_statistical_evidence.items()
+                    },
+                    "alternative_variants_scored_on_lockbox": False,
+                },
+                "sources": [
+                    "https://www.davidhbailey.com/dhbpapers/deflated-sharpe.pdf",
+                    "https://www.davidhbailey.com/dhbpapers/backtest-prob.pdf",
+                ],
             },
         )
         _atomic_json(
@@ -3577,6 +3866,7 @@ class ProfitabilityRebuild:
                         "factor_ablation_report.json",
                         "execution_cost_report.json",
                         "capital_preservation_report.json",
+                        "statistical_overfit_report.json",
                     )
                 },
             )
@@ -3654,6 +3944,16 @@ def write_failed_outputs(output_dir: Path, *, reason: str) -> ProfitabilityGateR
         ("factor_ablation_report.json", _factor_ablation_report()),
         ("execution_cost_report.json", {"status": "FAILED", "reason": reason, "execution_evidence_complete": False}),
         ("capital_preservation_report.json", policy_report(CapitalPreservationConfig())),
+        (
+            "statistical_overfit_report.json",
+            {
+                "status": "FAILED",
+                "reason": reason,
+                "complete": False,
+                "deflated_sharpe_probability": None,
+                "probability_of_backtest_overfitting": None,
+            },
+        ),
     ):
         _atomic_json(output_dir / name, payload)
     return result

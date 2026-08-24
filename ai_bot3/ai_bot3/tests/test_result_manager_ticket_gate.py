@@ -109,6 +109,7 @@ def _profitability_release(root: Path) -> tuple[Path, Path, dict]:
         "factor_ablation_report.json",
         "execution_cost_report.json",
         "capital_preservation_report.json",
+        "statistical_overfit_report.json",
     ):
         evidence_path = root / name
         evidence_path.write_text(

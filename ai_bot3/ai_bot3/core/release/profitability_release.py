@@ -16,6 +16,7 @@ REQUIRED_EVIDENCE_REPORTS = (
     "factor_ablation_report.json",
     "execution_cost_report.json",
     "capital_preservation_report.json",
+    "statistical_overfit_report.json",
 )
 
 

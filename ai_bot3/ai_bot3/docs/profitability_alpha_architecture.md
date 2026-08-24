@@ -191,6 +191,7 @@ FOMC 采集不能用会议日历日期猜测 14:00，也不能把 minutes、impl
 - 每个市场观测点对所有持仓 mark-to-market，计算真实盘中组合 drawdown。
 - 成交瞬间按 PIT reference/mid 而不是 fill price 标记权益，使入场 spread/slippage 立即进入回撤；2× 成本压力也同步作用于未平仓 funding MTM，不能只加压最终已实现收益。
 - 组合 development/lockbox 至少 100 笔、每个启用 horizon 至少 30 笔；费用后净 `net_pnl` 胜率至少 52%，2× 手续费/滑点/funding 压力净收益必须大于等于 0。三个条件都是代码门禁，不能用运行参数下调。
+- DSR 使用组合逐日 mark-to-market 收益、偏度、峰度、样本长度与预注册试验总数，放行概率不得低于 95%；PBO 使用固定 8 段 CSCV、同步的备选策略日收益矩阵，放行值不得高于 5%。备选策略只能在 development outer OOS 形成该矩阵；lockbox 只重算已冻结最终策略的 DSR，并继承 development PBO，禁止在 lockbox 上比较备选参数。
 - 同日跨币种和重叠持仓在统计门禁中属于同一组合收益簇，不能重复增加有效样本数。
 
 执行成本证据分两层，不能混写：

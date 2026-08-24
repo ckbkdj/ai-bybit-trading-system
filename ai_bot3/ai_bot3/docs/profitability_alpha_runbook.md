@@ -304,6 +304,7 @@ runtime 会校验模型和 bundle 哈希、逐列 staleness、`available_at <= d
 5. `profitability_report.json`：development/lockbox 门禁总结果；
 6. `lockbox_report.json`：未获授权时必须保持 sealed/unlabeled；
 7. `candidate_release_manifest.json`：只有全部门禁通过时才允许存在。
+8. `statistical_overfit_report.json`：逐 horizon 与组合的 DSR、CSCV/PBO、完整试验计数和 lockbox 不比较备选模型的证据。
 
 失败时应明确看到：
 

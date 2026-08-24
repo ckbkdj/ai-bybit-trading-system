@@ -16,6 +16,8 @@ class ProfitabilityThresholds:
     minimum_net_return: float = 0.0
     minimum_profit_factor: float = 1.20
     minimum_fee_adjusted_win_rate: float = 0.52
+    minimum_deflated_sharpe_probability: float = 0.95
+    maximum_cscv_pbo: float = 0.05
     maximum_drawdown: float = 0.03
     minimum_bootstrap_expectancy: float = 0.0
     minimum_two_x_cost_net_return: float = 0.0
@@ -34,6 +36,12 @@ class ProfitabilityThresholds:
             raise ValueError("minimum_profit_factor cannot be below 1.20")
         if self.minimum_fee_adjusted_win_rate < 0.52:
             raise ValueError("minimum_fee_adjusted_win_rate cannot be below 52%")
+        if self.minimum_deflated_sharpe_probability < 0.95:
+            raise ValueError(
+                "minimum_deflated_sharpe_probability cannot be below 95%"
+            )
+        if not 0 <= self.maximum_cscv_pbo <= 0.05:
+            raise ValueError("maximum_cscv_pbo cannot exceed 5%")
         if not 0 < self.maximum_drawdown <= 0.03:
             raise ValueError("maximum_drawdown cannot exceed 3%")
         if self.minimum_bootstrap_expectancy < 0:
@@ -217,6 +225,7 @@ def evaluate_profitability_gate(
     mark_to_market_evidence_complete: bool = False,
     execution_evidence_complete: bool = False,
     factor_ablation_complete: bool = False,
+    statistical_overfit_evidence: Mapping[str, object] | None = None,
     gate_scope: str = "portfolio",
     thresholds: ProfitabilityThresholds | None = None,
 ) -> ProfitabilityGateResult:
@@ -246,6 +255,12 @@ def evaluate_profitability_gate(
     fee_adjusted_win_rate = (
         sum(value > 0 for value in pnls) / len(pnls) if pnls else 0.0
     )
+    statistical_evidence = dict(statistical_overfit_evidence or {})
+    statistical_complete = bool(statistical_evidence.get("complete"))
+    deflated_sharpe_probability = statistical_evidence.get(
+        "deflated_sharpe_probability"
+    )
+    cscv_pbo = statistical_evidence.get("probability_of_backtest_overfitting")
     realized_only_drawdown = _maximum_drawdown(pnls, initial_equity_usdt)
     mark_to_market_drawdown = (
         float(mark_to_market_max_drawdown)
@@ -294,6 +309,27 @@ def evaluate_profitability_gate(
             "passed": bool(factor_ablation_complete),
             "actual": bool(factor_ablation_complete),
             "required": True,
+        },
+        "deflated_sharpe_ratio": {
+            "passed": statistical_complete
+            and deflated_sharpe_probability is not None
+            and float(deflated_sharpe_probability)
+            >= cfg.minimum_deflated_sharpe_probability,
+            "actual": deflated_sharpe_probability,
+            "threshold": cfg.minimum_deflated_sharpe_probability,
+            "evidence_complete": statistical_complete,
+            "number_of_trials": statistical_evidence.get("number_of_trials"),
+            "return_unit": statistical_evidence.get("return_unit"),
+        },
+        "cscv_probability_of_backtest_overfitting": {
+            "passed": statistical_complete
+            and cscv_pbo is not None
+            and float(cscv_pbo) <= cfg.maximum_cscv_pbo,
+            "actual": cscv_pbo,
+            "maximum": cfg.maximum_cscv_pbo,
+            "evidence_complete": statistical_complete,
+            "strategy_count": statistical_evidence.get("strategy_count"),
+            "combination_count": statistical_evidence.get("combination_count"),
         },
         "minimum_trades": {
             "passed": len(trades) >= minimum_trades,
@@ -368,6 +404,8 @@ def evaluate_profitability_gate(
             "net_return": net_return,
             "profit_factor": profit_factor_actual,
             "fee_adjusted_win_rate": fee_adjusted_win_rate,
+            "deflated_sharpe_probability": deflated_sharpe_probability,
+            "cscv_probability_of_backtest_overfitting": cscv_pbo,
             "max_drawdown": mark_to_market_drawdown,
             "realized_close_only_drawdown": realized_only_drawdown,
             "bootstrap_lower_expectancy": bootstrap_lower,
