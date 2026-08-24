@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import sqlite3
 import sys
@@ -19,8 +20,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.evaluation.profitability_rebuild import (
+    KlinePanelSource,
     MINIMUM_COVERAGE_DAYS,
     SYMBOLS,
+    audit_source_coverage,
 )
 from core.providers.binance_kline_archive import (
     BinanceKlineArchiveStore,
@@ -107,6 +110,57 @@ def _payload(path: Path, url: str) -> tuple[int, bytes]:
     return status, body
 
 
+def _coverage_report(
+    database: Path,
+    *,
+    symbols: tuple[str, ...] = SYMBOLS,
+    timeframes: tuple[str, ...] | None = None,
+) -> dict[str, object]:
+    source = KlinePanelSource(database)
+    selected_timeframes = timeframes or tuple(
+        HORIZON_TIMEFRAME[horizon] for horizon in HORIZON_TIMEFRAME
+    )
+    series: list[dict[str, object]] = []
+    for symbol in symbols:
+        for timeframe in selected_timeframes:
+            try:
+                frame = source.load(symbol, timeframe, 200_000)
+                audit = audit_source_coverage(
+                    frame,
+                    timeframe,
+                    listing_evidence=source.listing_evidence(symbol, timeframe),
+                )
+            except Exception as exc:
+                audit = {
+                    "status": "FAILED",
+                    "coverage_gate": "FAILED",
+                    "continuity_gate": "FAILED",
+                    "failure_reasons": [f"{type(exc).__name__}:{exc}"],
+                }
+            series.append({"symbol": symbol, "timeframe": timeframe, **audit})
+    passed = sum(item.get("status") == "PASSED" for item in series)
+    return {
+        "schema_version": "binance-kline-archive-backfill.v1",
+        "database": str(Path(database).resolve()),
+        "status": "PASSED" if passed == len(series) else "FAILED",
+        "complete": passed == len(series),
+        "expected_series_count": len(series),
+        "passed_series_count": passed,
+        "series": series,
+    }
+
+
+def _atomic_json(path: Path, payload: object) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True, default=str),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -128,6 +182,14 @@ def main() -> int:
         "--cache-dir",
         type=Path,
         default=ROOT / "data" / "raw" / "binance-kline-archive",
+    )
+    parser.add_argument(
+        "--report",
+        type=Path,
+        default=ROOT
+        / "model_results"
+        / "evaluation"
+        / "kline_archive_backfill_report.json",
     )
     parser.add_argument("--request-pause-sec", type=float, default=0.05)
     args = parser.parse_args()
@@ -240,7 +302,21 @@ def main() -> int:
                     f"404={prior_not_found}, first={first_archive_month}",
                     flush=True,
                 )
-    print(f"versioned kline store ready: {args.output.resolve()}", flush=True)
+    report = _coverage_report(args.output, timeframes=timeframes)
+    _atomic_json(args.report, report)
+    if report["status"] != "PASSED":
+        print(
+            "versioned kline store coverage FAILED: "
+            f"{report['passed_series_count']}/{report['expected_series_count']} "
+            f"report={args.report.resolve()}",
+            flush=True,
+        )
+        return 2
+    print(
+        f"versioned kline store ready: {args.output.resolve()} "
+        f"coverage={report['passed_series_count']}/{report['expected_series_count']}",
+        flush=True,
+    )
     return 0
 
 

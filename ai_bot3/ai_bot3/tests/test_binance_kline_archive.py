@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT))
 
 from core.evaluation.profitability_rebuild import KlinePanelSource
 from core.providers.binance_kline_archive import BinanceKlineArchiveStore
+from scripts.backfill_binance_kline_archive import _coverage_report
 
 
 def _database(path: Path) -> None:
@@ -109,6 +110,14 @@ def test_checksum_verified_month_and_adjacent_404_create_listing_evidence(tmp_pa
     assert evidence["first_archive_checksum_verified"] == 1
     assert evidence["raw_receipt_reverified"] is True
     assert evidence["raw_receipt_reverification_failures"] == []
+
+    report = _coverage_report(
+        database,
+        symbols=("1000PEPEUSDT",),
+        timeframes=("1d",),
+    )
+    assert report["status"] == "PASSED"
+    assert report["passed_series_count"] == report["expected_series_count"] == 1
 
     archive_path.write_bytes(archive_body + b"tampered-after-import")
     tampered = KlinePanelSource(database).listing_evidence(

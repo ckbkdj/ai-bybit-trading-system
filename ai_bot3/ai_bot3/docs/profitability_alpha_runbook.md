@@ -266,7 +266,7 @@ python scripts/backfill_binance_kline_archive.py `
   --cache-dir data/raw/binance-kline-archive
 ```
 
-每个月必须满足官方 URL、保留的原始 ZIP/Checksum、SHA-256、月内连续网格和 OHLC 不变量后，才在同一事务写入 `raw_kline` 与 completed manifest。脚本中断后可重跑，completed 月不会改写。不能以“币种较新”为理由手工降门槛；只有首个官方归档月已校验、紧邻前一月的 archive 与 checksum 都真实返回 HTTP 404 时，才生成不可修改的 `VERIFIED_SINCE_LISTING` 收据。研究预检会重新读取保留的 ZIP/Checksum 并计算 SHA-256，同时逐字段复核该收据；文件缺失、损坏或收据不一致时仍按固定历史门槛失败。
+每个月必须满足官方 URL、保留的原始 ZIP/Checksum、SHA-256、月内连续网格和 OHLC 不变量后，才在同一事务写入 `raw_kline` 与 completed manifest。脚本中断后可重跑，completed 月不会改写。不能以“币种较新”为理由手工降门槛；只有首个官方归档月已校验、紧邻前一月的 archive 与 checksum 都真实返回 HTTP 404 时，才生成不可修改的 `VERIFIED_SINCE_LISTING` 收据。研究预检会重新读取保留的 ZIP/Checksum 并计算 SHA-256，同时逐字段复核该收据；文件缺失、损坏或收据不一致时仍按固定历史门槛失败。下载循环结束后脚本还会生成 `kline_archive_backfill_report.json` 并对 25 个 symbol×timeframe 序列做跨月逐 bar 连续性和历史下限复核；不是 25/25 时退出码为 2，不得把数据库解释成 ready。
 
 回填结束后把实验命令的 feature store 显式切换为新版本：
 
