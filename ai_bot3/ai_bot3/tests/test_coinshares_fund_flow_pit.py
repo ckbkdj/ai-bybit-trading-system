@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -16,6 +18,7 @@ from core.providers.coinshares_fund_flow_pit import (
     _weekly_flow,
 )
 from core.training.flow_pit_panel import FlowPITFeatureSource
+from scripts import backfill_coinshares_fund_flow_pit as backfill_script
 
 
 UTC = timezone.utc
@@ -161,6 +164,56 @@ def test_coinshares_unparsable_article_is_explicitly_excluded(tmp_path: Path):
     assert report["feature_observation_count"] == 59
     assert report["excluded_count"] == 1
     assert "no parsable global weekly flow" in report["exclusions"][0]["reason"]
+
+
+def test_coinshares_backfill_fails_closed_when_requested_tail_is_stale(tmp_path: Path):
+    report = backfill_coinshares_fund_flow_pit(
+        CoinSharesFundFlowPITStore(tmp_path / "flows.sqlite3"),
+        cache_dir=tmp_path / "raw",
+        publication_start=START,
+        publication_end=START + timedelta(days=59 * 7 + 30),
+        requester=_requester,
+    )
+    assert report["status"] == "FAILED_INCOMPLETE_COVERAGE"
+    assert report["coverage_complete"] is False
+    assert report["trailing_gap_days"] == 30
+
+
+def test_coinshares_cli_returns_nonzero_for_incomplete_coverage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    report_path = tmp_path / "report.json"
+    monkeypatch.setattr(
+        backfill_script,
+        "backfill_coinshares_fund_flow_pit",
+        lambda *_args, **_kwargs: {
+            "status": "FAILED_INCOMPLETE_COVERAGE",
+            "sitemap_article_count": 10,
+            "feature_observation_count": 8,
+            "excluded_count": 2,
+        },
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "backfill_coinshares_fund_flow_pit.py",
+            "--start",
+            START.isoformat(),
+            "--end",
+            (START + timedelta(days=70)).isoformat(),
+            "--database",
+            str(tmp_path / "flows.sqlite3"),
+            "--cache-dir",
+            str(tmp_path / "raw"),
+            "--report",
+            str(report_path),
+        ],
+    )
+    assert backfill_script.main() == 2
+    assert json.loads(report_path.read_text(encoding="utf-8"))["status"] == (
+        "FAILED_INCOMPLETE_COVERAGE"
+    )
 
 
 def test_equivalent_duplicate_publication_urls_are_canonical_and_idempotent(

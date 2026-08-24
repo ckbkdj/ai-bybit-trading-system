@@ -79,6 +79,8 @@ def test_stablecoin_backfill_is_hashed_idempotent_semantic_and_pit(tmp_path: Pat
     )
 
     assert report["status"] == "PASS"
+    assert report["continuous_through_requested_end"] is True
+    assert report["missing_complete_date_count"] == 0
     assert set(report["feature_names"]) == set(FEATURE_NAMES)
     assert report["api_key_required"] is False
     assert "not exchange netflow" in report["semantic_scope"]
@@ -101,6 +103,32 @@ def test_stablecoin_backfill_is_hashed_idempotent_semantic_and_pit(tmp_path: Pat
         row["event_time"] <= row["available_at"] <= row["ingested_at"]
         for row in observations
     )
+
+
+def test_stablecoin_backfill_rejects_an_internal_complete_date_gap(tmp_path: Path):
+    payload = json.loads(_body())
+    payload["data"] = [
+        row
+        for row in payload["data"]
+        if not str(row["time"]).startswith("2026-01-06")
+    ]
+
+    def missing_day_requester(_url: str, _timeout_sec: float) -> HTTPPayload:
+        return HTTPPayload(
+            body=json.dumps(payload, separators=(",", ":")).encode(),
+            requested_at=FETCHED - timedelta(seconds=1),
+            received_at=FETCHED,
+            http_status=200,
+        )
+
+    with pytest.raises(ValueError, match="continuously cover"):
+        backfill_coinmetrics_stablecoin_pit(
+            CoinMetricsStablecoinPITStore(tmp_path / "flows.sqlite3"),
+            cache_dir=tmp_path / "raw",
+            observation_start=date(2026, 1, 1),
+            observation_end=date(2026, 1, 12),
+            requester=missing_day_requester,
+        )
 
 
 def test_stablecoin_history_conflict_fails_closed(tmp_path: Path):

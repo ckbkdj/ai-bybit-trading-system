@@ -321,6 +321,22 @@ def backfill_coinmetrics_stablecoin_pit(
     if not isinstance(payload, Mapping):
         raise ValueError("Coin Metrics response is not an object")
     supply = _parse_rows(payload)
+    complete_dates = sorted(supply)
+    if (
+        complete_dates[0] < observation_start
+        or complete_dates[-1] > observation_end
+    ):
+        raise ValueError("Coin Metrics history is outside the requested date window")
+    expected_complete_dates = set(
+        complete_dates[0] + timedelta(days=offset)
+        for offset in range((observation_end - complete_dates[0]).days + 1)
+    )
+    missing_complete_dates = sorted(expected_complete_dates.difference(supply))
+    if complete_dates[-1] != observation_end or missing_complete_dates:
+        raise ValueError(
+            "Coin Metrics complete USDC/USDT history does not continuously "
+            "cover the requested end date"
+        )
     content_sha256 = _sha256(response.body)
     raw_path = cache_dir / f"stablecoin-supply.{content_sha256[:16]}.json"
     temporary = raw_path.with_suffix(raw_path.suffix + ".tmp")
@@ -355,6 +371,10 @@ def backfill_coinmetrics_stablecoin_pit(
         "observation_end": observation_end.isoformat(),
         "response": asdict(evidence),
         "source_row_count": evidence.row_count,
+        "complete_source_start": complete_dates[0].isoformat(),
+        "complete_source_end": complete_dates[-1].isoformat(),
+        "missing_complete_date_count": len(missing_complete_dates),
+        "continuous_through_requested_end": True,
         "feature_observation_count": len(features),
         "feature_names": sorted({str(item["name"]) for item in features}),
         "api_key_required": False,

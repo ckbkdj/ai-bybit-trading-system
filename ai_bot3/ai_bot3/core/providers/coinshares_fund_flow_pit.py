@@ -561,6 +561,19 @@ def backfill_coinshares_fund_flow_pit(
     parsed_dates = sorted(
         date.fromisoformat(str(item["observation_date"])) for item in features
     )
+    internal_gaps = [
+        (later - earlier).days
+        for earlier, later in zip(parsed_dates, parsed_dates[1:])
+    ]
+    maximum_internal_gap_days = max(internal_gaps, default=0)
+    leading_gap_days = (parsed_dates[0] - publication_start).days
+    trailing_gap_days = (publication_end - parsed_dates[-1]).days
+    maximum_allowed_gap_days = 15
+    coverage_complete = bool(
+        leading_gap_days <= maximum_allowed_gap_days
+        and trailing_gap_days <= maximum_allowed_gap_days
+        and maximum_internal_gap_days <= maximum_allowed_gap_days
+    )
     store.append(
         responses=responses,
         features=features,
@@ -568,7 +581,13 @@ def backfill_coinshares_fund_flow_pit(
     )
     return {
         "schema_version": "coinshares-fund-flow-pit-backfill.v1",
-        "status": "PASS" if not exclusions else "PASS_WITH_EXCLUSIONS",
+        "status": (
+            "FAILED_INCOMPLETE_COVERAGE"
+            if not coverage_complete
+            else "PASS"
+            if not exclusions
+            else "PASS_WITH_EXCLUSIONS"
+        ),
         "source": "CoinShares official US research publications",
         "sitemap_url": SITEMAP_URL,
         "sitemap_content_sha256": sitemap_sha,
@@ -581,6 +600,11 @@ def backfill_coinshares_fund_flow_pit(
         "feature_name": FEATURE_NAME,
         "feature_start": parsed_dates[0].isoformat(),
         "feature_end": parsed_dates[-1].isoformat(),
+        "coverage_complete": coverage_complete,
+        "maximum_allowed_gap_days": maximum_allowed_gap_days,
+        "leading_gap_days": leading_gap_days,
+        "trailing_gap_days": trailing_gap_days,
+        "maximum_internal_gap_days": maximum_internal_gap_days,
         "excluded_count": len(exclusions),
         "exclusions": exclusions,
         "pit_policy": (

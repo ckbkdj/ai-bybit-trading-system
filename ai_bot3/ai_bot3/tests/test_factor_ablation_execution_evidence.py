@@ -16,11 +16,26 @@ from core.evaluation.profitability_rebuild import (
     _ablation_oof_threshold,
     _ablation_signals_from_predictions,
     _execution_release_evidence,
+    _factor_fold_coverage,
     _factor_ablation_report,
     _failed_ablation_execution_result,
     _horizon_scoped_ablation_result,
 )
 from core.models.two_stage import TwoStagePrediction
+
+
+def test_ablation_cannot_select_only_complete_factor_rows():
+    train = pd.DataFrame({"factor": [1.0, float("nan"), 3.0]})
+    test = pd.DataFrame({"factor": [4.0, 5.0]})
+    train_mask, test_mask, evidence = _factor_fold_coverage(
+        train, test, ("factor",)
+    )
+    assert train_mask.tolist() == [True, False, True]
+    assert test_mask.tolist() == [True, True]
+    assert evidence["complete"] is False
+    assert evidence["train_missing_rows"] == 1
+    assert evidence["test_missing_rows"] == 0
+    assert "no complete-case row selection" in evidence["policy"]
 
 
 def test_zero_trade_ablation_is_not_accepted_as_evaluated_evidence():

@@ -359,6 +359,36 @@ def _emit_ablation_progress(
     )
 
 
+def _factor_fold_coverage(
+    train: pd.DataFrame,
+    test: pd.DataFrame,
+    columns: Sequence[str],
+) -> tuple[pd.Series, pd.Series, dict[str, object]]:
+    """Require the ablation sample to match final train/serve availability."""
+
+    train_mask = train[list(columns)].notna().all(axis=1)
+    test_mask = test[list(columns)].notna().all(axis=1)
+    train_complete = int(train_mask.sum())
+    test_complete = int(test_mask.sum())
+    evidence = {
+        "required_factor_columns": list(columns),
+        "train_total_rows": len(train),
+        "train_complete_rows": train_complete,
+        "train_missing_rows": len(train) - train_complete,
+        "train_complete_ratio": train_complete / len(train) if len(train) else 0.0,
+        "test_total_rows": len(test),
+        "test_complete_rows": test_complete,
+        "test_missing_rows": len(test) - test_complete,
+        "test_complete_ratio": test_complete / len(test) if len(test) else 0.0,
+        "complete": bool(train_mask.all() and test_mask.all()),
+        "policy": (
+            "no complete-case row selection: every scheduled train/OOS row must "
+            "have every retained factor because production inference fails closed"
+        ),
+    }
+    return train_mask, test_mask, evidence
+
+
 def _execution_release_evidence(
     report: object,
     *,
@@ -2290,12 +2320,32 @@ def _evaluate_legacy_technical_ablation(
         for fold in dataset.folds:
             train = dataset.development.iloc[fold.train_indices]
             test = dataset.development.iloc[fold.test_indices]
-            eligible_train = train.loc[
-                train[list(columns)].notna().all(axis=1)
-            ].reset_index(drop=True)
-            eligible_test = test.loc[
-                test[list(columns)].notna().all(axis=1)
-            ].reset_index(drop=True)
+            train_mask, test_mask, coverage_evidence = _factor_fold_coverage(
+                train, test, columns
+            )
+            eligible_train = train.loc[train_mask].reset_index(drop=True)
+            eligible_test = test.loc[test_mask].reset_index(drop=True)
+            if not bool(coverage_evidence["complete"]):
+                _emit_ablation_progress(
+                    progress_callback,
+                    factor_group=group,
+                    horizon_sec=horizon,
+                    fold_id=fold.fold_id,
+                    status="FAILED_INCOMPLETE_FACTOR_COVERAGE",
+                    train_rows=len(eligible_train),
+                    test_rows=len(eligible_test),
+                )
+                fold_evidence.append(
+                    {
+                        "horizon_sec": horizon,
+                        "fold_id": fold.fold_id,
+                        "status": "FAILED_INCOMPLETE_FACTOR_COVERAGE",
+                        "train_rows": len(eligible_train),
+                        "test_rows": len(eligible_test),
+                        "factor_coverage": coverage_evidence,
+                    }
+                )
+                continue
             if len(eligible_train) < 100 or len(eligible_test) < 30:
                 _emit_ablation_progress(
                     progress_callback,
@@ -2527,10 +2577,32 @@ def _evaluate_long_factor_ablation(
             for fold in dataset.folds:
                 train = dataset.development.iloc[fold.train_indices]
                 test = dataset.development.iloc[fold.test_indices]
-                train_mask = train[list(columns)].notna().all(axis=1)
-                test_mask = test[list(columns)].notna().all(axis=1)
+                train_mask, test_mask, coverage_evidence = _factor_fold_coverage(
+                    train, test, columns
+                )
                 eligible_train = train.loc[train_mask].reset_index(drop=True)
                 eligible_test = test.loc[test_mask].reset_index(drop=True)
+                if not bool(coverage_evidence["complete"]):
+                    _emit_ablation_progress(
+                        progress_callback,
+                        factor_group=group,
+                        horizon_sec=horizon,
+                        fold_id=fold.fold_id,
+                        status="FAILED_INCOMPLETE_FACTOR_COVERAGE",
+                        train_rows=len(eligible_train),
+                        test_rows=len(eligible_test),
+                    )
+                    fold_evidence.append(
+                        {
+                            "horizon_sec": horizon,
+                            "fold_id": fold.fold_id,
+                            "status": "FAILED_INCOMPLETE_FACTOR_COVERAGE",
+                            "train_rows": len(eligible_train),
+                            "test_rows": len(eligible_test),
+                            "factor_coverage": coverage_evidence,
+                        }
+                    )
+                    continue
                 if len(eligible_train) < 100 or len(eligible_test) < 30:
                     _emit_ablation_progress(
                         progress_callback,
@@ -2906,10 +2978,32 @@ def _evaluate_bybit_pit_ablation(
             for fold in dataset.folds:
                 train = dataset.development.iloc[fold.train_indices]
                 test = dataset.development.iloc[fold.test_indices]
-                train_mask = train[list(columns)].notna().all(axis=1)
-                test_mask = test[list(columns)].notna().all(axis=1)
+                train_mask, test_mask, coverage_evidence = _factor_fold_coverage(
+                    train, test, columns
+                )
                 eligible_train = train.loc[train_mask].reset_index(drop=True)
                 eligible_test = test.loc[test_mask].reset_index(drop=True)
+                if not bool(coverage_evidence["complete"]):
+                    _emit_ablation_progress(
+                        progress_callback,
+                        factor_group=group,
+                        horizon_sec=horizon,
+                        fold_id=fold.fold_id,
+                        status="FAILED_INCOMPLETE_FACTOR_COVERAGE",
+                        train_rows=len(eligible_train),
+                        test_rows=len(eligible_test),
+                    )
+                    fold_evidence.append(
+                        {
+                            "horizon_sec": horizon,
+                            "fold_id": fold.fold_id,
+                            "status": "FAILED_INCOMPLETE_FACTOR_COVERAGE",
+                            "train_rows": len(eligible_train),
+                            "test_rows": len(eligible_test),
+                            "factor_coverage": coverage_evidence,
+                        }
+                    )
+                    continue
                 if len(eligible_train) < 1_000 or len(eligible_test) < 200:
                     _emit_ablation_progress(
                         progress_callback,

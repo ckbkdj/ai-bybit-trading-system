@@ -101,7 +101,7 @@ python scripts/backfill_coinmetrics_stablecoin_pit.py `
   --report model_results/evaluation/coinmetrics_stablecoin_backfill_report.json
 ```
 
-审计必须确认原始响应长度/SHA 一致、时序违规为 0、descriptor 无 key，并明确这些列是 USDC/USDT 发行/赎回变化而不是 exchange netflow。任何后续抓取与既有历史值冲突都应失败关闭，不能覆盖旧证据。
+审计必须确认原始响应长度/SHA 一致、时序违规为 0、descriptor 无 key，并明确这些列是 USDC/USDT 发行/赎回变化而不是 exchange netflow。从第一天同时存在 USDC/USDT 起，完整日期必须逐日连续并覆盖请求结束日；任一天缺任一资产或尾部陈旧都必须失败关闭。任何后续抓取与既有历史值冲突都不能覆盖旧证据。
 
 数字资产投资产品周 flow 使用 CoinShares 官方历史发布物：
 
@@ -115,7 +115,7 @@ python scripts/backfill_coinshares_fund_flow_pit.py `
   --report model_results/evaluation/coinshares_fund_flow_backfill_report.json
 ```
 
-检查 sitemap 文章数、成功解析数、exclusions、发布日期唯一性、最大周度间隔、正负号和极值。累计/YTD/年度金额不得当成周流量；parser 修正必须新增版本和失效记录，不能删除旧错误证据。该列不是日度 issuer-level ETF creation/redemption，报告和模型卡中必须保留这一语义边界。
+检查 sitemap 文章数、成功解析数、exclusions、发布日期唯一性、首尾缺口、最大周度间隔、正负号和极值。首部、内部或尾部超过 15 天没有可用周报时状态必须为 `FAILED_INCOMPLETE_COVERAGE`，命令返回非零。累计/YTD/年度金额不得当成周流量；parser 修正必须新增版本和失效记录，不能删除旧错误证据。该列不是日度 issuer-level ETF creation/redemption，报告和模型卡中必须保留这一语义边界。
 
 启动命令只允许公开线性行情 endpoint，不含认证或交易参数：
 
@@ -414,6 +414,7 @@ blocker 只允许表示样本量、fold 或跨币种不足。PIT 违规、混周
 每个 baseline/augmented arm 至少满足代码中预先锁定的 OOS trade/fold 下限。只有以下条件同时满足才 retained：
 
 - 完整因子组没有 missing required factor；
+- 每个已安排 train/OOS 行都具备完整因子；禁止先删除缺失行再只在 complete-case 子样本上制造增益。研究、最终训练和生产推理必须使用同一可用性语义；
 - 相同 purged outer folds；
 - folds 必须来自完整最大执行窗口均有直接成本证据的 release dataset；
 - 相同成本、风险和事件回测；

@@ -193,6 +193,7 @@ FOMC 采集不能用会议日历日期猜测 14:00，也不能把 minutes、impl
 17. development 内部再按时间把外层 OOS 拆成两段：较早一段只用于真实因子消融和冻结 feature set，较晚一段只用于冻结特征后的正式 development 评估。两段测试行不得重叠并保留 embargo；较晚 evaluation OOS 的收益、标签和门禁结果禁止反向改变 retained factors。默认至少六个 walk-forward folds，配置少于四个时直接拒绝启动。
 18. 交易所 K 线若以 `interval_end - 1 ms` 表示最后一个有效毫秒，特征可用时间必须正规化到下一毫秒的真实 interval end；禁止在最后一个成交毫秒尚未结束时使用整根 K 线的 high/low/close。
 19. 正式标签、训练、事件回测和生产推理必须使用 Bybit 同交易所 last-trade Kline。每根 `MarketBar`、每个标签和每笔回测交易都携带 `price_source/price_observed`；模型 bundle 绑定 `kline_source=bybit`。生产运行若收到 Binance frame、Bybit 断档或陈旧数据，Alpha 与 `ResultManager` 必须双重失败关闭。
+20. 因子消融禁止 complete-case 选样。某 fold 的任一已安排 train/OOS 行缺少因子时，该 fold 必须记录 `FAILED_INCOMPLETE_FACTOR_COVERAGE`；不能删除缺失行后比较 baseline/augmented，也不能让研究阶段只看有值子集、最终训练做均值填补、生产阶段再因缺失拒绝。稳定币日序列从共同可用日起必须连续到请求结束日；周度 fund flow 的首部、内部、尾部缺口均不得超过其 15 天 staleness 合约。
 
 ## 7. 事件回测和回撤
 
