@@ -27,6 +27,24 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _release_id(
+    *,
+    profitability_report_sha256: str,
+    model_artifact_sha256: str,
+    evidence_report_sha256: Mapping[str, str],
+    lockbox_fingerprint: str,
+    code_commit: str,
+) -> str:
+    token = hashlib.sha256(
+        (
+            f"{profitability_report_sha256}|{model_artifact_sha256}|"
+            f"{lockbox_fingerprint}|{code_commit}|"
+            + json.dumps(dict(evidence_report_sha256), sort_keys=True)
+        ).encode()
+    ).hexdigest()[:32]
+    return f"pr_{token}"
+
+
 @dataclass(frozen=True)
 class ProfitabilityReleaseManifest:
     schema_version: str
@@ -69,15 +87,15 @@ def create_candidate_manifest(
         name: _sha256(Path(evidence_paths[name]))
         for name in REQUIRED_EVIDENCE_REPORTS
     }
-    release_id = hashlib.sha256(
-        (
-            f"{report_hash}|{model_hash}|{lockbox_fingerprint}|{code_commit}|"
-            + json.dumps(evidence_hashes, sort_keys=True)
-        ).encode()
-    ).hexdigest()[:32]
     manifest = ProfitabilityReleaseManifest(
         schema_version="profitability-release.v2",
-        release_id=f"pr_{release_id}",
+        release_id=_release_id(
+            profitability_report_sha256=report_hash,
+            model_artifact_sha256=model_hash,
+            evidence_report_sha256=evidence_hashes,
+            lockbox_fingerprint=lockbox_fingerprint,
+            code_commit=code_commit,
+        ),
         stage="candidate",
         model_family="profitability_two_stage",
         model_artifact_sha256=model_hash,
@@ -132,6 +150,17 @@ def verify_candidate_authorization(
             return False, f"profitability_evidence_report_missing:{name}"
         if str(evidence_hashes[name]) != _sha256(evidence_path):
             return False, f"profitability_evidence_hash_mismatch:{name}"
+    expected_release_id = _release_id(
+        profitability_report_sha256=str(manifest.get("profitability_report_sha256") or ""),
+        model_artifact_sha256=str(manifest.get("model_artifact_sha256") or ""),
+        evidence_report_sha256={
+            name: str(evidence_hashes[name]) for name in REQUIRED_EVIDENCE_REPORTS
+        },
+        lockbox_fingerprint=str(manifest.get("lockbox_fingerprint") or ""),
+        code_commit=str(manifest.get("code_commit") or ""),
+    )
+    if manifest.get("release_id") != expected_release_id:
+        return False, "profitability_release_id_mismatch"
     return True, "verified_profitability_candidate"
 
 

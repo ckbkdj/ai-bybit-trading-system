@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -247,6 +248,46 @@ def test_candidate_manifest_binds_every_final_evidence_report(tmp_path):
     authorized, reason = verify_candidate_authorization(profitability, manifest)
     assert authorized is False
     assert reason == "profitability_evidence_hash_mismatch:execution_cost_report.json"
+
+
+def test_candidate_manifest_release_id_is_derived_from_bound_evidence(tmp_path):
+    gate = evaluate_profitability_gate(
+        _profitable_trades(),
+        [{"net_return": value} for value in (0.01, 0.02, -0.001, 0.015, 0.005)],
+        initial_equity_usdt=100_000,
+        two_x_cost_net_return=0.01,
+        mark_to_market_max_drawdown=0.02,
+        mark_to_market_evidence_complete=True,
+        execution_evidence_complete=True,
+        factor_ablation_complete=True,
+    )
+    profitability = tmp_path / "profitability_report.json"
+    model = tmp_path / "model.json"
+    write_profitability_report(profitability, gate)
+    model.write_text("{}", encoding="utf-8")
+    evidence = {}
+    for name in REQUIRED_EVIDENCE_REPORTS:
+        evidence_path = tmp_path / name
+        evidence_path.write_text(f'{{"report":"{name}"}}', encoding="utf-8")
+        evidence[name] = evidence_path
+    manifest_path = tmp_path / "candidate_release_manifest.json"
+    create_candidate_manifest(
+        manifest_path,
+        gate=gate,
+        profitability_report_path=profitability,
+        model_artifact_path=model,
+        lockbox_fingerprint="e" * 64,
+        code_commit="1234567",
+        evidence_report_paths=evidence,
+    )
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["release_id"] = "pr_tampered_identity"
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert verify_candidate_authorization(profitability, manifest_path) == (
+        False,
+        "profitability_release_id_mismatch",
+    )
 
 
 def test_profitability_gate_rejects_realized_only_or_excess_mtm_drawdown():
