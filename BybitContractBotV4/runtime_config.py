@@ -56,7 +56,9 @@ class TradingSettings:
     ticket_consumer_id: str
     ticket_poll_seconds: float
     execution_db_path: str
+    max_risk_per_trade_pct: float
     max_daily_loss_pct: float
+    max_weekly_loss_pct: float
     max_equity_drawdown_pct: float
     max_gross_leverage: float
     max_correlated_exposure_pct: float
@@ -114,8 +116,10 @@ class TradingSettings:
             timeout = float(value("PREDICTION_TIMEOUT_SECONDS", "10"))
             max_age = int(value("PREDICTION_MAX_AGE_SECONDS", "600"))
             ticket_poll = float(value("TICKET_POLL_SECONDS", "2"))
-            max_daily_loss = float(value("MAX_DAILY_LOSS_PCT", "0.02"))
-            max_equity_drawdown = float(value("MAX_EQUITY_DRAWDOWN_PCT", "0.10"))
+            max_risk_per_trade = float(value("MAX_RISK_PER_TRADE_PCT", "0.0025"))
+            max_daily_loss = float(value("MAX_DAILY_LOSS_PCT", "0.005"))
+            max_weekly_loss = float(value("MAX_WEEKLY_LOSS_PCT", "0.015"))
+            max_equity_drawdown = float(value("MAX_EQUITY_DRAWDOWN_PCT", "0.03"))
             max_gross_leverage = float(value("MAX_GROSS_LEVERAGE", "2"))
             max_correlated = float(value("MAX_CORRELATED_EXPOSURE_PCT", "0.35"))
             max_margin_utilization = float(value("MAX_MARGIN_UTILIZATION", "0.70"))
@@ -126,8 +130,16 @@ class TradingSettings:
             raise SettingsError("numeric runtime settings contain an invalid value") from exc
         if shadow_equity <= 0 or timeout <= 0 or max_age <= 0 or ticket_poll <= 0:
             raise SettingsError("shadow equity, prediction timeout and max age must be positive")
-        if not 0 < max_daily_loss <= 1 or not 0 < max_equity_drawdown <= 1 or max_gross_leverage <= 0:
-            raise SettingsError("risk loss/leverage limits contain invalid values")
+        if not 0 < max_risk_per_trade <= 0.0025:
+            raise SettingsError("MAX_RISK_PER_TRADE_PCT cannot exceed 0.0025")
+        if not 0 < max_daily_loss <= 0.005:
+            raise SettingsError("MAX_DAILY_LOSS_PCT cannot exceed 0.005")
+        if not 0 < max_weekly_loss <= 0.015:
+            raise SettingsError("MAX_WEEKLY_LOSS_PCT cannot exceed 0.015")
+        if not 0 < max_equity_drawdown <= 0.03:
+            raise SettingsError("MAX_EQUITY_DRAWDOWN_PCT cannot exceed 0.03")
+        if not 0 < max_gross_leverage <= 2:
+            raise SettingsError("MAX_GROSS_LEVERAGE cannot exceed 2")
         if not 0 < max_correlated <= 1 or not 0 < max_margin_utilization <= 1:
             raise SettingsError("risk exposure/margin limits must be in (0, 1]")
         if max_consecutive_losses <= 0 or max_clock_drift <= 0:
@@ -199,7 +211,9 @@ class TradingSettings:
             execution_db_path=value(
                 "EXECUTION_DB_PATH", str(service_root / "execution_state.sqlite3")
             ),
+            max_risk_per_trade_pct=max_risk_per_trade,
             max_daily_loss_pct=max_daily_loss,
+            max_weekly_loss_pct=max_weekly_loss,
             max_equity_drawdown_pct=max_equity_drawdown,
             max_gross_leverage=max_gross_leverage,
             max_correlated_exposure_pct=max_correlated,

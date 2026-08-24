@@ -60,7 +60,7 @@ def ticket_payload(ticket_id="tk_execution_test_001", *, position_version=3, ref
             "side": "BUY",
             "position_effect": "OPEN_OR_INCREASE",
             "target_exposure_pct": 0.08,
-            "risk_budget_pct": 0.003,
+            "risk_budget_pct": 0.0025,
             "max_notional_usdt": 5000,
             "leverage_cap": 3,
         },
@@ -205,6 +205,31 @@ class ExecutionEngineTests(unittest.TestCase):
         self.assertEqual(
             self.store.ticket_record(ticket.ticket_id)["reason_code"],
             "EQUITY_DRAWDOWN_LIMIT",
+        )
+
+    def test_weekly_loss_limit_blocks_new_risk(self):
+        ticket = OperationTicket.model_validate(ticket_payload("tk_weekly_guard_001"))
+        self.context.account_snapshot = replace(
+            self.context.account_snapshot,
+            realised_pnl_today=0,
+            realised_pnl_week=-151,
+        )
+        state = self.consumer.process(ticket, now=NOW)
+        self.assertEqual(state, ExecutionState.RISK_BLOCKED)
+        self.assertEqual(
+            self.store.ticket_record(ticket.ticket_id)["reason_code"],
+            "WEEKLY_LOSS_LIMIT",
+        )
+
+    def test_per_trade_risk_above_quarter_percent_is_rejected(self):
+        payload = ticket_payload("tk_trade_risk_guard_001")
+        payload["intent"]["risk_budget_pct"] = 0.0026
+        ticket = OperationTicket.model_validate(payload)
+        state = self.consumer.process(ticket, now=NOW)
+        self.assertEqual(state, ExecutionState.RISK_BLOCKED)
+        self.assertEqual(
+            self.store.ticket_record(ticket.ticket_id)["reason_code"],
+            "TRADE_RISK_LIMIT",
         )
 
     def test_equity_high_water_is_monotonic_and_persistent(self):
@@ -899,13 +924,14 @@ class BybitEvidenceTests(unittest.TestCase):
         class Exchange:
             def private_get_v5_account_transaction_log(self, params):
                 return {
+                    "retCode": 0,
                     "result": {
                         "list": [
-                            {"type": "TRADE", "orderId": "loss-1", "change": "-11", "cashFlow": "-10", "transactionTime": now_ms - 4},
-                            {"type": "SETTLEMENT", "change": "-2", "cashFlow": "0", "transactionTime": now_ms - 3},
+                            {"id": "log-1", "type": "TRADE", "orderId": "loss-1", "change": "-11", "cashFlow": "-10", "transactionTime": now_ms - 4},
+                            {"id": "log-2", "type": "SETTLEMENT", "change": "-2", "cashFlow": "0", "transactionTime": now_ms - 3},
                             {"type": "TRANSFER_IN", "change": "100", "cashFlow": "100", "transactionTime": now_ms - 2},
-                            {"type": "TRADE", "orderId": "win-1", "change": "3.5", "cashFlow": "4", "transactionTime": now_ms - 1},
-                            {"type": "TRADE", "orderId": "loss-2", "change": "-2.5", "cashFlow": "-2", "transactionTime": now_ms},
+                            {"id": "log-3", "type": "TRADE", "orderId": "win-1", "change": "3.5", "cashFlow": "4", "transactionTime": now_ms - 1},
+                            {"id": "log-4", "type": "TRADE", "orderId": "loss-2", "change": "-2.5", "cashFlow": "-2", "transactionTime": now_ms},
                         ],
                         "nextPageCursor": "",
                     }
@@ -914,8 +940,66 @@ class BybitEvidenceTests(unittest.TestCase):
         metrics = ExchangeGateway(mode="live", exchange=Exchange()).get_daily_risk_metrics(NOW)
         self.assertTrue(metrics["healthy"])
         self.assertEqual(metrics["realised_pnl"], -12.0)
+        self.assertEqual(metrics["realised_pnl_week"], -12.0)
         self.assertEqual(metrics["consecutive_losses"], 1)
         self.assertEqual(metrics["record_count"], 5)
+
+    def test_weekly_risk_fails_closed_on_exchange_error(self):
+        class Exchange:
+            def private_get_v5_account_transaction_log(self, params):
+                return {"retCode": 10001, "retMsg": "bad request", "result": {}}
+
+        metrics = ExchangeGateway(mode="live", exchange=Exchange()).get_daily_risk_metrics(NOW)
+        self.assertFalse(metrics["healthy"])
+        self.assertEqual(metrics["reason"], "transaction_log_exchange_rejected")
+
+    def test_weekly_risk_fails_closed_on_repeated_cursor(self):
+        class Exchange:
+            def private_get_v5_account_transaction_log(self, params):
+                return {
+                    "retCode": 0,
+                    "result": {"list": [], "nextPageCursor": "same-cursor"},
+                }
+
+        metrics = ExchangeGateway(mode="live", exchange=Exchange()).get_daily_risk_metrics(NOW)
+        self.assertFalse(metrics["healthy"])
+        self.assertEqual(metrics["reason"], "transaction_log_cursor_repeated")
+
+    def test_weekly_risk_includes_prior_utc_days_but_daily_does_not(self):
+        prior_day_ms = int((NOW - timedelta(days=2)).timestamp() * 1000)
+        now_ms = int(NOW.timestamp() * 1000)
+
+        class Exchange:
+            def private_get_v5_account_transaction_log(self, params):
+                return {
+                    "retCode": 0,
+                    "result": {
+                        "list": [
+                            {
+                                "id": "weekly-log-1",
+                                "type": "TRADE",
+                                "orderId": "older-loss",
+                                "change": "-120",
+                                "cashFlow": "-120",
+                                "transactionTime": prior_day_ms,
+                            },
+                            {
+                                "id": "weekly-log-2",
+                                "type": "TRADE",
+                                "orderId": "today-loss",
+                                "change": "-40",
+                                "cashFlow": "-40",
+                                "transactionTime": now_ms,
+                            },
+                        ],
+                        "nextPageCursor": "",
+                    }
+                }
+
+        metrics = ExchangeGateway(mode="live", exchange=Exchange()).get_daily_risk_metrics(NOW)
+        self.assertTrue(metrics["healthy"])
+        self.assertEqual(metrics["realised_pnl"], -40.0)
+        self.assertEqual(metrics["realised_pnl_week"], -160.0)
 
     def test_daily_risk_fails_closed_when_page_cap_is_exceeded(self):
         class Exchange:
@@ -924,6 +1008,7 @@ class BybitEvidenceTests(unittest.TestCase):
             def private_get_v5_account_transaction_log(self, params):
                 self.calls += 1
                 return {
+                    "retCode": 0,
                     "result": {
                         "list": [{"type": "TRADE", "change": "0", "cashFlow": "0"}],
                         "nextPageCursor": f"cursor-{self.calls}",

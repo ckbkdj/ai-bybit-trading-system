@@ -63,7 +63,9 @@ class TradingExecutionService:
         self.stream_handler = PrivateStreamHandler(self.store)
         self.websocket = None
         limits = RiskLimits(
+            max_risk_per_trade_pct=settings.max_risk_per_trade_pct,
             max_daily_loss_pct=settings.max_daily_loss_pct,
+            max_weekly_loss_pct=settings.max_weekly_loss_pct,
             max_equity_drawdown_pct=settings.max_equity_drawdown_pct,
             max_gross_leverage=settings.max_gross_leverage,
             max_correlated_exposure_pct=settings.max_correlated_exposure_pct,

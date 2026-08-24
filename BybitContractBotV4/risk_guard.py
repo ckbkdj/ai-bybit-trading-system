@@ -31,6 +31,7 @@ class AccountSnapshot:
     margin_used_usdt: float
     realised_pnl_today: float = 0.0
     unrealised_pnl: float = 0.0
+    realised_pnl_week: float = 0.0
     consecutive_losses: int = 0
     cooldown_until: Optional[datetime] = None
     equity_high_water_usdt: Optional[float] = None
@@ -63,14 +64,28 @@ class SystemHealth:
 
 @dataclass(frozen=True)
 class RiskLimits:
-    max_daily_loss_pct: float = 0.02
-    max_equity_drawdown_pct: float = 0.10
+    max_risk_per_trade_pct: float = 0.0025
+    max_daily_loss_pct: float = 0.005
+    max_weekly_loss_pct: float = 0.015
+    max_equity_drawdown_pct: float = 0.03
     max_gross_leverage: float = 2.0
     max_correlated_exposure_pct: float = 0.35
     max_margin_utilization: float = 0.70
     max_consecutive_losses: int = 4
     max_exchange_clock_drift_sec: float = 2.0
     require_websocket_confirmation: bool = True
+
+    def __post_init__(self) -> None:
+        if not 0 < self.max_risk_per_trade_pct <= 0.0025:
+            raise ValueError("max_risk_per_trade_pct cannot exceed 0.25%")
+        if not 0 < self.max_daily_loss_pct <= 0.005:
+            raise ValueError("max_daily_loss_pct cannot exceed 0.50%")
+        if not 0 < self.max_weekly_loss_pct <= 0.015:
+            raise ValueError("max_weekly_loss_pct cannot exceed 1.50%")
+        if not 0 < self.max_equity_drawdown_pct <= 0.03:
+            raise ValueError("max_equity_drawdown_pct cannot exceed 3.00%")
+        if not 0 < self.max_gross_leverage <= 2.0:
+            raise ValueError("max_gross_leverage cannot exceed 2x")
 
 
 @dataclass(frozen=True)
@@ -189,9 +204,25 @@ class RiskGuard:
                 "ACCOUNT_RISK_METRICS_UNAVAILABLE",
                 "daily account PnL and loss-streak evidence is unavailable",
             )
+        if (
+            risk_increasing
+            and ticket.intent.risk_budget_pct > self.limits.max_risk_per_trade_pct
+        ):
+            return reject(
+                "TRADE_RISK_LIMIT",
+                "ticket risk budget exceeds the 0.25% per-trade hard limit",
+            )
         daily_pnl = account.realised_pnl_today + account.unrealised_pnl
         if risk_increasing and daily_pnl <= -(account.equity_usdt * self.limits.max_daily_loss_pct):
             return reject("DAILY_LOSS_LIMIT", "daily realised plus unrealised loss reached the limit")
+        weekly_pnl = account.realised_pnl_week + account.unrealised_pnl
+        if risk_increasing and weekly_pnl <= -(
+            account.equity_usdt * self.limits.max_weekly_loss_pct
+        ):
+            return reject(
+                "WEEKLY_LOSS_LIMIT",
+                "weekly realised plus unrealised loss reached the limit",
+            )
         high_water = float(account.equity_high_water_usdt or account.equity_usdt)
         equity_drawdown = (high_water - account.equity_usdt) / high_water if high_water > 0 else float("inf")
         if risk_increasing and equity_drawdown >= self.limits.max_equity_drawdown_pct:
