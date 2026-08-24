@@ -12,10 +12,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from core.evaluation.profitability_rebuild import (
+    BYBIT_EXECUTION_EVIDENCE_FEATURES,
     MINIMUM_COVERAGE_DAYS,
     ProfitabilityRebuild,
     ProfitabilityRebuildConfig,
     _engineer_features,
+    _bybit_names_for_horizon,
     _market_bars,
     _panel_rows,
     validate_source_coverage,
@@ -48,6 +50,25 @@ def test_short_horizon_coverage_cannot_silently_collapse_to_six_or_31_days(tmp_p
         code_commit="1" * 40,
     )
     assert config.max_bars_per_symbol >= 175_200
+
+
+def test_long_horizons_load_real_execution_evidence_without_using_short_factors():
+    short_factor_names = (
+        "bybit_orderbook_delta_l5",
+        "orderbook_spread_bps",
+        "orderbook_depth_usdt_l5",
+        "funding_rate",
+        "open_interest_change_1h",
+    )
+    assert _bybit_names_for_horizon(180, short_factor_names) == short_factor_names
+    assert _bybit_names_for_horizon(900, short_factor_names) == short_factor_names
+    for horizon in (7200, 14400, 86400):
+        requested = _bybit_names_for_horizon(horizon, short_factor_names)
+        assert requested == BYBIT_EXECUTION_EVIDENCE_FEATURES
+        assert "orderbook_spread_bps" in requested
+        assert "orderbook_depth_usdt_l5" in requested
+        assert "funding_rate" in requested
+        assert "open_interest_change_1h" not in requested
 
 
 def test_separate_lockbox_bybit_store_is_not_opened_during_initialization(tmp_path):

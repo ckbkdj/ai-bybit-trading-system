@@ -46,6 +46,7 @@ from core.training.pooled_panel import (
 )
 from core.training.nested_walk_forward import NestedWalkForwardSelector
 from core.training.bybit_execution_bars import (
+    ORDERBOOK_EXECUTION_FEATURES,
     enrich_market_bars_with_bybit_execution_pit,
 )
 from core.training.bybit_pit_panel import BybitPITFeatureSource
@@ -109,6 +110,22 @@ MINIMUM_ABLATION_OOS_TRADES = 30
 MINIMUM_ABLATION_TRADED_FOLDS = 2
 ABLATION_RESEARCH_SELECTION_FRACTION = 0.02
 ABLATION_RESEARCH_TAIL_PENALTY = 0.50
+BYBIT_EXECUTION_EVIDENCE_FEATURES = tuple(
+    dict.fromkeys((*ORDERBOOK_EXECUTION_FEATURES, "funding_rate"))
+)
+
+
+def _bybit_names_for_horizon(
+    horizon_sec: int,
+    short_factor_names: Sequence[str],
+) -> tuple[str, ...]:
+    if horizon_sec not in HORIZONS_SEC:
+        raise ValueError(f"unsupported horizon: {horizon_sec}")
+    return (
+        tuple(short_factor_names)
+        if horizon_sec in {180, 900}
+        else BYBIT_EXECUTION_EVIDENCE_FEATURES
+    )
 
 
 @dataclass(frozen=True)
@@ -1400,9 +1417,12 @@ class ProfitabilityRebuild:
             )
             bybit_history: pd.DataFrame | None = None
             horizon_evidence: dict[str, object] | None = None
-            if bybit_source is not None and horizon in {180, 900}:
+            if bybit_source is not None:
+                requested_bybit_names = _bybit_names_for_horizon(
+                    horizon, bybit_names
+                )
                 bybit_history, horizon_evidence = bybit_source.load(
-                    bybit_names,
+                    requested_bybit_names,
                     maximum_sequence=self.bybit_pit_snapshot_maximum_sequence,
                     minimum_decision_at=decision_minimum,
                     maximum_decision_at=development_decision_end,
@@ -1451,7 +1471,7 @@ class ProfitabilityRebuild:
                 del development_bars
             panels[horizon] = pd.concat(panel_parts, ignore_index=True)
             panel_parts.clear()
-            if bybit_history is not None:
+            if bybit_history is not None and horizon in {180, 900}:
                 assert bybit_source is not None
                 panels[horizon] = bybit_source.join(
                     panels[horizon], names=bybit_names, history=bybit_history
@@ -2046,10 +2066,13 @@ class ProfitabilityRebuild:
             }
             lockbox_bybit_history: pd.DataFrame | None = None
             lockbox_bybit_evidence: dict[str, object] | None = None
-            if horizon in {180, 900} and lockbox_bybit_source is not None:
+            if lockbox_bybit_source is not None:
+                requested_bybit_names = _bybit_names_for_horizon(
+                    horizon, bybit_names
+                )
                 lockbox_bybit_history, lockbox_bybit_evidence = (
                     lockbox_bybit_source.load(
-                        bybit_names,
+                        requested_bybit_names,
                         maximum_sequence=lockbox_bybit_maximum_sequence,
                         minimum_decision_at=lockbox_start_by_horizon[horizon],
                         maximum_decision_at=max(last_complete_by_symbol.values()),
