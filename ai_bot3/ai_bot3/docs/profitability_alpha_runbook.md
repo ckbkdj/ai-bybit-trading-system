@@ -311,6 +311,8 @@ blocker 只允许表示样本量、fold 或跨币种不足。PIT 违规、混周
 
 研究用固定 2% OOS ranking 只用于测量因子增益。它可以让负 edge 信号进入“研究回测”，但不会改写真实 lower-bound edge，也不会放松生产 TRADE gate。
 
+liquidation 组必须额外核对 `collection_evidence`。Bybit 官方公开的是 [`allLiquidation.{symbol}` 实时 WS](https://bybit-exchange.github.io/docs/v5/websocket/public/all-liquidation)，500ms 推送；当前 [V5 Market REST 清单](https://bybit-exchange.github.io/docs/api-explorer/v5/market/market)没有公共历史爆仓接口。因此 `historical_backfill_supported=false` 是真实来源限制，不是待补代码。达到 180 天 forward-only PIT 历史前，该组和总因子门禁保持失败。
+
 ## 11. Lockbox 操作
 
 当前禁止打开新 lockbox。只有 development 报告全部通过后：

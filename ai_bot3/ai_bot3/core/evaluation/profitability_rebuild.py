@@ -81,6 +81,23 @@ SHORT_FACTOR_GROUPS: Mapping[str, tuple[str, ...]] = {
     "liquidations": ("liquidation_imbalance_5m",),
     "execution_quality": ("fill_probability", "expected_slippage_bps"),
 }
+SHORT_FACTOR_COLLECTION_EVIDENCE: Mapping[str, Mapping[str, object]] = {
+    "liquidations": {
+        "data_mode": "forward_only_public_websocket",
+        "source_topic": "allLiquidation.{symbol}",
+        "push_frequency_ms": 500,
+        "historical_backfill_supported": False,
+        "official_rest_history_endpoint": None,
+        "source_contract_url": (
+            "https://bybit-exchange.github.io/docs/v5/websocket/public/"
+            "all-liquidation"
+        ),
+        "release_policy": (
+            "collect until the precommitted minimum PIT history is reached; "
+            "never infer liquidations from OHLCV"
+        ),
+    }
+}
 LEGACY_FACTOR_GROUPS: Mapping[str, tuple[str, ...]] = {
     "legacy_brain_technical": LEGACY_BRAIN_FEATURE_COLUMNS,
 }
@@ -1539,6 +1556,9 @@ def _evaluate_bybit_pit_ablation(
     results: dict[str, dict[str, object]] = {}
     coverage = dict(source_evidence.get("feature_coverage") or {})
     for group, columns in factor_groups.items():
+        collection_evidence = dict(
+            SHORT_FACTOR_COLLECTION_EVIDENCE.get(group) or {}
+        )
         required_coverage = [
             coverage.get(f"{symbol}:{column}")
             for symbol in SYMBOLS
@@ -1574,6 +1594,7 @@ def _evaluate_bybit_pit_ablation(
                 "minimum_required_history_days": minimum_history_days,
                 "minimum_observed_history_days": minimum_observed_days,
                 "missing_symbol_feature_contracts": missing_contracts,
+                "collection_evidence": collection_evidence,
             }
             continue
 
@@ -1712,6 +1733,7 @@ def _evaluate_bybit_pit_ablation(
                 "oos_fold_count": len(baseline_folds),
                 "retained": False,
                 "formal_feature_set": False,
+                "collection_evidence": collection_evidence,
                 "folds": fold_evidence,
             }
             continue
@@ -1722,6 +1744,7 @@ def _evaluate_bybit_pit_ablation(
             fold_evidence=fold_evidence,
             baseline_folds=baseline_folds,
             augmented_folds=augmented_folds,
+            extra={"collection_evidence": collection_evidence},
         )
         if insufficient_execution is not None:
             results[group] = insufficient_execution
@@ -1761,6 +1784,7 @@ def _evaluate_bybit_pit_ablation(
             "worst_fold_improvement": comparison.worst_fold_improvement,
             "retained": comparison.retained,
             "formal_feature_set": comparison.retained,
+            "collection_evidence": collection_evidence,
             "folds": fold_evidence,
         }
     return results

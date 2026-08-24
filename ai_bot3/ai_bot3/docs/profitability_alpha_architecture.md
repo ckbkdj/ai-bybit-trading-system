@@ -103,6 +103,8 @@ flowchart TD
 | liquidations | `allLiquidation` public WS | 按 Bybit 语义 `S=Buy => long position liquidated`；v1 永久失效，v2 生效 |
 | execution quality | 真实盘口状态派生 | fill probability、expected slippage；没有盘口证据时不得用 OHLCV 猜测代替 |
 
+liquidation 是 forward-only 证据：Bybit 当前公开 `allLiquidation.{symbol}` 只提供 500ms 实时 WS，V5 Market REST 没有公共历史爆仓接口。必须持续采满预先锁定的 180 天；不得用 OHLCV、成交量尖峰或第三方未审计聚合值回填。
+
 ### 5.3 中长周期跨资产
 
 参考服务仅接纳 canonical panel 中显式白名单的基础价格。接入时同时核验最近一次 PASS 收据的 `canonical_sha_before`/`canonical_sha_after`、baseline/canonical 文件哈希，并逐行证明允许标的只追加新日期、没有改写或回填旧价格：

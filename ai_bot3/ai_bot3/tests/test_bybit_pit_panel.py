@@ -109,6 +109,11 @@ def test_symbol_partitioned_bybit_history_joins_only_fresh_available_values(tmp_
         item["minimum_required_history_days"] == 180.0
         for item in report.values()
     )
+    liquidation_evidence = report["liquidations"]["collection_evidence"]
+    assert liquidation_evidence["data_mode"] == "forward_only_public_websocket"
+    assert liquidation_evidence["source_topic"] == "allLiquidation.{symbol}"
+    assert liquidation_evidence["historical_backfill_supported"] is False
+    assert liquidation_evidence["official_rest_history_endpoint"] is None
 
 
 def test_ofi_source_contract_keeps_legacy_trade_semantics_for_audit_only(tmp_path):
