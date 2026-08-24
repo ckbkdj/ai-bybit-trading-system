@@ -262,6 +262,22 @@ def test_release_walk_forward_excludes_proxy_rows_before_splitting():
     assert evidence["outcome_dependent_selection"] is False
     assert evidence["direct_window_rows"] == 160
 
+    corrupted = panel.copy()
+    corrupted.loc[0, "available_at"] = (
+        pd.Timestamp(corrupted.loc[0, "decision_at"]) + timedelta(seconds=1)
+    )
+    with pytest.raises(ValueError, match="PIT violation"):
+        _build_direct_release_dataset(
+            PooledPanelBuilder(
+                minimum_train_rows=40,
+                minimum_test_rows=10,
+                maximum_folds=2,
+            ),
+            corrupted,
+            180,
+            lockbox_start=start + timedelta(days=1),
+        )
+
 
 def test_development_label_materialization_stops_before_sealed_lockbox_path():
     start = datetime(2025, 1, 1, tzinfo=timezone.utc)

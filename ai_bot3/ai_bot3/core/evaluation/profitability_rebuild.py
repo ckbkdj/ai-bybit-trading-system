@@ -678,6 +678,13 @@ def _build_direct_release_dataset(
             lockbox_start=lockbox_start,
         )
     except ValueError as exc:
+        expected_evidence_blockers = {
+            "pooled panel requires at least two symbols",
+            "sealed development panel is too small",
+            "no valid sealed-development walk-forward folds",
+        }
+        if str(exc) not in expected_evidence_blockers:
+            raise
         evidence["blocker"] = f"{type(exc).__name__}: {exc}"
         return None, evidence
     evidence.update(

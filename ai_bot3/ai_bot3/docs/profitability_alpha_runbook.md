@@ -294,6 +294,8 @@ moving-block bootstrap 的 95% 下界不大于零，都不得通过。
 - `release_walk_forward_ready=true` 后，该周期才允许进入正式 walk-forward 和因子消融；
 - direct 样本不足必须显示 blocker 并保持 rejected，禁止回退到 OHLCV 代理成本凑交易数。
 
+blocker 只允许表示样本量、fold 或跨币种不足。PIT 违规、混周期、非法标签或 schema 损坏必须终止 trial 并登记 `pipeline_error`，不得伪装成普通的数据收集中状态。
+
 ## 10. 因子消融验收
 
 每个 baseline/augmented arm 至少满足代码中预先锁定的 OOS trade/fold 下限。只有以下条件同时满足才 retained：
