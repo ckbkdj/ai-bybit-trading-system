@@ -65,6 +65,29 @@ def _statistical_evidence() -> dict[str, object]:
     }
 
 
+def _release_evidence_fixture(name: str) -> dict[str, object]:
+    if name == "data_coverage_report.json":
+        return {
+            "status": "PASSED",
+            "complete": True,
+            "expected_series_count": 25,
+            "passed_series_count": 25,
+        }
+    if name == "missing_intervals_report.json":
+        return {
+            "status": "PASSED",
+            "complete": True,
+            "total_discontinuity_count": 0,
+        }
+    if name == "independent_timestamp_count_report.json":
+        return {
+            "status": "PASSED",
+            "raw_source_complete": True,
+            "outer_oos_complete": True,
+        }
+    return {"report": name}
+
+
 def test_profitability_gate_passes_only_complete_stable_evidence():
     gate = evaluate_profitability_gate(
         _profitable_trades(),
@@ -356,7 +379,10 @@ def test_candidate_manifest_binds_every_final_evidence_report(tmp_path):
     evidence = {}
     for name in REQUIRED_EVIDENCE_REPORTS:
         path = tmp_path / name
-        path.write_text(f'{{"report":"{name}"}}', encoding="utf-8")
+        path.write_text(
+            json.dumps(_release_evidence_fixture(name), sort_keys=True),
+            encoding="utf-8",
+        )
         evidence[name] = path
     manifest = tmp_path / "candidate_release_manifest.json"
     create_candidate_manifest(
@@ -400,7 +426,10 @@ def test_candidate_manifest_release_id_is_derived_from_bound_evidence(tmp_path):
     evidence = {}
     for name in REQUIRED_EVIDENCE_REPORTS:
         evidence_path = tmp_path / name
-        evidence_path.write_text(f'{{"report":"{name}"}}', encoding="utf-8")
+        evidence_path.write_text(
+            json.dumps(_release_evidence_fixture(name), sort_keys=True),
+            encoding="utf-8",
+        )
         evidence[name] = evidence_path
     manifest_path = tmp_path / "candidate_release_manifest.json"
     create_candidate_manifest(

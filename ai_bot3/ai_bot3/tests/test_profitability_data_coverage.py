@@ -25,6 +25,7 @@ from core.evaluation.profitability_rebuild import (
     _market_bars,
     _maximum_execution_window_observed,
     _panel_rows,
+    audit_source_coverage,
     validate_source_coverage,
 )
 from core.training.pooled_panel import PooledPanelBuilder
@@ -99,6 +100,23 @@ def test_nominal_history_span_cannot_hide_a_missing_kline():
 
     with pytest.raises(ValueError, match="discontinuous"):
         validate_source_coverage(frame, "3m")
+
+    evidence = audit_source_coverage(frame, "3m")
+    assert evidence["status"] == "FAILED"
+    assert evidence["missing_interval_count"] == 1
+    assert evidence["missing_bar_count"] == 1
+    assert evidence["missing_intervals"] == [
+        {
+            "after_open_at": frame.loc[99, "open_at"].isoformat().replace(
+                "+00:00", "Z"
+            ),
+            "next_open_at": frame.loc[100, "open_at"].isoformat().replace(
+                "+00:00", "Z"
+            ),
+            "gap_sec": 360.0,
+            "estimated_missing_bars": 1,
+        }
+    ]
 
 
 def test_long_horizons_load_real_execution_evidence_without_using_short_factors():

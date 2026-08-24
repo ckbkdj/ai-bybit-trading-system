@@ -17,6 +17,9 @@ REQUIRED_EVIDENCE_REPORTS = (
     "execution_cost_report.json",
     "capital_preservation_report.json",
     "statistical_overfit_report.json",
+    "data_coverage_report.json",
+    "missing_intervals_report.json",
+    "independent_timestamp_count_report.json",
 )
 
 
@@ -26,6 +29,41 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _evidence_semantic_failure(name: str, path: Path) -> str | None:
+    if name not in {
+        "data_coverage_report.json",
+        "missing_intervals_report.json",
+        "independent_timestamp_count_report.json",
+    }:
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return "invalid_json"
+    if not isinstance(payload, Mapping):
+        return "invalid_payload"
+    if name == "data_coverage_report.json":
+        if payload.get("status") != "PASSED" or not bool(payload.get("complete")):
+            return "coverage_incomplete"
+        if int(payload.get("passed_series_count", -1)) != int(
+            payload.get("expected_series_count", -2)
+        ):
+            return "coverage_series_failed"
+    elif name == "missing_intervals_report.json":
+        if payload.get("status") != "PASSED" or not bool(payload.get("complete")):
+            return "interval_audit_incomplete"
+        if int(payload.get("total_discontinuity_count", -1)) != 0:
+            return "discontinuities_present"
+    elif name == "independent_timestamp_count_report.json":
+        if payload.get("status") != "PASSED":
+            return "independent_timestamp_audit_incomplete"
+        if not bool(payload.get("raw_source_complete")) or not bool(
+            payload.get("outer_oos_complete")
+        ):
+            return "independent_timestamp_scope_incomplete"
+    return None
 
 
 def _release_id(
@@ -84,6 +122,12 @@ def create_candidate_manifest(
         raise ValueError(
             "candidate manifest requires every evidence report: " + ", ".join(missing)
         )
+    for name in REQUIRED_EVIDENCE_REPORTS:
+        failure = _evidence_semantic_failure(name, Path(evidence_paths[name]))
+        if failure is not None:
+            raise ValueError(
+                f"candidate manifest evidence incomplete:{name}:{failure}"
+            )
     evidence_hashes = {
         name: _sha256(Path(evidence_paths[name]))
         for name in REQUIRED_EVIDENCE_REPORTS
@@ -151,6 +195,9 @@ def verify_candidate_authorization(
             return False, f"profitability_evidence_report_missing:{name}"
         if str(evidence_hashes[name]) != _sha256(evidence_path):
             return False, f"profitability_evidence_hash_mismatch:{name}"
+        failure = _evidence_semantic_failure(name, evidence_path)
+        if failure is not None:
+            return False, f"profitability_evidence_incomplete:{name}:{failure}"
     expected_release_id = _release_id(
         profitability_report_sha256=str(manifest.get("profitability_report_sha256") or ""),
         model_artifact_sha256=str(manifest.get("model_artifact_sha256") or ""),

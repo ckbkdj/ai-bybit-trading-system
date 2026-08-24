@@ -16,12 +16,38 @@ sys.path.insert(0, str(ROOT))
 from core.result_manager import ResultManager
 from contracts.strategy_release_v1 import StrategyReleaseBundle
 from core.evaluation.profitability_gate import ProfitabilityGateResult, write_profitability_report
-from core.release.profitability_release import create_candidate_manifest
+from core.release.profitability_release import (
+    REQUIRED_EVIDENCE_REPORTS,
+    create_candidate_manifest,
+)
 from core.release.strategy_bundle import canonical_bundle_hash
 
 
 def _iso(point: datetime) -> str:
     return point.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _release_evidence_fixture(name: str) -> dict[str, object]:
+    if name == "data_coverage_report.json":
+        return {
+            "status": "PASSED",
+            "complete": True,
+            "expected_series_count": 25,
+            "passed_series_count": 25,
+        }
+    if name == "missing_intervals_report.json":
+        return {
+            "status": "PASSED",
+            "complete": True,
+            "total_discontinuity_count": 0,
+        }
+    if name == "independent_timestamp_count_report.json":
+        return {
+            "status": "PASSED",
+            "raw_source_complete": True,
+            "outer_oos_complete": True,
+        }
+    return {"fixture": name}
 
 
 def _prediction(stage: str, release_id: str = "sr_result_gate_test_001") -> dict:
@@ -103,17 +129,11 @@ def _profitability_release(root: Path) -> tuple[Path, Path, dict]:
     artifact = root / "two-stage-model.json"
     artifact.write_text('{"release_stage":"rejected"}', encoding="utf-8")
     evidence_paths = {}
-    for name in (
-        "walk_forward_report.json",
-        "lockbox_report.json",
-        "factor_ablation_report.json",
-        "execution_cost_report.json",
-        "capital_preservation_report.json",
-        "statistical_overfit_report.json",
-    ):
+    for name in REQUIRED_EVIDENCE_REPORTS:
         evidence_path = root / name
         evidence_path.write_text(
-            json.dumps({"fixture": name}, sort_keys=True), encoding="utf-8"
+            json.dumps(_release_evidence_fixture(name), sort_keys=True),
+            encoding="utf-8",
         )
         evidence_paths[name] = evidence_path
     write_profitability_report(report, gate)

@@ -505,16 +505,40 @@ class KlinePanelSource:
         return frame.reset_index(drop=True)
 
 
-def validate_source_coverage(frame: pd.DataFrame, timeframe: str) -> dict[str, object]:
+def audit_source_coverage(frame: pd.DataFrame, timeframe: str) -> dict[str, object]:
+    """Describe the complete, actually observed kline grid without hiding failures."""
+
     if timeframe not in MINIMUM_COVERAGE_DAYS:
         raise ValueError(f"unsupported coverage timeframe: {timeframe}")
-    if frame.empty or "open_at" not in frame or "close_at" not in frame:
-        raise ValueError("source coverage requires open_at and close_at")
-    first = pd.to_datetime(frame["open_at"], utc=True, errors="coerce").min()
-    last = pd.to_datetime(frame["close_at"], utc=True, errors="coerce").max()
-    if pd.isna(first) or pd.isna(last) or last <= first:
-        raise ValueError("source coverage timestamps are invalid")
     expected_interval_sec = TIMEFRAME_INTERVAL_SEC[timeframe]
+    minimum = float(MINIMUM_COVERAGE_DAYS[timeframe])
+    base: dict[str, object] = {
+        "bars": int(len(frame)),
+        "start": None,
+        "end": None,
+        "coverage_days": 0.0,
+        "minimum_coverage_days": minimum,
+        "coverage_gate": "FAILED",
+        "continuity_gate": "FAILED",
+        "status": "FAILED",
+        "expected_interval_sec": expected_interval_sec,
+        "maximum_open_gap_sec": None,
+        "independent_open_timestamp_count": 0,
+        "invalid_timestamp_count": 0,
+        "duplicate_open_count": 0,
+        "invalid_bar_duration_count": 0,
+        "discontinuity_count": 0,
+        "missing_interval_count": 0,
+        "missing_bar_count": 0,
+        "overlap_or_off_grid_count": 0,
+        "missing_intervals": [],
+        "missing_intervals_truncated": False,
+        "missing_intervals_sha256": _hash_payload([]),
+        "failure_reasons": [],
+    }
+    if frame.empty or "open_at" not in frame or "close_at" not in frame:
+        base["failure_reasons"] = ["open_at_and_close_at_required"]
+        return base
     ordered = frame[["open_at", "close_at"]].copy()
     ordered["open_at"] = pd.to_datetime(
         ordered["open_at"], utc=True, errors="coerce"
@@ -522,38 +546,222 @@ def validate_source_coverage(frame: pd.DataFrame, timeframe: str) -> dict[str, o
     ordered["close_at"] = pd.to_datetime(
         ordered["close_at"], utc=True, errors="coerce"
     )
-    if ordered.isna().any().any():
-        raise ValueError("source coverage timestamps are invalid")
+    invalid_timestamp_count = int(ordered.isna().any(axis=1).sum())
+    base["invalid_timestamp_count"] = invalid_timestamp_count
+    ordered = ordered.dropna().sort_values("open_at").reset_index(drop=True)
+    if ordered.empty:
+        base["failure_reasons"] = ["timestamps_invalid"]
+        return base
+    first = ordered["open_at"].min()
+    last = ordered["close_at"].max()
+    if pd.isna(first) or pd.isna(last) or last <= first:
+        base["failure_reasons"] = ["timestamps_invalid"]
+        return base
+    duplicate_open_count = int(ordered["open_at"].duplicated().sum())
+    base["duplicate_open_count"] = duplicate_open_count
+    base["independent_open_timestamp_count"] = int(ordered["open_at"].nunique())
+    base["start"] = pd.Timestamp(first).isoformat().replace("+00:00", "Z")
+    base["end"] = pd.Timestamp(last).isoformat().replace("+00:00", "Z")
+    coverage_days = float((last - first).total_seconds() / 86_400.0)
+    base["coverage_days"] = coverage_days
     ordered = ordered.sort_values("open_at").reset_index(drop=True)
-    if ordered["open_at"].duplicated().any():
-        raise ValueError("source coverage contains duplicate bar opens")
     durations = (
         ordered["close_at"] - ordered["open_at"]
     ).dt.total_seconds()
-    if ((durations - expected_interval_sec).abs() > 1.0).any():
-        raise ValueError("source coverage contains invalid bar durations")
+    invalid_bar_duration_count = int(
+        ((durations - expected_interval_sec).abs() > 1.0).sum()
+    )
+    base["invalid_bar_duration_count"] = invalid_bar_duration_count
     gaps = ordered["open_at"].diff().dt.total_seconds().iloc[1:]
-    if ((gaps - expected_interval_sec).abs() > 1.0).any():
-        raise ValueError("source coverage is discontinuous")
-    coverage_days = float((last - first).total_seconds() / 86_400.0)
-    minimum = float(MINIMUM_COVERAGE_DAYS[timeframe])
-    if coverage_days < minimum:
-        raise ValueError(
-            f"{timeframe} coverage {coverage_days:.2f} days is below required {minimum:.2f} days"
+    discontinuity_mask = (gaps - expected_interval_sec).abs() > 1.0
+    base["discontinuity_count"] = int(discontinuity_mask.sum())
+    base["maximum_open_gap_sec"] = float(gaps.max()) if len(gaps) else None
+    missing_records: list[dict[str, object]] = []
+    missing_bar_count = 0
+    for current_index in gaps[gaps > expected_interval_sec + 1.0].index:
+        previous_open = pd.Timestamp(ordered.loc[current_index - 1, "open_at"])
+        current_open = pd.Timestamp(ordered.loc[current_index, "open_at"])
+        gap_sec = float((current_open - previous_open).total_seconds())
+        estimated_missing = max(1, int(math.floor(gap_sec / expected_interval_sec)) - 1)
+        missing_bar_count += estimated_missing
+        missing_records.append(
+            {
+                "after_open_at": previous_open.isoformat().replace("+00:00", "Z"),
+                "next_open_at": current_open.isoformat().replace("+00:00", "Z"),
+                "gap_sec": gap_sec,
+                "estimated_missing_bars": estimated_missing,
+            }
         )
-    return {
-        "bars": len(frame),
-        "start": first.isoformat().replace("+00:00", "Z"),
-        "end": last.isoformat().replace("+00:00", "Z"),
-        "coverage_days": coverage_days,
-        "minimum_coverage_days": minimum,
-        "coverage_gate": "PASSED",
-        "continuity_gate": "PASSED",
-        "expected_interval_sec": expected_interval_sec,
-        "maximum_open_gap_sec": float(gaps.max()) if len(gaps) else None,
-        "duplicate_open_count": 0,
-        "invalid_bar_duration_count": 0,
+    base["missing_interval_count"] = len(missing_records)
+    base["missing_bar_count"] = int(missing_bar_count)
+    base["overlap_or_off_grid_count"] = int(
+        (gaps < expected_interval_sec - 1.0).sum()
+    )
+    base["missing_intervals"] = missing_records[:1000]
+    base["missing_intervals_truncated"] = len(missing_records) > 1000
+    base["missing_intervals_sha256"] = _hash_payload(missing_records)
+    failure_reasons: list[str] = []
+    if invalid_timestamp_count:
+        failure_reasons.append("timestamps_invalid")
+    if duplicate_open_count:
+        failure_reasons.append("duplicate_bar_opens")
+    if invalid_bar_duration_count:
+        failure_reasons.append("invalid_bar_durations")
+    if int(base["discontinuity_count"]):
+        failure_reasons.append("discontinuous_bar_grid")
+    if coverage_days < minimum:
+        failure_reasons.append("insufficient_history")
+    base["failure_reasons"] = failure_reasons
+    base["coverage_gate"] = "PASSED" if coverage_days >= minimum else "FAILED"
+    base["continuity_gate"] = (
+        "PASSED"
+        if not any(
+            (
+                invalid_timestamp_count,
+                duplicate_open_count,
+                invalid_bar_duration_count,
+                int(base["discontinuity_count"]),
+            )
+        )
+        else "FAILED"
+    )
+    base["status"] = "PASSED" if not failure_reasons else "FAILED"
+    return base
+
+
+def validate_source_coverage(frame: pd.DataFrame, timeframe: str) -> dict[str, object]:
+    evidence = audit_source_coverage(frame, timeframe)
+    if evidence["failure_reasons"] == ["open_at_and_close_at_required"]:
+        raise ValueError("source coverage requires open_at and close_at")
+    if int(evidence["invalid_timestamp_count"]):
+        raise ValueError("source coverage timestamps are invalid")
+    if int(evidence["duplicate_open_count"]):
+        raise ValueError("source coverage contains duplicate bar opens")
+    if int(evidence["invalid_bar_duration_count"]):
+        raise ValueError("source coverage contains invalid bar durations")
+    if int(evidence["discontinuity_count"]):
+        raise ValueError("source coverage is discontinuous")
+    if evidence["coverage_gate"] != "PASSED":
+        raise ValueError(
+            f"{timeframe} coverage {float(evidence['coverage_days']):.2f} days is "
+            f"below required {float(evidence['minimum_coverage_days']):.2f} days"
+        )
+    return evidence
+
+
+def _write_kline_data_evidence(
+    output_dir: Path,
+    *,
+    trial_id: str,
+    code_commit: str,
+    feature_store_identity: Mapping[str, object],
+    series_audits: Mapping[str, Mapping[str, object]],
+    source_timestamp_counts_by_horizon: Mapping[int, int],
+    oos_timestamp_evidence: Mapping[int, Mapping[str, object]] | None = None,
+) -> None:
+    expected_series_count = len(SYMBOLS) * len(HORIZONS_SEC)
+    ordered_audits = {
+        key: dict(series_audits[key]) for key in sorted(series_audits)
     }
+    passed_series_count = sum(
+        1 for audit in ordered_audits.values() if audit.get("status") == "PASSED"
+    )
+    complete = len(ordered_audits) == expected_series_count
+    coverage_passed = complete and passed_series_count == expected_series_count
+    _atomic_json(
+        output_dir / "data_coverage_report.json",
+        {
+            "schema_version": "profitability-data-coverage.v1",
+            "trial_id": trial_id,
+            "code_commit": code_commit,
+            "feature_store": dict(feature_store_identity),
+            "status": "PASSED" if coverage_passed else "FAILED",
+            "complete": complete,
+            "expected_series_count": expected_series_count,
+            "audited_series_count": len(ordered_audits),
+            "passed_series_count": passed_series_count,
+            "minimum_coverage_days": dict(MINIMUM_COVERAGE_DAYS),
+            "continuity_tolerance_sec": 1.0,
+            "series": ordered_audits,
+        },
+    )
+    missing_series = {
+        key: {
+            "timeframe": audit.get("timeframe"),
+            "horizon_sec": audit.get("horizon_sec"),
+            "discontinuity_count": audit.get("discontinuity_count"),
+            "missing_interval_count": audit.get("missing_interval_count"),
+            "missing_bar_count": audit.get("missing_bar_count"),
+            "overlap_or_off_grid_count": audit.get("overlap_or_off_grid_count"),
+            "missing_intervals": audit.get("missing_intervals"),
+            "missing_intervals_truncated": audit.get(
+                "missing_intervals_truncated"
+            ),
+            "missing_intervals_sha256": audit.get("missing_intervals_sha256"),
+        }
+        for key, audit in ordered_audits.items()
+        if int(audit.get("discontinuity_count", 0)) > 0
+    }
+    total_discontinuities = sum(
+        int(audit.get("discontinuity_count", 0))
+        for audit in ordered_audits.values()
+    )
+    _atomic_json(
+        output_dir / "missing_intervals_report.json",
+        {
+            "schema_version": "profitability-missing-intervals.v1",
+            "trial_id": trial_id,
+            "code_commit": code_commit,
+            "feature_store_sha256": feature_store_identity.get("sha256"),
+            "status": (
+                "PASSED" if complete and total_discontinuities == 0 else "FAILED"
+            ),
+            "complete": complete,
+            "audited_series_count": len(ordered_audits),
+            "total_discontinuity_count": total_discontinuities,
+            "total_missing_interval_count": sum(
+                int(audit.get("missing_interval_count", 0))
+                for audit in ordered_audits.values()
+            ),
+            "total_missing_bar_count": sum(
+                int(audit.get("missing_bar_count", 0))
+                for audit in ordered_audits.values()
+            ),
+            "series_with_discontinuities": missing_series,
+        },
+    )
+    oos_payload = {
+        str(horizon): dict(evidence)
+        for horizon, evidence in sorted((oos_timestamp_evidence or {}).items())
+    }
+    oos_complete = bool(oos_timestamp_evidence) and set(oos_timestamp_evidence) == set(
+        HORIZONS_SEC
+    ) and all(
+        int(evidence.get("unique_decision_timestamp_count", 0)) > 0
+        for evidence in oos_timestamp_evidence.values()
+    )
+    _atomic_json(
+        output_dir / "independent_timestamp_count_report.json",
+        {
+            "schema_version": "profitability-independent-timestamps.v1",
+            "trial_id": trial_id,
+            "code_commit": code_commit,
+            "status": "PASSED" if coverage_passed and oos_complete else "INCOMPLETE",
+            "raw_source_complete": coverage_passed,
+            "outer_oos_complete": oos_complete,
+            "counting_policy": (
+                "paired BUY/SELL alternatives and simultaneous symbols are not counted "
+                "as independent decision timestamps"
+            ),
+            "raw_source_unique_timestamps_by_horizon": {
+                str(horizon): int(count)
+                for horizon, count in sorted(
+                    source_timestamp_counts_by_horizon.items()
+                )
+            },
+            "outer_oos_by_horizon": oos_payload,
+        },
+    )
 
 
 _engineer_features = engineer_profitability_features
@@ -2328,9 +2536,74 @@ class ProfitabilityRebuild:
         self.ledger.append_event(self.trial_id, "running", {"phase": "load_and_label"})
         panels: dict[int, pd.DataFrame] = {}
         market: dict[str, Sequence[MarketBar]] = {}
+        output = self.config.output_dir
         source_evidence: dict[str, object] = {
             "kline_feature_store": dict(self.feature_store_identity)
         }
+        coverage_audits: dict[str, dict[str, object]] = {}
+        preflight_unique_times_by_horizon: dict[int, pd.Series] = {}
+        source_timestamp_counts_by_horizon: dict[int, int] = {}
+        for horizon in HORIZONS_SEC:
+            timeframe = HORIZON_TIMEFRAME[horizon]
+            decision_times: list[pd.Series] = []
+            for symbol in SYMBOLS:
+                series_id = f"{symbol}:{horizon}"
+                frame: pd.DataFrame | None = None
+                try:
+                    frame = self.source.load(
+                        symbol, timeframe, self.config.max_bars_per_symbol
+                    )
+                    audit = audit_source_coverage(frame, timeframe)
+                    decision_times.append(frame["close_at"].copy())
+                except Exception as exc:
+                    audit = audit_source_coverage(
+                        pd.DataFrame(columns=["open_at", "close_at"]), timeframe
+                    )
+                    audit["failure_reasons"] = [
+                        *list(audit["failure_reasons"]),
+                        "source_load_failed",
+                    ]
+                    audit["load_error"] = f"{type(exc).__name__}: {exc}"
+                audit = {
+                    "symbol": symbol,
+                    "horizon_sec": horizon,
+                    "timeframe": timeframe,
+                    "decision_sampling": "non_overlapping_max_execution_windows",
+                    "paired_side_alternatives": True,
+                    **audit,
+                }
+                coverage_audits[series_id] = audit
+                source_evidence[series_id] = audit
+                if frame is not None:
+                    del frame
+            unique_times = (
+                pd.concat(decision_times, ignore_index=True)
+                .drop_duplicates()
+                .sort_values()
+                .reset_index(drop=True)
+                if decision_times
+                else pd.Series(dtype="datetime64[ns, UTC]")
+            )
+            preflight_unique_times_by_horizon[horizon] = unique_times
+            source_timestamp_counts_by_horizon[horizon] = int(len(unique_times))
+        _write_kline_data_evidence(
+            output,
+            trial_id=self.trial_id,
+            code_commit=self.config.code_commit,
+            feature_store_identity=self.feature_store_identity,
+            series_audits=coverage_audits,
+            source_timestamp_counts_by_horizon=source_timestamp_counts_by_horizon,
+        )
+        failed_coverage_series = [
+            series_id
+            for series_id, audit in coverage_audits.items()
+            if audit.get("status") != "PASSED"
+        ]
+        if failed_coverage_series:
+            raise ValueError(
+                "kline coverage preflight failed for: "
+                + ", ".join(failed_coverage_series)
+            )
         bybit_source: BybitPITFeatureSource | None = None
         bybit_evidence_by_horizon: dict[int, dict[str, object]] = {}
         bybit_names: tuple[str, ...] = ()
@@ -2353,24 +2626,7 @@ class ProfitabilityRebuild:
         for horizon in HORIZONS_SEC:
             timeframe = HORIZON_TIMEFRAME[horizon]
             panel_parts: list[pd.DataFrame] = []
-            decision_times: list[pd.Series] = []
-            for symbol in SYMBOLS:
-                frame = self.source.load(symbol, timeframe, self.config.max_bars_per_symbol)
-                coverage = validate_source_coverage(frame, timeframe)
-                decision_times.append(frame["close_at"].copy())
-                source_evidence[f"{symbol}:{horizon}"] = {
-                    "timeframe": timeframe,
-                    "decision_sampling": "non_overlapping_max_execution_windows",
-                    "paired_side_alternatives": True,
-                    **coverage,
-                }
-                del frame
-            unique_times = (
-                pd.concat(decision_times, ignore_index=True)
-                .drop_duplicates()
-                .sort_values()
-                .reset_index(drop=True)
-            )
+            unique_times = preflight_unique_times_by_horizon[horizon]
             if len(unique_times) < 10:
                 raise ValueError(f"too few raw decision times for horizon {horizon}")
             boundary_position = min(
@@ -2383,7 +2639,6 @@ class ProfitabilityRebuild:
             lockbox_start = pd.Timestamp(unique_times.iloc[boundary_position]).to_pydatetime()
             lockbox_start_by_horizon[horizon] = lockbox_start
             decision_minimum = pd.Timestamp(unique_times.iloc[0]).to_pydatetime()
-            decision_times.clear()
             max_wait_sec = max(30, min(300, horizon // 2))
             development_decision_end = lockbox_start - timedelta(
                 seconds=horizon + max_wait_sec
@@ -3044,7 +3299,39 @@ class ProfitabilityRebuild:
             statistical_overfit_evidence=development_statistical_evidence,
             thresholds=ProfitabilityThresholds(),
         )
-        output = self.config.output_dir
+        oos_timestamp_evidence = {}
+        for horizon in HORIZONS_SEC:
+            timestamps = pd.to_datetime(
+                pd.Series(development_evaluation_timestamps_by_horizon[horizon]),
+                utc=True,
+                errors="coerce",
+            ).dropna()
+            unique_timestamp_count = int(timestamps.nunique())
+            oos_timestamp_evidence[horizon] = {
+                "outer_oos_prediction_row_count": int(len(timestamps)),
+                "unique_decision_timestamp_count": unique_timestamp_count,
+                "non_independent_duplicate_row_count": int(
+                    len(timestamps) - unique_timestamp_count
+                ),
+                "unique_utc_day_count": int(timestamps.dt.floor("D").nunique()),
+                "outer_fold_count": sum(
+                    1
+                    for fold in walk_forward
+                    if int(fold["horizon_sec"]) == horizon
+                ),
+                "paired_side_alternatives_counted_once": True,
+                "simultaneous_symbols_counted_once": True,
+                "overlapping_execution_windows_allowed": False,
+            }
+        _write_kline_data_evidence(
+            output,
+            trial_id=self.trial_id,
+            code_commit=self.config.code_commit,
+            feature_store_identity=self.feature_store_identity,
+            series_audits=coverage_audits,
+            source_timestamp_counts_by_horizon=source_timestamp_counts_by_horizon,
+            oos_timestamp_evidence=oos_timestamp_evidence,
+        )
         _archive_candidate_manifest(output, self.trial_id)
         write_profitability_report(output / "profitability_report.json", development_gate)
         _atomic_json(
@@ -3867,6 +4154,9 @@ class ProfitabilityRebuild:
                         "execution_cost_report.json",
                         "capital_preservation_report.json",
                         "statistical_overfit_report.json",
+                        "data_coverage_report.json",
+                        "missing_intervals_report.json",
+                        "independent_timestamp_count_report.json",
                     )
                 },
             )
@@ -3956,6 +4246,27 @@ def write_failed_outputs(output_dir: Path, *, reason: str) -> ProfitabilityGateR
         ),
     ):
         _atomic_json(output_dir / name, payload)
+    for name, schema_version in (
+        ("data_coverage_report.json", "profitability-data-coverage.v1"),
+        ("missing_intervals_report.json", "profitability-missing-intervals.v1"),
+        (
+            "independent_timestamp_count_report.json",
+            "profitability-independent-timestamps.v1",
+        ),
+    ):
+        path = output_dir / name
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            payload = {
+                "schema_version": schema_version,
+                "status": "FAILED",
+                "complete": False,
+            }
+        payload["pipeline_status"] = "FAILED"
+        payload["pipeline_failure_reason"] = reason
+        payload["release_eligible"] = False
+        _atomic_json(path, payload)
     return result
 
 
@@ -3964,6 +4275,7 @@ __all__: Sequence[str] = (
     "ProfitabilityRebuildConfig",
     "MINIMUM_COVERAGE_DAYS",
     "SYMBOLS",
+    "audit_source_coverage",
     "validate_source_coverage",
     "write_failed_outputs",
 )
