@@ -16,10 +16,22 @@ class PortfolioIntentPolicy:
     min_data_quality: float = 0.90
     max_range_guard_score: float = 0.35
     max_target_exposure_pct: float = 0.08
-    risk_budget_pct: float = 0.003
+    risk_budget_pct: float = 0.0025
     max_turnover_pct: float = 0.08
     decision_deadband: float = 0.12
     ttl_sec: int = 300
+
+    def __post_init__(self) -> None:
+        if not 0 < self.risk_budget_pct <= 0.0025:
+            raise ValueError("risk_budget_pct cannot exceed the 0.25% hard limit")
+        if not 0 < self.max_target_exposure_pct <= 1:
+            raise ValueError("max_target_exposure_pct must be in (0, 1]")
+        if not 0 < self.max_turnover_pct <= 1:
+            raise ValueError("max_turnover_pct must be in (0, 1]")
+        if self.min_horizons < 2:
+            raise ValueError("portfolio decisions require at least two horizons")
+        if self.ttl_sec <= 0:
+            raise ValueError("ttl_sec must be positive")
 
     def weight_for(self, horizon_sec: int) -> float:
         configured = dict(self.horizon_weights or {})

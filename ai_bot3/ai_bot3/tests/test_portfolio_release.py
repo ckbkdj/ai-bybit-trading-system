@@ -12,8 +12,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from adapters.legacy_forecast_adapter import LegacyForecastAdapter
-from core.decision.portfolio_intent import PortfolioIntentBuilder
+from core.decision.portfolio_intent import PortfolioIntentBuilder, PortfolioIntentPolicy
 from core.decision.ticket_builder import TicketBuilder
+from core.decision.ticket_policy import TicketPolicyConfig
 from core.release.strategy_bundle import (
     StrategyReleaseLoader,
     StrategyReleaseVerificationError,
@@ -79,6 +80,23 @@ def test_multi_horizon_signal_book_nets_once_and_ticket_references_decision():
     assert ticket.guards.forecast_market == "binance"
     assert ticket.created_at == intent.created_at
     assert ticket.expires_at <= intent.valid_until
+    assert intent.risk_budget_pct == 0.0025
+    assert ticket.intent.risk_budget_pct == 0.0025
+    assert ticket.intent.leverage_cap == 2.0
+
+
+def test_research_ticket_policies_cannot_relax_capital_preservation_limits():
+    for factory, keyword, unsafe in (
+        (PortfolioIntentPolicy, "risk_budget_pct", 0.0025001),
+        (TicketPolicyConfig, "risk_budget_pct", 0.0025001),
+        (TicketPolicyConfig, "leverage_cap", 2.0001),
+    ):
+        try:
+            factory(**{keyword: unsafe})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{factory.__name__} accepted unsafe {keyword}")
 
 
 def test_one_horizon_event_block_vetoes_the_whole_portfolio():

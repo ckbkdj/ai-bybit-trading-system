@@ -47,6 +47,16 @@ class TicketValidator:
                 "REPLACE_NOT_IMPLEMENTED",
                 "REPLACE is blocked until target-order cancellation/amendment and recovery are atomic and tested",
             )
+        if ticket.intent.action == "INCREASE":
+            # The current portfolio snapshot does not carry enough immutable
+            # position-cost evidence to prove that an increase is profitable
+            # pyramiding rather than averaging down.  Fail closed until that
+            # distinction is implemented and independently tested.
+            return ValidationResult(
+                False,
+                "INCREASE_NOT_IMPLEMENTED",
+                "INCREASE is blocked until position-side and average-entry evidence can prove it is not averaging down",
+            )
         if ticket.intent.action in {"OPEN", "INCREASE"}:
             if ticket.entry is None or ticket.protection is None or ticket.protection.stop_loss is None:
                 return ValidationResult(False, "MISSING_RISK_FIELDS", "entry and stop loss are required")

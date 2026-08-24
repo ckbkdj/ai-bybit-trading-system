@@ -29,3 +29,19 @@ def test_replace_is_rejected_until_atomic_amend_or_cancel_replace_exists():
     assert result.accepted is False
     assert result.reason_code == "REPLACE_NOT_IMPLEMENTED"
     assert "atomic" in result.reason_detail.lower()
+
+
+def test_increase_is_rejected_until_averaging_down_can_be_ruled_out():
+    payload = ticket_payload("tk_increase_fail_closed_001")
+    payload["intent"].update(
+        action="INCREASE",
+        position_effect="OPEN_OR_INCREASE",
+    )
+    payload["guards"]["require_flat_position"] = False
+    ticket = OperationTicket.model_validate(payload)
+
+    result = TicketValidator().validate(ticket, now=NOW)
+
+    assert result.accepted is False
+    assert result.reason_code == "INCREASE_NOT_IMPLEMENTED"
+    assert "averaging down" in result.reason_detail.lower()
