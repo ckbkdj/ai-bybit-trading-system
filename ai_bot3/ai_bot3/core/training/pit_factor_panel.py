@@ -56,14 +56,18 @@ class TradPanelHistorySource:
         *,
         instruments: Mapping[str, str] | None = None,
         availability_lag: timedelta = timedelta(hours=30),
+        maximum_age: timedelta = timedelta(days=7),
         verify_sha256: bool = True,
     ) -> None:
         self.root = Path(root).expanduser().resolve()
         self.instruments = dict(instruments or TRAD_PANEL_INSTRUMENTS)
         self.availability_lag = availability_lag
+        self.maximum_age = maximum_age
         self.verify_sha256 = verify_sha256
         if availability_lag < timedelta(hours=24):
             raise ValueError("daily external prices require at least a 24-hour PIT lag")
+        if maximum_age <= timedelta(0):
+            raise ValueError("external price maximum age must be positive")
         if not self.instruments:
             raise ValueError("an explicit instrument allowlist is required")
 
@@ -150,10 +154,14 @@ class TradPanelHistorySource:
             "hash_verified": self.verify_sha256,
             "selection_policy": "explicit_symbol_allowlist_base_prices_only",
             "availability_lag_seconds": int(self.availability_lag.total_seconds()),
+            "maximum_age_seconds": int(self.maximum_age.total_seconds()),
             "row_count": len(history),
             "missing_symbols": sorted(set(missing_symbols)),
             "factor_columns": list(self.instruments),
-            "pit_policy": "available_at=panel_ts+conservative_daily_release_lag",
+            "pit_policy": (
+                "available_at=panel_ts+conservative_daily_release_lag;"
+                "reject_if_decision_at-available_at>maximum_age"
+            ),
         }
         return history, evidence
 
@@ -180,6 +188,7 @@ class TradPanelHistorySource:
             right_on="factor_available_at",
             direction="backward",
             allow_exact_matches=True,
+            tolerance=pd.Timedelta(self.maximum_age),
         )
         violation = joined["factor_available_at"].notna() & (
             joined["factor_available_at"] > joined["decision_at"]

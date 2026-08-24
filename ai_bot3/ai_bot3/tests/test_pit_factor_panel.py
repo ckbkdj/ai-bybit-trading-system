@@ -66,6 +66,7 @@ def test_trad_panel_history_joins_only_values_available_before_crypto_decision(t
     history, evidence = source.load()
     assert evidence["hash_verified"] is True
     assert evidence["selection_policy"] == "explicit_symbol_allowlist_base_prices_only"
+    assert evidence["maximum_age_seconds"] == 7 * 24 * 60 * 60
     assert history["available_at"].is_monotonic_increasing
 
     decisions = pd.DataFrame(
@@ -80,3 +81,23 @@ def test_trad_panel_history_joins_only_values_available_before_crypto_decision(t
     assert pd.isna(joined.loc[0, "gld_return"])
     assert joined.loc[1, "gld_return"] == (101.0 / 100.0 - 1.0)
     assert joined.loc[1, "factor_available_at"] <= joined.loc[1, "decision_at"]
+
+
+def test_trad_panel_history_does_not_carry_stale_returns_forward(tmp_path):
+    source = TradPanelHistorySource(
+        _service(tmp_path),
+        instruments={"gld_return": "GLD.US"},
+        availability_lag=timedelta(hours=30),
+        maximum_age=timedelta(days=7),
+        verify_sha256=True,
+    )
+    history, _ = source.load()
+    latest_available = history["available_at"].max().to_pydatetime()
+    decisions = pd.DataFrame(
+        {"decision_at": [latest_available + timedelta(days=7, seconds=1)]}
+    )
+
+    joined = source.join(decisions, history=history)
+
+    assert pd.isna(joined.loc[0, "factor_available_at"])
+    assert pd.isna(joined.loc[0, "gld_return"])

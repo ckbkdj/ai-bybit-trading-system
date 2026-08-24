@@ -1789,7 +1789,7 @@ class ProfitabilityRebuild:
                 panels[horizon] = flow_source.join(
                     panels[horizon], names=flow_names, history=flow_history
                 )
-            source_evidence["coinmetrics_stablecoin_pit"] = flow_pit_evidence
+            source_evidence["flow_pit"] = flow_pit_evidence
 
         splitter = PooledPanelBuilder(
             lockbox_fraction=self.config.lockbox_fraction,

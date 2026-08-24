@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping
@@ -40,6 +40,8 @@ EXTERNAL_FEATURE_ALIASES: Mapping[str, str] = {
     "coin_return": "cross_asset_coin_ret_1d",
     "mstr_return": "cross_asset_mstr_ret_1d",
 }
+
+MAX_EXTERNAL_PANEL_AGE = timedelta(days=7)
 
 
 def _utc(value: Any) -> datetime:
@@ -106,12 +108,18 @@ def _external_values(
 ) -> tuple[dict[str, float], dict[str, object]]:
     if not isinstance(context, Mapping):
         return {}, {"status": "missing"}
+    status = str(context.get("status") or "missing").strip().lower()
     data = context.get("data")
     if not isinstance(data, Mapping):
-        return {}, {"status": str(context.get("status") or "missing")}
+        return {}, {"status": status}
+    if status != "ok":
+        raise ValueError(f"external panel provider status is not healthy: {status}")
     available_at = _utc(data.get("available_at"))
     if available_at > decision_at:
         raise ValueError("external panel was unavailable at the inference cutoff")
+    age = decision_at - available_at
+    if age > MAX_EXTERNAL_PANEL_AGE:
+        raise ValueError("external panel is stale at the inference cutoff")
     if data.get("hash_verified") is not True:
         raise ValueError("external panel hash is not verified")
     raw = data.get("features")
@@ -124,12 +132,14 @@ def _external_values(
             if np.isfinite(value):
                 values[model_name] = value
     evidence = {
-        "status": str(context.get("status") or "unknown"),
+        "status": status,
         "source": context.get("source"),
         "available_at": _iso(available_at),
         "latest_pass_run_id": data.get("latest_pass_run_id"),
         "canonical_sha256": data.get("canonical_sha_from_receipt"),
         "hash_verified": True,
+        "age_seconds": age.total_seconds(),
+        "maximum_age_seconds": MAX_EXTERNAL_PANEL_AGE.total_seconds(),
     }
     return values, evidence
 
@@ -253,9 +263,20 @@ def build_current_feature_rows(
     session = (
         "asia" if decision_at.hour < 8 else "europe" if decision_at.hour < 16 else "americas"
     )
-    external, external_evidence = _external_values(
-        external_panel_context, decision_at=decision_at
-    )
+    required_external_features = [
+        column for column in model_feature_columns if column in EXTERNAL_FEATURE_ALIASES
+    ]
+    external: dict[str, float] = {}
+    external_evidence: dict[str, object] = {"status": "not_required"}
+    if required_external_features:
+        external, external_evidence = _external_values(
+            external_panel_context, decision_at=decision_at
+        )
+        missing_external = sorted(set(required_external_features).difference(external))
+        if missing_external:
+            raise ValueError(
+                f"fresh external panel features unavailable: {missing_external}"
+            )
     required_macro_features = [
         column for column in model_feature_columns if column in MACRO_FEATURE_CONTRACTS
     ]
@@ -546,6 +567,7 @@ def generate_profitability_alpha_prediction(
 
 __all__ = (
     "EXTERNAL_FEATURE_ALIASES",
+    "MAX_EXTERNAL_PANEL_AGE",
     "build_current_feature_rows",
     "generate_profitability_alpha_prediction",
 )

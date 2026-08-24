@@ -218,6 +218,66 @@ def test_rejected_shadow_bundle_runs_real_alpha_but_cannot_be_actionable(tmp_pat
     assert alpha["feature_evidence"]["feature_snapshot_sha256"]
 
 
+def _external_context(decision_at: datetime, *, status: str = "ok", age_days: int = 1):
+    return {
+        "status": status,
+        "source": "trad_data_service.canonical_panel",
+        "data": {
+            "available_at": (decision_at - timedelta(days=age_days)).isoformat(),
+            "hash_verified": True,
+            "latest_pass_run_id": "pass-run",
+            "canonical_sha_from_receipt": "a" * 64,
+            "features": {"cross_asset_spy_ret_1d": 0.01},
+        },
+    }
+
+
+def test_runtime_requires_fresh_healthy_external_panel_only_when_in_contract(tmp_path):
+    market = _market_frame()
+    decision_at = market.index[-1].to_pydatetime()
+    baseline_bundle = _bundle(tmp_path / "baseline")
+    ignored = generate_profitability_alpha_prediction(
+        market,
+        symbol="BTCUSDT",
+        mode="scalping",
+        model_bundle_path=baseline_bundle,
+        external_panel_context=_external_context(decision_at, status="degraded", age_days=30),
+    )
+    assert ignored["status"] == "ok"
+    assert ignored["feature_evidence"]["external_panel"]["status"] == "not_required"
+
+    external_bundle = _bundle(tmp_path / "external", ("spy_return",))
+    healthy = generate_profitability_alpha_prediction(
+        market,
+        symbol="BTCUSDT",
+        mode="scalping",
+        model_bundle_path=external_bundle,
+        external_panel_context=_external_context(decision_at),
+    )
+    assert healthy["status"] == "ok", healthy.get("reason")
+    assert healthy["feature_evidence"]["external_panel"]["age_seconds"] == 86400.0
+
+    degraded = generate_profitability_alpha_prediction(
+        market,
+        symbol="BTCUSDT",
+        mode="scalping",
+        model_bundle_path=external_bundle,
+        external_panel_context=_external_context(decision_at, status="degraded"),
+    )
+    assert degraded["status"] == "blocked"
+    assert "status is not healthy" in degraded["reason"]
+
+    stale = generate_profitability_alpha_prediction(
+        market,
+        symbol="BTCUSDT",
+        mode="scalping",
+        model_bundle_path=external_bundle,
+        external_panel_context=_external_context(decision_at, age_days=8),
+    )
+    assert stale["status"] == "blocked"
+    assert "external panel is stale" in stale["reason"]
+
+
 def test_runtime_fails_closed_when_horizon_model_is_modified(tmp_path):
     bundle = _bundle(tmp_path)
     model_path = tmp_path / "horizon_180.json"
