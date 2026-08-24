@@ -671,7 +671,18 @@ class BybitPITFeatureSource:
                           WHERE archive_id IN ({placeholders})""",
                     archive_ids,
                 ).fetchall()
+                archive_count_rows = connection.execute(
+                    f"""SELECT archive_id,COUNT(*) AS observation_count
+                           FROM bybit_feature_observations
+                          WHERE archive_id IN ({placeholders}) AND sequence<=?
+                          GROUP BY archive_id""",
+                    archive_ids + (frozen_sequence,),
+                ).fetchall()
             by_id = {str(row["archive_id"]): dict(row) for row in archive_rows}
+            archive_observation_counts = {
+                str(row["archive_id"]): int(row["observation_count"])
+                for row in archive_count_rows
+            }
             missing_archive_ids = sorted(set(archive_ids).difference(by_id))
             if missing_archive_ids:
                 raise RuntimeError("historical archive feature provenance record is missing")
@@ -711,6 +722,8 @@ class BybitPITFeatureSource:
                     or int(record["content_length"]) <= 0
                     or int(record["rows_read"]) <= 0
                     or int(record["feature_observation_count"]) <= 0
+                    or archive_observation_counts.get(str(archive_id), 0)
+                    != int(record["feature_observation_count"])
                 ):
                     raise RuntimeError("historical archive provenance contract failed")
                 if set(group["symbol"].astype(str)) != {str(record["symbol"])}:
@@ -748,7 +761,18 @@ class BybitPITFeatureSource:
                           ORDER BY batch_id,response_id""",
                     api_batch_ids,
                 ).fetchall()
+                api_count_rows = connection.execute(
+                    f"""SELECT api_batch_id,COUNT(*) AS observation_count
+                           FROM bybit_feature_observations
+                          WHERE api_batch_id IN ({api_placeholders}) AND sequence<=?
+                          GROUP BY api_batch_id""",
+                    api_batch_ids + (frozen_sequence,),
+                ).fetchall()
             api_by_id = {str(row["batch_id"]): dict(row) for row in api_rows}
+            api_observation_counts = {
+                str(row["api_batch_id"]): int(row["observation_count"])
+                for row in api_count_rows
+            }
             if set(api_batch_ids).difference(api_by_id):
                 raise RuntimeError("historical API feature provenance record is missing")
             responses_by_batch: dict[str, list[dict[str, object]]] = {}
@@ -788,6 +812,8 @@ class BybitPITFeatureSource:
                     or str(record["endpoint_group"]) == ""
                     or int(record["rows_read"]) <= 0
                     or int(record["feature_observation_count"]) <= 0
+                    or api_observation_counts.get(str(batch_id), 0)
+                    != int(record["feature_observation_count"])
                     or not _is_sha256(record["request_manifest_sha256"])
                     or _api_manifest_sha256(responses)
                     != str(record["request_manifest_sha256"])

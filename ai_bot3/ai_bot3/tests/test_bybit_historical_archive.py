@@ -274,3 +274,38 @@ def test_completed_archive_evidence_cannot_be_downgraded_by_late_failure(tmp_pat
         assert "immutable" in str(exc)
     else:
         raise AssertionError("completed archive evidence accepted an update")
+
+
+def test_loader_rejects_legacy_archive_with_missing_feature_rows(tmp_path):
+    database = tmp_path / "legacy-corrupt.sqlite3"
+    archive = tmp_path / "book.zip"
+    _orderbook_zip(archive)
+    store = BybitPublicPITStore(database)
+    evidence = replay_orderbook_archive(
+        store,
+        archive,
+        symbol=SYMBOL,
+        trading_date=DAY,
+        source_url=orderbook_archive_url(SYMBOL, DAY),
+        fetched_at=FETCHED,
+        feature_emit_interval_sec=15,
+    )
+    # Simulate damage that occurred in an old database before immutable
+    # triggers existed. New stores cannot perform this delete.
+    with store.connect() as connection:
+        connection.execute("DROP TRIGGER reject_bybit_feature_delete")
+        connection.execute(
+            """DELETE FROM bybit_feature_observations
+                WHERE sequence=(
+                    SELECT MIN(sequence) FROM bybit_feature_observations
+                     WHERE archive_id=?
+                )""",
+            (evidence.archive_id,),
+        )
+        connection.commit()
+    try:
+        BybitPITFeatureSource(database).load(["orderbook_spread_bps"])
+    except RuntimeError as exc:
+        assert "archive provenance contract" in str(exc)
+    else:
+        raise AssertionError("a completed archive with missing rows was accepted")

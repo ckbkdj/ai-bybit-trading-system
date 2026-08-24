@@ -116,6 +116,8 @@ capture audit 同时验证官方 public-linear endpoint、sealed session、订�
 
 historical archive/API feature 还要与 data kind 一一绑定：orderbook、trades、funding、open_interest、basis 不能互相背书。API batch/response deterministic ID、官方 host/path 和 request manifest 在 loader 中重算；公开 REST 原始响应正文以 BLOB 留存，写入与读取时均重新核对 content length/SHA，只有哈希但没有正文的旧 API 证据失败关闭。
 
+每个 completed archive/API batch 声明的 `feature_observation_count` 必须等于 trial 冻结 feature sequence 下数据库中实际引用该 archive/batch 的总行数。该检查覆盖不可变 trigger 安装前形成的旧库；manifest 仍在但特征缺行时整份 provenance 失败。
+
 实时采集库与历史研究库物理分离。`core/providers/bybit_capture_audit.py` 先把停止后的 capture journal 封成不可变 audit，再以 append-only、冲突即失败的方式仅迁移 liquidation 原始事件、v2 特征、失效记录、session 和连续区间收据；archive/orderbook/trades/API 历史仍留在 development 仓。导入收据保存选择水位、源/新增计数和逻辑 manifest SHA，重复导入必须为零新增。
 
 Bybit trial 除冻结 feature sequence 和 invalidation rowid，还冻结 capture-audit/import receipt rowid，并把四个水位共同写入 trial identity 与 snapshot SHA。raw/features/invalidations/API responses/audits/intervals/imports 在 SQLite trigger 层禁止更新删除；archive/API batch 从 `completed` 起不可修改。失败批次仍可原子重试为 completed，但完成证据不能被后来失败或相同 ID 的另一内容覆盖。
