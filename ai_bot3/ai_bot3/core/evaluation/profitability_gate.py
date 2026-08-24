@@ -164,11 +164,16 @@ def _daily_portfolio_returns(
 def _concentration(trades: Sequence[object], key: str) -> tuple[float, str | None]:
     pnl: dict[str, float] = defaultdict(float)
     for trade in trades:
-        pnl[str(_value(trade, key, "unknown"))] += max(0.0, float(_value(trade, "net_pnl", 0.0)))
-    total = sum(pnl.values())
+        pnl[str(_value(trade, key, "unknown"))] += float(
+            _value(trade, "net_pnl", 0.0)
+        )
+    positive_contributions = {
+        group: max(0.0, value) for group, value in pnl.items()
+    }
+    total = sum(positive_contributions.values())
     if total <= 0:
         return 1.0, None
-    group, value = max(pnl.items(), key=lambda item: item[1])
+    group, value = max(positive_contributions.items(), key=lambda item: item[1])
     return value / total, group
 
 
@@ -215,7 +220,11 @@ def evaluate_profitability_gate(
         trades,
         initial_equity_usdt=initial_equity_usdt,
     )
-    independent_cluster_count = int(cluster_evidence.get("cluster_count", 0))
+    # Zero-return calendar days remain in the moving-block bootstrap so an
+    # inactive policy cannot hide its opportunity cost.  They are not,
+    # however, independent realized trading evidence for the minimum-sample
+    # gate.  Count only active portfolio days there.
+    independent_cluster_count = int(cluster_evidence.get("active_cluster_count", 0))
     bootstrap_lower = (
         _bootstrap_lower_expectancy(
             clustered_returns,
@@ -270,6 +279,7 @@ def evaluate_profitability_gate(
             "unit": "utc_calendar_day_portfolio_net_return",
             "dependence_control": "moving_block_bootstrap_over_daily_portfolio_clusters",
             "cluster_count": independent_cluster_count,
+            "calendar_cluster_count": int(cluster_evidence.get("cluster_count", 0)),
         },
         "two_x_cost_stress": {
             "passed": two_x_cost_net_return >= -cfg.maximum_2x_cost_loss,

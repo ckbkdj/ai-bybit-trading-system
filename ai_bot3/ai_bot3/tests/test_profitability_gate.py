@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from core.evaluation.profitability_gate import (
+    _concentration,
     evaluate_development_gate,
     evaluate_profitability_gate,
     write_profitability_report,
@@ -77,6 +78,45 @@ def test_profitability_gate_does_not_treat_correlated_trades_as_independent():
     assert "independent_return_clusters" in gate.blockers
     assert "bootstrap_lower_expectancy" in gate.blockers
     assert gate.checks["independent_return_clusters"]["actual"] == 1
+
+
+def test_sparse_calendar_gaps_do_not_count_as_independent_trading_evidence():
+    trades = _profitable_trades()[:30]
+    active_days = (
+        datetime(2026, 1, 1, 12, tzinfo=timezone.utc),
+        datetime(2026, 2, 1, 12, tzinfo=timezone.utc),
+        datetime(2026, 3, 1, 12, tzinfo=timezone.utc),
+    )
+    for index, trade in enumerate(trades):
+        trade["exit_at"] = active_days[index % len(active_days)]
+    gate = evaluate_profitability_gate(
+        trades,
+        [{"net_return": 0.01}] * 5,
+        initial_equity_usdt=100_000,
+        two_x_cost_net_return=0.01,
+        mark_to_market_max_drawdown=0.02,
+        mark_to_market_evidence_complete=True,
+    )
+
+    assert gate.profitability_gate == "FAILED"
+    assert gate.checks["independent_return_clusters"]["actual"] == 3
+    evidence = gate.checks["independent_return_clusters"]["evidence"]
+    assert evidence["cluster_count"] == 60
+    assert evidence["active_cluster_count"] == 3
+
+
+def test_return_concentration_uses_net_group_contribution():
+    trades = [
+        {"symbol": "A", "net_pnl": 100.0},
+        {"symbol": "A", "net_pnl": -100.0},
+        {"symbol": "B", "net_pnl": 60.0},
+        {"symbol": "C", "net_pnl": 40.0},
+    ]
+
+    share, group = _concentration(trades, "symbol")
+
+    assert group == "B"
+    assert share == pytest.approx(0.60)
 
 
 def test_profitability_gate_fails_closed_without_utc_trade_timestamps():
