@@ -13,7 +13,7 @@ from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Deque, Mapping, Sequence
+from typing import Any, Deque, Iterable, Mapping, Sequence
 
 from core.features.point_in_time_store import PointInTimeFeatureStore
 from core.features.registry import default_registry
@@ -549,7 +549,7 @@ class BybitPublicPITStore:
 
     def append_feature_batch(
         self,
-        observations: Sequence[Mapping[str, object]],
+        observations: Iterable[Mapping[str, object]],
         *,
         archive_record: Mapping[str, object] | None = None,
         api_batch_record: Mapping[str, object] | None = None,

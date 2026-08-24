@@ -6,13 +6,15 @@ import hashlib
 import json
 import math
 import os
+import pickle
+import tempfile
 import urllib.request
 import zipfile
 from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Deque, Iterable, Mapping, Sequence
+from typing import BinaryIO, Deque, Iterable, Iterator, Mapping, Sequence
 from urllib.parse import urlparse
 
 from core.providers.bybit_public_pit import BybitPublicPITStore
@@ -78,6 +80,47 @@ class ArchiveReplayEvidence:
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
+
+
+class _FeatureSpool:
+    """Bound replay memory while retaining one-file atomic database commits.
+
+    The stream contains only dictionaries created by this process. It is never
+    populated from or reopened as an externally supplied pickle.
+    """
+
+    def __init__(self) -> None:
+        self._stream: BinaryIO = tempfile.TemporaryFile(mode="w+b")
+        self.count = 0
+
+    def append(self, observation: Mapping[str, object]) -> None:
+        pickle.dump(dict(observation), self._stream, protocol=pickle.HIGHEST_PROTOCOL)
+        self.count += 1
+
+    def __iter__(self) -> Iterator[Mapping[str, object]]:
+        self._stream.flush()
+        self._stream.seek(0)
+        while True:
+            try:
+                item = pickle.load(self._stream)
+            except EOFError:
+                return
+            if not isinstance(item, dict):
+                raise RuntimeError("historical feature spool was corrupted")
+            yield item
+
+    def close(self) -> None:
+        if not self._stream.closed:
+            self._stream.close()
+
+    def __del__(self) -> None:
+        self.close()
+
+    def __enter__(self) -> _FeatureSpool:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
 
 def _sha256_file(path: Path) -> str:
@@ -356,7 +399,7 @@ def replay_orderbook_archive(
     book = _ReplayBook({}, {})
     ofi_window: Deque[tuple[datetime, float]] = deque()
     rows_read = 0
-    pending_features: list[dict[str, object]] = []
+    pending_features = _FeatureSpool()
     first_event: datetime | None = None
     last_event: datetime | None = None
     with zipfile.ZipFile(path) as archive:
@@ -553,10 +596,13 @@ def replay_orderbook_archive(
         "last_event_time": _iso(last_event),
         "rows_read": rows_read,
     }
-    feature_count = store.append_feature_batch(
-        pending_features,
-        archive_record=archive_record,
-    )
+    try:
+        feature_count = store.append_feature_batch(
+            pending_features,
+            archive_record=archive_record,
+        )
+    finally:
+        pending_features.close()
     evidence = ArchiveReplayEvidence(
         archive_id=archive_id,
         data_kind="orderbook",
@@ -618,7 +664,7 @@ def replay_trade_archive(
     buy_total = 0.0
     sell_total = 0.0
     rows_read = 0
-    pending_features: list[dict[str, object]] = []
+    pending_features = _FeatureSpool()
     first_event: datetime | None = None
     last_event: datetime | None = None
     last_emit: datetime | None = None
@@ -710,10 +756,13 @@ def replay_trade_archive(
         "last_event_time": _iso(last_event),
         "rows_read": rows_read,
     }
-    feature_count = store.append_feature_batch(
-        pending_features,
-        archive_record=archive_record,
-    )
+    try:
+        feature_count = store.append_feature_batch(
+            pending_features,
+            archive_record=archive_record,
+        )
+    finally:
+        pending_features.close()
     evidence = ArchiveReplayEvidence(
         archive_id=archive_id,
         data_kind="trades",
