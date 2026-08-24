@@ -56,6 +56,8 @@ def test_profitability_gate_passes_only_complete_stable_evidence():
         two_x_cost_net_return=0.01,
         mark_to_market_max_drawdown=0.02,
         mark_to_market_evidence_complete=True,
+        execution_evidence_complete=True,
+        factor_ablation_complete=True,
     )
     assert gate.profitability_gate == "PASSED"
     assert gate.stage == "candidate"
@@ -84,6 +86,21 @@ def test_profitability_thresholds_cannot_be_relaxed():
             ProfitabilityThresholds(**{field: value})
 
 
+def test_profitability_gate_defaults_missing_release_evidence_to_failed():
+    gate = evaluate_profitability_gate(
+        _profitable_trades(),
+        [{"net_return": value} for value in (0.01, 0.02, -0.001, 0.015, 0.005)],
+        initial_equity_usdt=100_000,
+        two_x_cost_net_return=0.01,
+        mark_to_market_max_drawdown=0.02,
+        mark_to_market_evidence_complete=True,
+    )
+
+    assert gate.profitability_gate == "FAILED"
+    assert "execution_evidence" in gate.blockers
+    assert "factor_ablation" in gate.blockers
+
+
 def test_profitability_gate_does_not_treat_correlated_trades_as_independent():
     trades = _profitable_trades()
     same_day = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
@@ -96,6 +113,8 @@ def test_profitability_gate_does_not_treat_correlated_trades_as_independent():
         two_x_cost_net_return=0.01,
         mark_to_market_max_drawdown=0.02,
         mark_to_market_evidence_complete=True,
+        execution_evidence_complete=True,
+        factor_ablation_complete=True,
     )
     assert gate.profitability_gate == "FAILED"
     assert "independent_return_clusters" in gate.blockers
@@ -195,6 +214,8 @@ def test_candidate_manifest_binds_every_final_evidence_report(tmp_path):
         two_x_cost_net_return=0.01,
         mark_to_market_max_drawdown=0.02,
         mark_to_market_evidence_complete=True,
+        execution_evidence_complete=True,
+        factor_ablation_complete=True,
     )
     profitability = tmp_path / "profitability_report.json"
     model = tmp_path / "model.json"
@@ -258,6 +279,8 @@ def test_development_gate_can_pass_without_creating_a_candidate_or_opening_lockb
         two_x_cost_net_return=0.01,
         mark_to_market_max_drawdown=0.02,
         mark_to_market_evidence_complete=True,
+        execution_evidence_complete=True,
+        factor_ablation_complete=True,
     )
     assert development.profitability_gate == "PASSED"
     assert development.stage == "development_validated"

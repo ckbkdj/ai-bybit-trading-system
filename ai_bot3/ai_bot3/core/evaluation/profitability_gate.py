@@ -209,8 +209,8 @@ def evaluate_profitability_gate(
     two_x_cost_net_return: float,
     mark_to_market_max_drawdown: float | None = None,
     mark_to_market_evidence_complete: bool = False,
-    execution_evidence_complete: bool = True,
-    factor_ablation_complete: bool = True,
+    execution_evidence_complete: bool = False,
+    factor_ablation_complete: bool = False,
     thresholds: ProfitabilityThresholds | None = None,
 ) -> ProfitabilityGateResult:
     cfg = thresholds or ProfitabilityThresholds()
