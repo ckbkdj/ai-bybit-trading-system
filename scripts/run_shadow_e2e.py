@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import socket
@@ -21,7 +22,10 @@ sys.path.insert(0, str(AI_ROOT))
 
 from contracts.strategy_release_v1 import StrategyReleaseBundle
 from core.evaluation.profitability_gate import ProfitabilityGateResult, write_profitability_report
-from core.release.profitability_release import create_candidate_manifest
+from core.release.profitability_release import (
+    REQUIRED_EVIDENCE_REPORTS,
+    create_candidate_manifest,
+)
 from core.release.strategy_bundle import canonical_bundle_hash
 from core.result_manager import ResultManager
 
@@ -118,6 +122,103 @@ def prediction(
     }
 
 
+def shadow_authenticity_evidence(
+    name: str, *, model_sha256: str
+) -> dict[str, object]:
+    """Build semantically complete, explicitly non-research E2E fixtures.
+
+    These short-lived files exercise release verification and the real shadow
+    transport boundary.  They are never written to the repository, trial
+    ledger, model registry, or a live environment and are not profitability
+    evidence.
+    """
+
+    common = {
+        "fixture_scope": "shadow_authenticity_only",
+        "not_profitability_evidence": True,
+    }
+    if name == "data_coverage_report.json":
+        return {
+            **common,
+            "status": "PASSED",
+            "complete": True,
+            "expected_series_count": 25,
+            "passed_series_count": 25,
+        }
+    if name == "missing_intervals_report.json":
+        return {
+            **common,
+            "status": "PASSED",
+            "complete": True,
+            "total_discontinuity_count": 0,
+        }
+    if name == "independent_timestamp_count_report.json":
+        return {
+            **common,
+            "status": "PASSED",
+            "raw_source_complete": True,
+            "outer_oos_complete": True,
+        }
+    if name == "calibration_coverage_report.json":
+        return {
+            **common,
+            "status": "PASSED",
+            "complete": True,
+            "development": {"portfolio": {"passed": True}},
+            "lockbox": {
+                "portfolio": {"passed": True},
+                "used_for_calibration_or_tuning": False,
+                "alternative_models_scored": False,
+            },
+        }
+    if name == "nested_cv_report.json":
+        return {
+            **common,
+            "status": "PASSED",
+            "complete": True,
+            "outer_oos_used_for_tuning": False,
+        }
+    if name == "signal_funnel_report.json":
+        scope = {
+            "status": "PASSED",
+            "zero_signal_or_trade_result_accepted": False,
+        }
+        return {
+            **common,
+            "status": "PASSED",
+            "complete": True,
+            "development": scope,
+            "lockbox": scope,
+        }
+    if name == "intratrade_drawdown_report.json":
+        scope = {
+            "status": "PASSED",
+            "mark_to_market_used": True,
+            "equity_observation_count": 10,
+        }
+        return {
+            **common,
+            "status": "PASSED",
+            "complete": True,
+            "development": scope,
+            "lockbox": scope,
+        }
+    if name == "production_replay_report.json":
+        return {
+            **common,
+            "status": "PASSED",
+            "complete": True,
+            "lockbox_used": False,
+            "alternative_models_scored": False,
+            "expected_sample_count": 25,
+            "observed_sample_count": 25,
+            "failed_sample_count": 0,
+            "final_bundle_models_match_replayed": True,
+            "final_model_bundle_sha256": model_sha256,
+        }
+    return {**common, "report": name}
+
+
 def publish_release_gated_ticket(temp: Path, control_db: Path, now: datetime) -> dict:
     # This is an authenticity fixture, not profitability evidence.  It exercises
     # the complete candidate-gated production path without opening live trading.
@@ -137,6 +238,19 @@ def publish_release_gated_ticket(temp: Path, control_db: Path, now: datetime) ->
         '{"fixture":true,"release_stage":"candidate"}', encoding="utf-8"
     )
     write_profitability_report(report_path, gate)
+    model_sha256 = hashlib.sha256(model_artifact_path.read_bytes()).hexdigest()
+    evidence_report_paths: dict[str, Path] = {}
+    for name in REQUIRED_EVIDENCE_REPORTS:
+        evidence_path = temp / name
+        evidence_path.write_text(
+            json.dumps(
+                shadow_authenticity_evidence(name, model_sha256=model_sha256),
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        evidence_report_paths[name] = evidence_path
     manifest = create_candidate_manifest(
         manifest_path,
         gate=gate,
@@ -144,6 +258,7 @@ def publish_release_gated_ticket(temp: Path, control_db: Path, now: datetime) ->
         model_artifact_path=model_artifact_path,
         lockbox_fingerprint="c" * 64,
         code_commit="shadow-e2e-commit",
+        evidence_report_paths=evidence_report_paths,
     ).to_dict()
     alpha_prediction = {
         "model_family": "profitability_two_stage",
