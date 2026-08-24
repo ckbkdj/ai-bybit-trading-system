@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from array import array
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Mapping, Sequence
@@ -62,8 +63,10 @@ def causal_regime_labels(
 @dataclass(frozen=True)
 class WalkForwardFold:
     fold_id: str
-    train_indices: tuple[int, ...]
-    test_indices: tuple[int, ...]
+    # Unsigned packed arrays retain the existing Sequence[int] contract while
+    # avoiding millions of boxed Python integers on real pooled panels.
+    train_indices: Sequence[int]
+    test_indices: Sequence[int]
     train_start: str
     train_end: str
     test_start: str
@@ -306,8 +309,14 @@ class PooledPanelBuilder:
                 (development["decision_at"] >= test_start)
                 & (development["decision_at"] <= test_end)
             )
-            train_indices = tuple(int(value) for value in development.index[train_mask])
-            test_indices = tuple(int(value) for value in development.index[test_mask])
+            if len(development) >= 2**32:
+                raise ValueError("walk-forward panel exceeds packed index capacity")
+            train_indices = array(
+                "I", (int(value) for value in development.index[train_mask])
+            )
+            test_indices = array(
+                "I", (int(value) for value in development.index[test_mask])
+            )
             if len(train_indices) >= self.minimum_train_rows and len(test_indices) >= self.minimum_test_rows:
                 folds.append(
                     WalkForwardFold(

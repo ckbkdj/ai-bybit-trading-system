@@ -287,20 +287,38 @@ def _market_bars(frame: pd.DataFrame) -> list[MarketBar]:
     return bars
 
 
-def _panel_rows(
+def _panel_frame(
     frame: pd.DataFrame,
     horizon_sec: int,
     bars: Sequence[MarketBar],
     *,
     decision_at_or_after: datetime | None = None,
     decision_before: datetime | None = None,
-) -> list[dict[str, object]]:
-    features = _engineer_features(frame)
-    features["regime"] = causal_regime_labels(
-        features.rename(columns={"close_at": "decision_at"})
-    ).to_numpy()
-    output: list[dict[str, object]] = []
+) -> pd.DataFrame:
     feature_names = TECHNICAL_FEATURE_COLUMNS + LEGACY_BRAIN_FEATURE_COLUMNS
+    required_engineered = set(feature_names) | {"volatility", "liquidity"}
+    # The rebuild already engineers each symbol before creating execution bars.
+    # Reuse that immutable frame instead of duplicating every numeric column and
+    # recalculating all rolling indicators at peak memory.  Direct callers that
+    # supply raw OHLCV retain the same public behaviour.
+    features = (
+        frame
+        if required_engineered.issubset(frame.columns)
+        else _engineer_features(frame)
+    )
+    regimes = causal_regime_labels(
+        features.rename(columns={"close_at": "decision_at"})
+    )
+    output: dict[str, list[object]] = {}
+
+    def append_payload(payload: Mapping[str, object]) -> None:
+        if not output:
+            output.update({name: [] for name in payload})
+        if len(output) != len(payload):
+            raise RuntimeError("panel payload schema changed within one horizon")
+        for name, values in output.items():
+            values.append(payload[name])
+
     next_allowed_decision_at: datetime | None = None
     for index in range(48, len(features) - 1):
         row = features.iloc[index]
@@ -361,7 +379,7 @@ def _panel_rows(
             direction_label = "up" if long_net >= short_net else "down"
         hour = signal_at.hour
         session = "asia" if hour < 8 else "europe" if hour < 16 else "americas"
-        regime = str(row["regime"])
+        regime = str(regimes.iloc[index])
         for side, label in labels.items():
             if label.label_available_at <= signal_at:
                 raise ValueError("label PIT invariant failed")
@@ -394,8 +412,27 @@ def _panel_rows(
                 "take_profit_bps": take_profit_bps,
             }
             payload.update({name: float(row[name]) for name in feature_names})
-            output.append(payload)
-    return output
+            append_payload(payload)
+    return pd.DataFrame(output)
+
+
+def _panel_rows(
+    frame: pd.DataFrame,
+    horizon_sec: int,
+    bars: Sequence[MarketBar],
+    *,
+    decision_at_or_after: datetime | None = None,
+    decision_before: datetime | None = None,
+) -> list[dict[str, object]]:
+    """Compatibility wrapper for diagnostics and small focused tests."""
+
+    return _panel_frame(
+        frame,
+        horizon_sec,
+        bars,
+        decision_at_or_after=decision_at_or_after,
+        decision_before=decision_before,
+    ).to_dict(orient="records")
 
 
 FEATURE_COLUMNS: tuple[str, ...] = (
@@ -655,8 +692,8 @@ def _evaluate_legacy_technical_ablation(
     fold_evidence: list[dict[str, object]] = []
     for horizon, dataset in datasets.items():
         for fold in dataset.folds:
-            train = dataset.development.iloc[list(fold.train_indices)]
-            test = dataset.development.iloc[list(fold.test_indices)]
+            train = dataset.development.iloc[fold.train_indices]
+            test = dataset.development.iloc[fold.test_indices]
             eligible_train = train.loc[
                 train[list(columns)].notna().all(axis=1)
             ].reset_index(drop=True)
@@ -843,8 +880,8 @@ def _evaluate_long_factor_ablation(
             if horizon < 7200:
                 continue
             for fold in dataset.folds:
-                train = dataset.development.iloc[list(fold.train_indices)]
-                test = dataset.development.iloc[list(fold.test_indices)]
+                train = dataset.development.iloc[fold.train_indices]
+                test = dataset.development.iloc[fold.test_indices]
                 train_mask = train[list(columns)].notna().all(axis=1)
                 test_mask = test[list(columns)].notna().all(axis=1)
                 eligible_train = train.loc[train_mask].reset_index(drop=True)
@@ -1053,8 +1090,8 @@ def _evaluate_bybit_pit_ablation(
             if horizon not in {180, 900}:
                 continue
             for fold in dataset.folds:
-                train = dataset.development.iloc[list(fold.train_indices)]
-                test = dataset.development.iloc[list(fold.test_indices)]
+                train = dataset.development.iloc[fold.train_indices]
+                test = dataset.development.iloc[fold.test_indices]
                 train_mask = train[list(columns)].notna().all(axis=1)
                 test_mask = test[list(columns)].notna().all(axis=1)
                 eligible_train = train.loc[train_mask].reset_index(drop=True)
@@ -1347,13 +1384,11 @@ class ProfitabilityRebuild:
                     del symbol_history
                 market[f"{symbol}:{horizon}"] = development_bars
                 panel_parts.append(
-                    pd.DataFrame(
-                        _panel_rows(
-                            development_enriched,
-                            horizon,
-                            development_bars,
-                            decision_before=development_decision_end,
-                        )
+                    _panel_frame(
+                        development_enriched,
+                        horizon,
+                        development_bars,
+                        decision_before=development_decision_end,
                     )
                 )
                 del frame
@@ -1633,8 +1668,8 @@ class ProfitabilityRebuild:
         for horizon, dataset in datasets.items():
             model_feature_columns = model_feature_columns_by_horizon[horizon]
             for fold in dataset.folds:
-                train = dataset.development.iloc[list(fold.train_indices)]
-                test = dataset.development.iloc[list(fold.test_indices)]
+                train = dataset.development.iloc[fold.train_indices]
+                test = dataset.development.iloc[fold.test_indices]
                 selection = selector.select_and_fit(train, model_feature_columns)
                 predictions = selection.model.predict(test)
                 signals = _signals_from_predictions(test, predictions, horizon)
@@ -1933,14 +1968,12 @@ class ProfitabilityRebuild:
                         source_evidence=lockbox_bybit_evidence,
                     )
                 lockbox_parts.append(
-                    pd.DataFrame(
-                        _panel_rows(
-                            enriched,
-                            horizon,
-                            bars,
-                            decision_at_or_after=lockbox_start_by_horizon[horizon],
-                            decision_before=last_complete_by_symbol[symbol],
-                        )
+                    _panel_frame(
+                        enriched,
+                        horizon,
+                        bars,
+                        decision_at_or_after=lockbox_start_by_horizon[horizon],
+                        decision_before=last_complete_by_symbol[symbol],
                     )
                 )
             lockbox_panel = pd.concat(lockbox_parts, ignore_index=True)

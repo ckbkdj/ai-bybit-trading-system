@@ -24,7 +24,7 @@ def _utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class MarketBar:
     """A bar whose full OHLC path is usable only at ``available_at``.
 
