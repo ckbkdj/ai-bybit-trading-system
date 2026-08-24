@@ -1,9 +1,20 @@
 {
+  "evaluation_scope": "development_oos",
+  "execution_evidence": {
+    "blocker": "requires immutable OOS shadow/testnet fill receipts and queue/latency calibration",
+    "direct_execution_cost_trade_count": 0,
+    "historical_archive_claim": "official PIT spread/depth/funding inputs; not realized own-order fills",
+    "official_pit_cost_inputs_complete": false,
+    "proxy_execution_cost_trade_count": 0,
+    "queue_position_and_latency_calibration_complete": false,
+    "shadow_or_testnet_fill_receipt_count": 0,
+    "shadow_or_testnet_fill_receipts_complete": false
+  },
   "execution_evidence_complete": false,
   "limitations": [
-    "historical spread/depth/fill inputs are conservative OHLCV-derived proxies",
-    "PIT Bybit orderbook and public-trade histories are not present in the current store",
-    "therefore execution evidence cannot authorize a candidate"
+    "official historical public data is not realized own-order fill evidence",
+    "immutable OOS shadow/testnet receipts and queue/latency calibration are incomplete",
+    "execution evidence cannot authorize opening a new lockbox"
   ],
   "normal_cost": {
     "cancel_fill_race_count": 0,
@@ -33,12 +44,18 @@
       "risk_per_trade": 0.0025,
       "weekly_loss_limit": 0.015
     },
+    "direct_execution_cost_trade_count": 0,
+    "equity_curve": [],
+    "execution_cost_evidence_complete": false,
     "final_equity_usdt": 100000.0,
     "initial_equity_usdt": 100000.0,
     "intrabar_path_used": true,
+    "mark_to_market_used": true,
     "max_drawdown": 0.0,
+    "maximum_gross_exposure_usdt": 0.0,
     "net_return": 0.0,
     "profit_factor": null,
+    "proxy_execution_cost_trade_count": 0,
     "rejected_signals": {},
     "total_fee_cost": 0,
     "total_funding_cost": 0,
@@ -73,12 +90,18 @@
       "risk_per_trade": 0.0025,
       "weekly_loss_limit": 0.015
     },
+    "direct_execution_cost_trade_count": 0,
+    "equity_curve": [],
+    "execution_cost_evidence_complete": false,
     "final_equity_usdt": 100000.0,
     "initial_equity_usdt": 100000.0,
     "intrabar_path_used": true,
+    "mark_to_market_used": true,
     "max_drawdown": 0.0,
+    "maximum_gross_exposure_usdt": 0.0,
     "net_return": 0.0,
     "profit_factor": null,
+    "proxy_execution_cost_trade_count": 0,
     "rejected_signals": {},
     "total_fee_cost": 0,
     "total_funding_cost": 0,

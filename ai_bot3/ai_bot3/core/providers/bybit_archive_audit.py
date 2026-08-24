@@ -9,7 +9,7 @@ from core.providers.bybit_historical_archive import (
     orderbook_archive_url,
     trade_archive_url,
 )
-from core.providers.bybit_public_pit import BybitPublicPITStore
+from core.providers.bybit_public_pit_store import BybitPublicPITStore
 
 
 ARCHIVE_MARKET = "linear"

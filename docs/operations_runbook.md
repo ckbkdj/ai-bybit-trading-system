@@ -1,12 +1,24 @@
 # 部署与运行手册
 
-更新时间：2026-08-22
+更新时间：2026-08-25
 
 ## 1. 安装与配置
 
-建议预测端和交易端使用独立 Python 虚拟环境。预测端安装 `ai_bot3/ai_bot3/requirements.txt`，交易端安装 `BybitContractBotV4/requirements.txt`。
+普通 clone 必须从与 CI 相同的锁文件安装。Windows Python 3.12 使用：
 
-复制 `BybitContractBotV4/.env.example` 为 `.env.local`。该文件已被 Git 忽略。至少配置：
+```powershell
+python -m pip install --require-hashes -r requirements\windows-py312.lock
+```
+
+Ubuntu Python 3.11 使用：
+
+```bash
+python -m pip install -r requirements/ubuntu-py311.lock
+```
+
+`requirements.txt` 仍用于声明直接依赖，不能替代部署锁。共享合同位于仓库根目录 `shadow_contracts/`，因此部署预测端或执行端时必须保留完整仓库布局。
+
+三类模板分别是根目录共享配置、预测配置和执行配置；按需复制到服务的 `.env.local`。该文件已被 Git 忽略。至少配置：
 
 - `BYBIT_TRADING_MODE=shadow`
 - `BYBIT_POSITION_MODE=hedge` 或与账户一致的 `one_way`

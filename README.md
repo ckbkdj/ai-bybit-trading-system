@@ -1,41 +1,72 @@
-# Versioned AI-to-Bybit Trading System
+# Versioned AI-to-Bybit Shadow Platform
 
-本目录现在包含一套默认 `shadow`、失败关闭、可回放的预测—执行系统。现用边界不再是旧预测 JSON 或共享数据库，而是版本化的 Forecast、PortfolioIntent、OperationTicket、ExecutionReceipt、ExecutionAwareLabel 和 StrategyReleaseBundle 契约。
+This repository is a complete, maintainable engineering baseline for a
+fail-closed prediction to Bybit execution system. It is not evidence of
+profitability and it is not permission to trade live.
 
-当前结论：**Profitability Gate 未通过；仅保留 shadow/研究能力，0 candidate、0 live。** 工程测试通过不代表盈利，也不代表真钱许可。
+The frozen integration baseline is `shadow-platform-v3-integration` at
+`f4a424fc06643e7af40478be5fc2c4d935a8491b`. Behavior-preserving cleanup is
+isolated on `refactor/shadow-platform-v3-clean`; the source branch is retained.
 
-## 入口
+Current safety state:
 
-- 预测控制面：`ai_bot3/ai_bot3/api/control_plane_main.py`
-- 交易执行服务：`BybitContractBotV4/bot_threshold_super_v4_1.py`
-- 跨项目影子验收：`scripts/run_shadow_e2e.py`
-- 盈利优先 Alpha 架构、因子来源与使用：`docs/profitability_first_alpha_rebuild.md`
-- 可读版系统架构：`docs/architecture_v3_release_candidate.md`
-- 部署就绪度：`docs/deployment_readiness_20260823.md`
-- 完整 Bug 与证据审计：`docs/bug_and_evidence_audit.md`
-- 旧版经验和真实数据来源：`docs/legacy_reuse_and_data_sources.md`
-- 使用与迁移手册：`docs/user_guide_v3.md`
-- 30 天 soak/SLO：`docs/soak_slo.md`
-- 供应链门禁：`docs/supply_chain_gate.md`
-- 部署与故障处理：`docs/operations_runbook.md`
-- 验收矩阵：`docs/acceptance_report.md`
-- 主网上线门禁：`docs/mainnet_go_live_checklist.md`
+```text
+profitability_gate=FAILED
+candidate_count=0
+live_count=0
+mainnet=DISABLED
+```
 
-## 安全状态
+## Start here
 
-默认模式为 `shadow`。所有旧 Brain 模型均为 baseline-only/rejected，不能独立出票。只有未参与调参的 lockbox 在全部成本后通过盈利、回撤、bootstrap、2x 成本、fold 稳定性、集中度、因子消融和执行证据门禁，才会生成 candidate manifest；当前没有生成。`live` 双开关未修改也未启用，旧数据库、模型、策略和历史 bot 均未删除。
+- Baseline and refactor boundary: `docs/engineering_baseline.md`
+- Architecture: `docs/architecture_v3_release_candidate.md`
+- Profitability research path: `docs/profitability_first_alpha_rebuild.md`
+- Runtime data contract: `runtime-data-manifest.json`
+- Operations: `docs/operations_runbook.md`
+- User guide: `docs/user_guide_v3.md`
+- Mainnet default-NO-GO checklist: `docs/mainnet_go_live_checklist.md`
+- Historical material: `docs/history/`
 
-## 快速验证
+## Ordinary clone setup
+
+Use the lock matching CI. On Windows with Python 3.12:
 
 ```powershell
-# 预测侧全量测试
+python -m pip install --require-hashes -r requirements\windows-py312.lock
+```
+
+On Ubuntu with Python 3.11:
+
+```bash
+python -m pip install -r requirements/ubuntu-py311.lock
+```
+
+Copy only the relevant values from the three configuration templates:
+
+- `.env.example` for shared process values;
+- `ai_bot3/ai_bot3/.env.example` for prediction/research;
+- `BybitContractBotV4/.env.example` for execution.
+
+Never commit real credentials or runtime databases.
+
+## Verify
+
+```powershell
 python -m pytest ai_bot3\ai_bot3\tests -q
-
-# 交易侧全量测试
 python -m pytest BybitContractBotV4\tests -q
-
-# 真实本机 HTTP、影子下单、回执闭环
 python scripts\run_shadow_e2e.py
 ```
 
-上线前请完整执行 `docs/mainnet_go_live_checklist.md`，不要把通过离线测试等同于已经获准实盘。
+The profitability CLI now works in a normal Git clone:
+
+```powershell
+python ai_bot3\ai_bot3\scripts\run_profitability_rebuild.py --help
+```
+
+Running the evaluation itself requires the external, untracked data declared in
+`runtime-data-manifest.json`. Missing evidence fails closed; it must never be
+filled with synthetic defaults.
+
+PR #4 should not be merged unchanged. It is the engineering integration
+baseline, not the reviewed structural-cleanup result.

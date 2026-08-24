@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
-from core.providers.bybit_public_pit import (
+from core.providers.bybit_public_pit_store import (
     BYBIT_PUBLIC_LINEAR_WS,
     BybitPublicPITStore,
     CaptureConflict,

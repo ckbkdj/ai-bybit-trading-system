@@ -1,6 +1,6 @@
 # 分阶段实施清单
 
-更新时间：2026-08-22
+更新时间：2026-08-25
 
 ## 已完成阶段
 
@@ -17,6 +17,7 @@
 11. 模型治理：purged holdout、训练段 scaler、研究 trial ledger、Deflated Sharpe、显式模型 stage 与人工证据晋升。
 12. AI 到出票：Brain 正式方向、在线校准状态、range guard、来源可靠性、因子组得分和默认 live-only 门禁。
 13. 组合证据与风控：历史非重叠成本复放、证据缺口报告、持久净值高水位和最大回撤熔断。
+14. 工程整形：普通 clone CLI、报告归档、三层环境模板、runtime data manifest、平台锁 CI、Windows Python 3.12、盈利/PIT 拆分和跨服务共享合同。
 
 ## 有意保留且未自动执行
 
@@ -27,4 +28,4 @@
 
 ## 活跃文件边界
 
-交易入口 `bot_threshold_super_v4_1.py` 仅启动 `service_main`。历史 v2/v3/v4/v6 保持只读。预测端原有模型与结果流程继续存在，`ResultManager` 在兼容适配后把标准预测与票据发布到新控制面；模型不直接接触交易所。
+交易入口 `bot_threshold_super_v4_1.py` 仅启动 `service_main`。历史 v2/v3/v4/v6 保持只读。预测端原有模型与结果流程继续存在，`ResultManager` 在兼容适配后把标准预测与票据发布到新控制面；模型不直接接触交易所。`shadow_contracts/` 是跨服务票据/回执唯一实现；盈利重建和 Bybit PIT 的旧模块名只作为兼容入口。

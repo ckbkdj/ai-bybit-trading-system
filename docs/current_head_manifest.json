@@ -1,0 +1,77 @@
+{
+  "schema_version": "shadow-platform-head-manifest.v1",
+  "snapshot_date": "2026-08-25",
+  "baseline": {
+    "name": "shadow-platform-v3-integration",
+    "commit": "f4a424fc06643e7af40478be5fc2c4d935a8491b",
+    "frozen": true,
+    "preserved_source_branch": "codex/complete-profitability-alpha-v2"
+  },
+  "refactor": {
+    "branch": "refactor/shadow-platform-v3-clean",
+    "base_commit": "f4a424fc06643e7af40478be5fc2c4d935a8491b",
+    "scope": "behavior-preserving structural cleanup"
+  },
+  "runtime_status": {
+    "profitability_gate": "FAILED",
+    "candidate_count": 0,
+    "live_count": 0,
+    "mainnet": "DISABLED"
+  },
+  "assessment": {
+    "engineering_baseline_complete": true,
+    "structural_cleanup_complete_at_baseline": false,
+    "pull_request_4_merge_as_is": false
+  },
+  "machine_report_archive": {
+    "path": "docs/history/machine-reports/f4a424fc06643e7af40478be5fc2c4d935a8491b",
+    "source": "machine-local state captured when the baseline was frozen",
+    "files": [
+      {
+        "name": "brain_retrain_report.json",
+        "size_bytes": 55429,
+        "sha256": "762087eeac390129e9170a8cc4474d632217efeff63da483fb1af28700707be5"
+      },
+      {
+        "name": "capital_preservation_report.json",
+        "size_bytes": 486,
+        "sha256": "26062b2bfc11d58b94ec91d16c5d60acb62060daa6bc4fa80d82268bc2bedde1"
+      },
+      {
+        "name": "CODEX_STOP_REPORT_20260825.md",
+        "size_bytes": 5912,
+        "sha256": "8de8cd3ad282134427040858735b03face3f6d385fb7a7b83b9a36d350228f42"
+      },
+      {
+        "name": "execution_cost_report.json",
+        "size_bytes": 3840,
+        "sha256": "409271ce928fab4fb837bc2f521c2c87b05c9ef389c589c0eaacd7769fba6bb0"
+      },
+      {
+        "name": "factor_ablation_report.json",
+        "size_bytes": 172064,
+        "sha256": "498f3096801088f368fc8ffe6223b56f1055256b49723af39be3b1f5592e1d32"
+      },
+      {
+        "name": "lockbox_report.json",
+        "size_bytes": 428389,
+        "sha256": "e5528c27b4cfd8eefc73699be3ca25cf8aadd56682546dfdec6f0a0639f43c06"
+      },
+      {
+        "name": "profitability_report.json",
+        "size_bytes": 3099,
+        "sha256": "bf94fb2fd33b6d9a7a22248ad433c7c1644ce2ddb0141af96879d1fd10dc86ba"
+      },
+      {
+        "name": "strategy_audit.json",
+        "size_bytes": 3590,
+        "sha256": "2def7773c19b02ec78303f9f19033f80134d5c8bb565362935708bffc5067b88"
+      },
+      {
+        "name": "walk_forward_report.json",
+        "size_bytes": 135209,
+        "sha256": "536f5d50441303fa756f71efde0570aba7dc7c230d7474ed6617639e0972eff9"
+      }
+    ]
+  }
+}

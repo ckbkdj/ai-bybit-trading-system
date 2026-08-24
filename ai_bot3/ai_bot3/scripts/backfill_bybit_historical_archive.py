@@ -21,7 +21,7 @@ from core.providers.bybit_historical_archive import (
     trade_archive_url,
 )
 from core.providers.bybit_archive_audit import audit_historical_archive_window
-from core.providers.bybit_public_pit import BybitPublicPITStore
+from core.providers.bybit_public_pit_store import BybitPublicPITStore
 DEFAULT_SYMBOLS = (
     "BTCUSDT",
     "ETHUSDT",

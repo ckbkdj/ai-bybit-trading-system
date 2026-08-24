@@ -20,6 +20,11 @@ from contracts.operation_ticket_v1 import OperationTicket
 from contracts.schema_validation import SchemaValidationError, validate_schema_file
 
 
+def test_cross_service_contracts_use_the_shared_package():
+    assert OperationTicket.__module__ == "shadow_contracts.operation_ticket_v1"
+    assert ExecutionReceipt.__module__ == "shadow_contracts.execution_receipt_v1"
+
+
 NOW = datetime(2026, 8, 21, 8, 0, tzinfo=timezone.utc)
 
 

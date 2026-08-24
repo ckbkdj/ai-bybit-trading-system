@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import BinaryIO, Deque, Iterable, Iterator, Mapping, Sequence
 from urllib.parse import urlparse
 
-from core.providers.bybit_public_pit import BybitPublicPITStore
+from core.providers.bybit_public_pit_store import BybitPublicPITStore
 
 
 ORDERBOOK_HOST = "quote-saver.bycsi.com"

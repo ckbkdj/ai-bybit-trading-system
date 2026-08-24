@@ -9,7 +9,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Callable, Mapping, Sequence
 from urllib.parse import parse_qs, urlencode, urlparse
 
-from core.providers.bybit_public_pit import BybitPublicPITStore
+from core.providers.bybit_public_pit_store import BybitPublicPITStore
 
 
 API_HOST = "api.bybit.com"

@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from core.providers.bybit_capture_audit import audit_live_capture
-from core.providers.bybit_public_pit import BybitPublicPITStore
+from core.providers.bybit_public_pit_store import BybitPublicPITStore
 
 
 def _parser() -> argparse.ArgumentParser:

@@ -21,7 +21,7 @@ from core.providers.bybit_historical_derivatives import (  # noqa: E402
     record_historical_api_failure,
     replay_derivative_day,
 )
-from core.providers.bybit_public_pit import BybitPublicPITStore  # noqa: E402
+from core.providers.bybit_public_pit_store import BybitPublicPITStore  # noqa: E402
 
 
 DEFAULT_SYMBOLS = (

@@ -1,0 +1,2 @@
+# CI audit tool entry point. Its target version is intentionally fixed.
+pip-audit==2.10.1

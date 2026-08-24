@@ -1,6 +1,6 @@
 # Shadow 候选使用、验证与回滚手册 v3
 
-更新时间：2026-08-23
+更新时间：2026-08-25
 
 当前版本只按 **可部署的 shadow 工程候选，持续运行能力仍需长时间 soak 验证** 使用。不要配置真钱权限，也不要把测试通过当作盈利证明。
 
@@ -13,8 +13,9 @@ D:\Money
 │  ├─ core\decision                  SignalBook、PortfolioIntent、TicketBuilder
 │  ├─ core\release                   StrategyReleaseBundle 校验
 │  ├─ core\evaluation                时间切分、执行标签
-│  ├─ contracts                      六类版本化合同和 JSON Schema
+│  ├─ contracts                      预测侧合同兼容入口和 JSON Schema
 │  └─ api\control_plane_main.py      预测控制面
+├─ shadow_contracts                  预测/执行共享的票据与回执唯一实现
 ├─ BybitContractBotV4
 │  ├─ service_main.py                独立执行服务入口
 │  ├─ ticket_store.py                execution DB、epoch、命令/订单账本
@@ -25,11 +26,11 @@ D:\Money
 └─ docs                              架构、证据、门禁、手册
 ```
 
-参考服务严格只读：`D:\lh\trad_data_service_20260821\data_service`。
+外部参考服务通过 `TRAD_DATA_SERVICE_ROOT` 指向，并且严格只读；其本机路径不属于仓库合同。
 
 ## 1. 安全配置
 
-从两个 `.env.example` 复制为各自 `.env.local`，只在安全机器注入 key。Git 已忽略 `.env.local`。
+从三类 `.env.example`（共享、预测、执行）选择需要的值复制到各自 `.env.local`，只在安全机器注入 key。Git 已忽略 `.env.local`。大数据和运行状态的路径/恢复要求见根目录 `runtime-data-manifest.json`。
 
 shadow 最小设置：
 
@@ -47,31 +48,28 @@ APP_CODE_COMMIT=<本次 Git commit>
 
 ## 2. 回归与证据复核
 
-预测端：
+先按平台锁文件安装依赖。预测端：
 
 ```powershell
 Set-Location D:\Money
-$env:PYTHONPATH='D:\Money\.test-deps;D:\Money;D:\Money\ai_bot3\ai_bot3'
-& 'D:\lh\trad_data_service_20260821\data_service\.venv\Scripts\python.exe' -m pytest -q ai_bot3\ai_bot3\tests
+python -m pytest -q ai_bot3\ai_bot3\tests
 ```
 
 交易端：
 
 ```powershell
-Set-Location D:\Money\BybitContractBotV4
-$env:PYTHONPATH='D:\Money\.test-deps;D:\Money;D:\Money\BybitContractBotV4'
-& 'D:\lh\trad_data_service_20260821\data_service\.venv\Scripts\python.exe' -m pytest -q
+Set-Location D:\Money
+python -m pytest -q BybitContractBotV4\tests
 ```
 
 跨进程影子闭环：
 
 ```powershell
 Set-Location D:\Money
-$env:PYTHONPATH='D:\Money\.test-deps;D:\Money;D:\Money\ai_bot3\ai_bot3;D:\Money\BybitContractBotV4'
-& 'D:\lh\trad_data_service_20260821\data_service\.venv\Scripts\python.exe' scripts\run_shadow_e2e.py
+python scripts\run_shadow_e2e.py
 ```
 
-当前证据应分别为 121 passed、59 passed，以及 `state=SUBMITTED`、`shadow_order_count=1`、`control_plane_receipt_count=1`。
+不要在文档里固化易过时的测试数量；以当前 CI 的两个测试矩阵和 `state=SUBMITTED`、`shadow_order_count=1`、`control_plane_receipt_count=1` 为准。
 
 ## 3. 候选特征库验收
 
@@ -79,8 +77,7 @@ $env:PYTHONPATH='D:\Money\.test-deps;D:\Money;D:\Money\ai_bot3\ai_bot3;D:\Money\
 
 ```powershell
 Set-Location D:\Money
-$env:PYTHONPATH='D:\Money\.test-deps;D:\Money;D:\Money\ai_bot3\ai_bot3'
-& 'D:\lh\trad_data_service_20260821\data_service\.venv\Scripts\python.exe' scripts\audit_feature_store_semantics.py --db ai_bot3\ai_bot3\data\kline_feature_store.rebuilt.20260822.sqlite3 --output docs\evidence\feature_store_semantic_audit_20260823.json
+python scripts\audit_feature_store_semantics.py --db ai_bot3\ai_bot3\data\kline_feature_store.rebuilt.20260822.sqlite3 --output docs\evidence\feature_store_semantic_audit_20260823.json
 ```
 
 只有 `deployment_status=PASS` 才能讨论切换；仍须先同时备份 SQLite 主文件和 `-wal/-shm`，停止写进程，修改环境路径后只以 shadow 对比。不要覆盖或删除旧库。
@@ -135,7 +132,7 @@ Set-Location D:\Money
 python scripts\supply_chain_audit.py --output docs\evidence\supply_chain_audit_20260823.json
 ```
 
-当前预期是 BLOCKED，因为依赖 lock 和漏洞 attestation 未完成。先在隔离构建环境解决，再生成 release bundle。
+依赖已由平台锁文件固定；漏洞 attestation 仍必须由当前 CI 重新生成并通过，不能复用旧机器报告。
 
 ## 8. 回滚
 

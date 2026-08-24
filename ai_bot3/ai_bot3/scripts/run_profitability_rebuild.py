@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -18,7 +19,14 @@ from core.evaluation.profitability_rebuild import (
 )
 
 
-def _local_head_commit() -> str:
+def _validate_commit(value: str, *, source: str) -> str:
+    value = value.strip().lower()
+    if len(value) != 40 or any(character not in "0123456789abcdef" for character in value):
+        raise RuntimeError(f"{source} did not resolve to a SHA-1 commit")
+    return value
+
+
+def _private_history_head_commit() -> str:
     git_dir = WORKSPACE / ".version-history"
     head_file = git_dir / "HEAD"
     if not head_file.exists():
@@ -29,9 +37,28 @@ def _local_head_commit() -> str:
         if not reference.exists():
             raise RuntimeError(f"local version-history reference is missing: {reference}")
         value = reference.read_text(encoding="utf-8").strip()
-    if len(value) != 40 or any(character not in "0123456789abcdef" for character in value.lower()):
-        raise RuntimeError("local version-history HEAD is not a SHA-1 commit")
-    return value.lower()
+    return _validate_commit(value, source="local version-history HEAD")
+
+
+def _local_head_commit() -> str:
+    """Resolve HEAD in a regular clone, with local history compatibility."""
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD"],
+            cwd=WORKSPACE,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as git_error:
+        try:
+            return _private_history_head_commit()
+        except RuntimeError as history_error:
+            raise RuntimeError(
+                "cannot resolve repository HEAD with standard Git or local "
+                f"version history: {history_error}"
+            ) from git_error
+    return _validate_commit(completed.stdout, source="git rev-parse HEAD")
 
 
 def main() -> int:

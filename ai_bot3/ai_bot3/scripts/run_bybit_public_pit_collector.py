@@ -10,7 +10,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from core.providers.bybit_public_pit import BybitPublicPITCollector, BybitPublicPITStore
+from core.providers.bybit_public_pit_collector import BybitPublicPITCollector
+from core.providers.bybit_public_pit_store import BybitPublicPITStore
 
 
 async def _run(args: argparse.Namespace) -> None:

@@ -30,7 +30,7 @@
 | 新闻/日历/鲸鱼/恐慌贪婪 | 本地 JSON wrapper | 低权重上下文 | 来源未登记为 Tier A 时不能独立触发交易或解除封锁 |
 | 内网 LLM | 内网 OpenAI-compatible Qwen 服务 | 结构化辅助分和摘要 | 不训练、不下单、失败返回中性；key 环境注入 |
 | 在线校准 | `online_learning.sqlite3` 已到期预测 | bias、scale、阈值 | 旧数据字段不全；状态不 valid 时禁止出票 |
-| 跨资产日频 | `D:\lh\trad_data_service_20260821\data_service` canonical Parquet | 当前只做 shadow/慢研究 | 显式白名单、30 小时滞后、SHA 收据校验，不直接融合 |
+| 跨资产日频 | `TRAD_DATA_SERVICE_ROOT` 指向的 canonical Parquet | 当前只做 shadow/慢研究 | 显式白名单、30 小时滞后、SHA 收据校验，不直接融合 |
 | Bybit 盘口/逐笔 | Bybit 官方历史归档 + V5 实时 public orderbook/trades | spread、depth、microprice、OFI/CVD、扫单滑点研究 | 正式 37 天五币种覆盖和 OOS 消融仍在建立；盘口不能替代真实 fill 回执 |
 | Bybit funding/OI/basis | Bybit V5 官方历史 REST | 实际结算 funding、5 分钟 OI 变化、1 分钟 mark/index basis | 历史回放保留响应哈希；liquidation 不是该 REST 的组成部分 |
 | Bybit liquidation | `allLiquidation.{symbol}` 实时流和保留的逐条原始事件 | 5 分钟多/空强平名义不平衡 | v1 方向解释已失效并重建为 v2；官方没有对应历史 REST，当前覆盖不足 |
