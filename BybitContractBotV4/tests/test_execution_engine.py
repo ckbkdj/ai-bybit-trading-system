@@ -62,7 +62,7 @@ def ticket_payload(ticket_id="tk_execution_test_001", *, position_version=3, ref
             "target_exposure_pct": 0.08,
             "risk_budget_pct": 0.0025,
             "max_notional_usdt": 5000,
-            "leverage_cap": 3,
+            "leverage_cap": 2,
         },
         "entry": {
             "order_type": "LIMIT",
@@ -223,8 +223,17 @@ class ExecutionEngineTests(unittest.TestCase):
 
     def test_per_trade_risk_above_quarter_percent_is_rejected(self):
         payload = ticket_payload("tk_trade_risk_guard_001")
-        payload["intent"]["risk_budget_pct"] = 0.0026
         ticket = OperationTicket.model_validate(payload)
+        # Simulate an object created by a stale/compromised producer that
+        # bypassed current contract validation.  The executor keeps its own
+        # independent hard gate as defense in depth.
+        ticket = ticket.model_copy(
+            update={
+                "intent": ticket.intent.model_copy(
+                    update={"risk_budget_pct": 0.0026}
+                )
+            }
+        )
         state = self.consumer.process(ticket, now=NOW)
         self.assertEqual(state, ExecutionState.RISK_BLOCKED)
         self.assertEqual(
