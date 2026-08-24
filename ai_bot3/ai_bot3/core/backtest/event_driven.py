@@ -69,6 +69,10 @@ class BacktestConfig:
             raise ValueError("gross exposure must fit inside the leverage cap")
         if self.funding_risk_buffer_bps_per_8h < 10.0:
             raise ValueError("funding risk buffer cannot be below 10 bps per 8h")
+        if not self.no_averaging_down or not self.no_martingale:
+            raise ValueError("averaging down and martingale must remain disabled")
+        if not self.require_stop:
+            raise ValueError("every backtest trade must retain a stop")
 
 
 @dataclass(frozen=True)
@@ -157,6 +161,10 @@ class EventDrivenReport:
     risk_policy_compliant: bool
     risk_budget_breach_count: int
     maximum_realized_loss_to_risk_budget: float
+    daily_loss_limit_breach_count: int
+    weekly_loss_limit_breach_count: int
+    equity_drawdown_limit_breached: bool
+    leverage_limit_breach_count: int
     intrabar_path_used: bool = True
     mark_to_market_used: bool = True
     equity_curve: tuple[EquityPoint, ...] = ()
@@ -208,6 +216,28 @@ def _pretrade_risk_loss_bps(
         + 2.0 * adverse_slippage_per_leg
         + funding_buffer
     )
+
+
+def _period_loss_breach_count(
+    points: Sequence[EquityPoint],
+    *,
+    initial_equity: float,
+    limit: float,
+    weekly: bool,
+) -> int:
+    grouped: dict[object, list[EquityPoint]] = defaultdict(list)
+    for point in sorted(points, key=lambda item: item.observed_at):
+        day = point.observed_at.astimezone(timezone.utc).date()
+        key = day - timedelta(days=day.weekday()) if weekly else day
+        grouped[key].append(point)
+    prior_close = initial_equity
+    breaches = 0
+    for key in sorted(grouped):
+        period = grouped[key]
+        if min(point.equity_usdt for point in period) <= prior_close * (1.0 - limit):
+            breaches += 1
+        prior_close = period[-1].equity_usdt
+    return breaches
 
 
 @dataclass(frozen=True, slots=True)
@@ -686,6 +716,34 @@ class EventDrivenBacktest:
         risk_budget_breach_count = sum(
             ratio > 1.0 + 1e-12 for ratio in realized_loss_to_budget
         )
+        mark_to_market_drawdown = _drawdown(mtm_values)
+        daily_loss_limit_breach_count = _period_loss_breach_count(
+            equity_curve,
+            initial_equity=cfg.initial_equity_usdt,
+            limit=cfg.daily_loss_limit,
+            weekly=False,
+        )
+        weekly_loss_limit_breach_count = _period_loss_breach_count(
+            equity_curve,
+            initial_equity=cfg.initial_equity_usdt,
+            limit=cfg.weekly_loss_limit,
+            weekly=True,
+        )
+        leverage_limit_breach_count = sum(
+            point.gross_exposure_usdt
+            > max(point.equity_usdt, 0.0) * cfg.leverage_cap + 1e-9
+            for point in equity_curve
+        )
+        equity_drawdown_limit_breached = (
+            mark_to_market_drawdown > cfg.equity_drawdown_limit + 1e-12
+        )
+        risk_policy_compliant = bool(
+            risk_budget_breach_count == 0
+            and daily_loss_limit_breach_count == 0
+            and weekly_loss_limit_breach_count == 0
+            and not equity_drawdown_limit_breached
+            and leverage_limit_breach_count == 0
+        )
 
         return EventDrivenReport(
             configuration={**asdict(cfg), "execution": asdict(execution), "cost_multiplier": cost_multiplier},
@@ -694,7 +752,7 @@ class EventDrivenBacktest:
             initial_equity_usdt=cfg.initial_equity_usdt,
             final_equity_usdt=equity,
             net_return=equity / cfg.initial_equity_usdt - 1.0,
-            max_drawdown=_drawdown(mtm_values),
+            max_drawdown=mark_to_market_drawdown,
             profit_factor=(gross_profit / gross_loss if gross_loss > 0 else None),
             total_fee_cost=sum(trade.fee_cost for trade in trades),
             total_slippage_cost=sum(trade.slippage_cost for trade in trades),
@@ -711,11 +769,15 @@ class EventDrivenBacktest:
             ),
             simulation_complete=unresolved_position_count == 0,
             unresolved_position_count=unresolved_position_count,
-            risk_policy_compliant=risk_budget_breach_count == 0,
+            risk_policy_compliant=risk_policy_compliant,
             risk_budget_breach_count=risk_budget_breach_count,
             maximum_realized_loss_to_risk_budget=max(
                 realized_loss_to_budget, default=0.0
             ),
+            daily_loss_limit_breach_count=daily_loss_limit_breach_count,
+            weekly_loss_limit_breach_count=weekly_loss_limit_breach_count,
+            equity_drawdown_limit_breached=equity_drawdown_limit_breached,
+            leverage_limit_breach_count=leverage_limit_breach_count,
             equity_curve=equity_curve,
             maximum_gross_exposure_usdt=max(
                 (point.gross_exposure_usdt for point in equity_curve), default=0.0

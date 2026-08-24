@@ -91,6 +91,17 @@ def test_event_driven_backtest_uses_fills_intrabar_path_and_all_costs():
     assert report.proxy_execution_cost_trade_count == 1
 
 
+def test_backtest_capital_preservation_switches_cannot_be_disabled():
+    with pytest.raises(ValueError, match="averaging down and martingale"):
+        BacktestConfig(no_averaging_down=False)
+    with pytest.raises(ValueError, match="averaging down and martingale"):
+        BacktestConfig(no_martingale=False)
+    with pytest.raises(ValueError, match="retain a stop"):
+        BacktestConfig(require_stop=False)
+    with pytest.raises(ValueError, match="funding risk buffer"):
+        BacktestConfig(funding_risk_buffer_bps_per_8h=9.99)
+
+
 def test_event_driven_backtest_propagates_direct_cost_provenance():
     start = datetime(2026, 1, 1, tzinfo=timezone.utc)
     signal = SignalEvent(
@@ -214,6 +225,7 @@ def test_pretrade_sizing_includes_costs_and_gap_loss_breaches_risk_gate():
     assert trade.net_pnl < -trade.risk_budget_usdt
     assert report.risk_budget_breach_count == 1
     assert report.risk_policy_compliant is False
+    assert report.daily_loss_limit_breach_count == 1
 
 
 def test_event_driven_backtest_fails_closed_on_nonpositive_edge():
@@ -425,6 +437,8 @@ def test_unrealized_drawdown_blocks_new_cross_symbol_risk():
     )
     assert [trade.signal_id for trade in report.trades] == ["btc-open-loss"]
     assert report.rejected_signals["equity_drawdown_limit"] == 1
+    assert report.equity_drawdown_limit_breached is True
+    assert report.risk_policy_compliant is False
 
 
 def test_event_backtest_passes_only_the_bounded_holding_path_to_labeler(monkeypatch):

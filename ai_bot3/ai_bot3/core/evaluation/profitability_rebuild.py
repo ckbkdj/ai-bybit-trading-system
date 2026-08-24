@@ -215,6 +215,20 @@ def _execution_release_evidence(
         "risk_budget_breach_count": int(
             getattr(report, "risk_budget_breach_count", 0)
         ),
+        "capital_preservation_breaches": {
+            "daily_loss_limit": int(
+                getattr(report, "daily_loss_limit_breach_count", 0)
+            ),
+            "weekly_loss_limit": int(
+                getattr(report, "weekly_loss_limit_breach_count", 0)
+            ),
+            "equity_drawdown_limit": bool(
+                getattr(report, "equity_drawdown_limit_breached", False)
+            ),
+            "leverage_limit": int(
+                getattr(report, "leverage_limit_breach_count", 0)
+            ),
+        },
         "direct_execution_cost_trade_count": int(
             getattr(report, "direct_execution_cost_trade_count", 0)
         ),
