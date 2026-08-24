@@ -4,6 +4,8 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -119,6 +121,43 @@ def test_event_driven_backtest_propagates_direct_cost_provenance():
     trade = report.trades[0]
     assert trade.entry_spread_source == "bybit.public.orderbook"
     assert trade.funding_source == "bybit.public.funding_history"
+
+
+def test_two_x_cost_stress_includes_observed_spread_slippage_and_funding():
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    signal = SignalEvent(
+        signal_id="alpha-direct-cost-stress-1",
+        symbol="BTCUSDT",
+        side="BUY",
+        decision_at=start,
+        reference_price=100.0,
+        lower_bound_net_edge=0.001,
+        take_profit_bps=100,
+        stop_loss_bps=100,
+        max_holding_sec=180,
+    )
+    bars = [
+        _bar(start, 102, 99.5, 101.5, observed_execution_costs=True),
+        _bar(
+            start + timedelta(minutes=1),
+            102,
+            99.5,
+            101.5,
+            observed_execution_costs=True,
+        ),
+    ]
+
+    baseline = EventDrivenBacktest().run([signal], {"BTCUSDT": bars})
+    stressed = EventDrivenBacktest().run(
+        [signal], {"BTCUSDT": bars}, cost_multiplier=2.0
+    )
+
+    base_trade = baseline.trades[0]
+    stressed_trade = stressed.trades[0]
+    assert stressed_trade.fee_cost == pytest.approx(base_trade.fee_cost * 2)
+    assert stressed_trade.funding_cost == pytest.approx(base_trade.funding_cost * 2)
+    assert stressed_trade.slippage_cost > base_trade.slippage_cost * 1.9
+    assert stressed_trade.net_pnl < base_trade.net_pnl
 
 
 def test_event_driven_backtest_fails_closed_on_nonpositive_edge():

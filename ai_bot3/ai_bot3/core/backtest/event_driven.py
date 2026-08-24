@@ -384,14 +384,20 @@ class EventDrivenBacktest:
         execution = TripleBarrierConfig(
             maker_fee_bps=self.execution.maker_fee_bps * cost_multiplier,
             taker_fee_bps=self.execution.taker_fee_bps * cost_multiplier,
-            base_slippage_bps=self.execution.base_slippage_bps * cost_multiplier,
-            volatility_slippage_multiplier=self.execution.volatility_slippage_multiplier * cost_multiplier,
-            impact_bps_at_full_depth=self.execution.impact_bps_at_full_depth * cost_multiplier,
-            default_spread_bps=self.execution.default_spread_bps * cost_multiplier,
+            base_slippage_bps=self.execution.base_slippage_bps,
+            volatility_slippage_multiplier=self.execution.volatility_slippage_multiplier,
+            impact_bps_at_full_depth=self.execution.impact_bps_at_full_depth,
+            default_spread_bps=self.execution.default_spread_bps,
             default_depth_usdt=self.execution.default_depth_usdt,
             missing_depth_fill_fraction=self.execution.missing_depth_fill_fraction,
             latency_ms=self.execution.latency_ms,
             stop_first_when_same_bar=self.execution.stop_first_when_same_bar,
+            slippage_stress_multiplier=(
+                self.execution.slippage_stress_multiplier * cost_multiplier
+            ),
+            funding_stress_multiplier=(
+                self.execution.funding_stress_multiplier * cost_multiplier
+            ),
         )
         market_index = self._market_index(market_bars)
         ordered = sorted(signals, key=lambda item: (item.decision_at, item.signal_id))

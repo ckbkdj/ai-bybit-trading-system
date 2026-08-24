@@ -119,6 +119,8 @@ class TripleBarrierConfig:
     missing_depth_fill_fraction: float = 0.50
     latency_ms: int = 250
     stop_first_when_same_bar: bool = True
+    slippage_stress_multiplier: float = 1.0
+    funding_stress_multiplier: float = 1.0
 
     def __post_init__(self) -> None:
         if min(self.maker_fee_bps, self.taker_fee_bps, self.base_slippage_bps) < 0:
@@ -127,6 +129,10 @@ class TripleBarrierConfig:
             raise ValueError("depth and missing-depth fill fraction are invalid")
         if self.latency_ms < 0:
             raise ValueError("latency cannot be negative")
+        if self.slippage_stress_multiplier < 1:
+            raise ValueError("slippage stress cannot make costs more optimistic")
+        if self.funding_stress_multiplier < 1:
+            raise ValueError("funding stress cannot make costs more optimistic")
 
 
 @dataclass(frozen=True)
@@ -178,7 +184,13 @@ def _slippage_bps(bar: MarketBar, notional: float, config: TripleBarrierConfig) 
     depth = bar.depth_usdt if bar.depth_usdt is not None else config.default_depth_usdt
     volatility = bar.volatility_bps if bar.volatility_bps is not None else 0.0
     impact = config.impact_bps_at_full_depth * min(3.0, notional / max(depth, 1.0))
-    return max(0.0, config.base_slippage_bps + spread / 2.0 + impact + volatility * config.volatility_slippage_multiplier)
+    base = (
+        config.base_slippage_bps
+        + spread / 2.0
+        + impact
+        + volatility * config.volatility_slippage_multiplier
+    )
+    return max(0.0, base * config.slippage_stress_multiplier)
 
 
 def _fill_probability(spec: EntrySpec, bar: MarketBar) -> float:
@@ -353,6 +365,13 @@ def build_triple_barrier_label(
     slippage_return = max(0.0, gross_return - realised_return)
     funding_bps = sum(bar.funding_bps for bar in path if bar.close_time <= exit_bar.close_time)
     funding_return = direction * funding_bps / 10_000.0
+    # A cost stress must never turn known funding income into larger income.
+    # Positive values are payments and are multiplied; negative values are
+    # receipts and are reduced toward zero at 2x before becoming a cost under
+    # more extreme stresses.
+    funding_return += (
+        cfg.funding_stress_multiplier - 1.0
+    ) * abs(funding_return)
     net_return = gross_return - fee_return - slippage_return - funding_return
     funding_path = [bar for bar in path if bar.close_time <= exit_bar.close_time]
     execution_cost_evidence_complete = bool(
