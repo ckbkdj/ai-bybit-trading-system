@@ -97,10 +97,75 @@ def test_kline_preflight_reads_only_timestamps_and_development_reads_stop_at_bou
         "3m",
         100,
         close_at_or_before=boundary,
+        include_boundary=False,
     )
-    assert len(development) == 2
-    assert development["close_at"].max() == pd.Timestamp(boundary)
-    assert development["close"].tolist() == [100.5, 101.5]
+    assert len(development) == 1
+    assert development["close_at"].max() < pd.Timestamp(boundary)
+    assert development["close"].tolist() == [100.5]
+
+    replay = source.load_before(
+        "BTCUSDT",
+        "3m",
+        100,
+        close_at_or_before=boundary,
+        include_boundary=True,
+    )
+    assert len(replay) == 2
+    assert replay["close_at"].max() == pd.Timestamp(boundary)
+
+
+def test_inclusive_exchange_close_millisecond_is_not_available_one_ms_early(
+    tmp_path: Path,
+):
+    database = tmp_path / "inclusive-close.sqlite3"
+    start = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    open_ms = int(start.timestamp() * 1_000)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """CREATE TABLE raw_kline(
+                   symbol TEXT,timeframe TEXT,source TEXT,open_time INTEGER,
+                   close_time INTEGER,open REAL,high REAL,low REAL,close REAL,
+                   volume REAL,fetched_at TEXT
+               )"""
+        )
+        connection.execute(
+            "INSERT INTO raw_kline VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "BTCUSDT",
+                "3m",
+                "binance",
+                open_ms,
+                open_ms + 180_000 - 1,
+                100.0,
+                101.0,
+                99.0,
+                100.5,
+                1_000.0,
+                "2026-01-01T00:00:00Z",
+            ),
+        )
+        connection.commit()
+
+    source = KlinePanelSource(database)
+    row = source.load_timestamps("BTCUSDT", "3m", 10).iloc[0]
+    assert row["close_at"] == pd.Timestamp(start + timedelta(seconds=180))
+    assert int(row["close_time"]) == open_ms + 180_000 - 1
+    with pytest.raises(ValueError, match="before the PIT boundary"):
+        source.load_before(
+            "BTCUSDT",
+            "3m",
+            10,
+            close_at_or_before=start + timedelta(seconds=180),
+            include_boundary=False,
+        )
+    through = source.load_before(
+        "BTCUSDT",
+        "3m",
+        10,
+        close_at_or_before=start + timedelta(seconds=180),
+        include_boundary=True,
+    )
+    assert len(through) == 1
 
 
 def test_short_horizon_coverage_cannot_silently_collapse_to_six_or_31_days(tmp_path):

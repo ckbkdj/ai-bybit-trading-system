@@ -501,6 +501,21 @@ class KlinePanelSource:
         if not self.path.exists():
             raise FileNotFoundError(self.path)
 
+    @staticmethod
+    def _attach_times(frame: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+        """Normalize inclusive exchange close milliseconds to availability time."""
+
+        interval_ms = int(TIMEFRAME_INTERVAL_SEC[timeframe] * 1_000)
+        open_ms = pd.to_numeric(frame["open_time"], errors="raise").astype("int64")
+        close_ms = pd.to_numeric(frame["close_time"], errors="raise").astype("int64")
+        inclusive_close = (close_ms - open_ms + 1) == interval_ms
+        normalized_close_ms = close_ms + inclusive_close.astype("int64")
+        frame["open_at"] = pd.to_datetime(open_ms, unit="ms", utc=True)
+        frame["close_at"] = pd.to_datetime(
+            normalized_close_ms, unit="ms", utc=True
+        )
+        return frame
+
     def load(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
         uri = f"file:{self.path.resolve().as_posix()}?mode=ro"
         query = """
@@ -521,9 +536,7 @@ class KlinePanelSource:
         for column in ("open", "high", "low", "close", "volume"):
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
         frame = frame.dropna(subset=["open", "high", "low", "close", "volume"])
-        frame["open_at"] = pd.to_datetime(frame["open_time"], unit="ms", utc=True)
-        frame["close_at"] = pd.to_datetime(frame["close_time"], unit="ms", utc=True)
-        return frame.reset_index(drop=True)
+        return self._attach_times(frame, timeframe).reset_index(drop=True)
 
     def load_timestamps(
         self,
@@ -553,13 +566,7 @@ class KlinePanelSource:
             )
         if frame.empty:
             raise ValueError(f"no bars for {symbol} {timeframe}")
-        frame["open_at"] = pd.to_datetime(
-            frame["open_time"], unit="ms", utc=True
-        )
-        frame["close_at"] = pd.to_datetime(
-            frame["close_time"], unit="ms", utc=True
-        )
-        return frame.reset_index(drop=True)
+        return self._attach_times(frame, timeframe).reset_index(drop=True)
 
     def load_before(
         self,
@@ -568,21 +575,30 @@ class KlinePanelSource:
         limit: int,
         *,
         close_at_or_before: object,
+        include_boundary: bool = True,
     ) -> pd.DataFrame:
-        """Read OHLCV only through a pre-registered PIT boundary."""
+        """Read OHLCV through, or strictly before, a pre-registered boundary."""
 
         cutoff = pd.to_datetime(close_at_or_before, utc=True, errors="coerce")
         if pd.isna(cutoff):
             raise ValueError("kline close boundary is invalid")
         cutoff_ms = int(pd.Timestamp(cutoff).value // 1_000_000)
+        interval_ms = int(TIMEFRAME_INTERVAL_SEC[timeframe] * 1_000)
+        comparison = "<=" if include_boundary else "<"
         uri = f"file:{self.path.resolve().as_posix()}?mode=ro"
-        query = """
+        query = f"""
             SELECT symbol,timeframe,source,open_time,close_time,open,high,low,close,volume,fetched_at
               FROM (
                     SELECT symbol,timeframe,source,open_time,close_time,open,high,low,close,volume,fetched_at
                       FROM raw_kline
                      WHERE symbol=? AND timeframe=? AND source='binance'
-                       AND close_time<=?
+                       AND (
+                            close_time
+                            + CASE
+                                WHEN close_time-open_time+1=? THEN 1
+                                ELSE 0
+                              END
+                       ) {comparison} ?
                      ORDER BY open_time DESC
                      LIMIT ?
               )
@@ -592,7 +608,13 @@ class KlinePanelSource:
             frame = pd.read_sql_query(
                 query,
                 connection,
-                params=(symbol, timeframe, cutoff_ms, int(limit)),
+                params=(
+                    symbol,
+                    timeframe,
+                    interval_ms,
+                    cutoff_ms,
+                    int(limit),
+                ),
             )
         if frame.empty:
             raise ValueError(
@@ -601,13 +623,7 @@ class KlinePanelSource:
         for column in ("open", "high", "low", "close", "volume"):
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
         frame = frame.dropna(subset=["open", "high", "low", "close", "volume"])
-        frame["open_at"] = pd.to_datetime(
-            frame["open_time"], unit="ms", utc=True
-        )
-        frame["close_at"] = pd.to_datetime(
-            frame["close_time"], unit="ms", utc=True
-        )
-        return frame.reset_index(drop=True)
+        return self._attach_times(frame, timeframe).reset_index(drop=True)
 
     def listing_evidence(
         self, symbol: str, timeframe: str
@@ -3302,6 +3318,7 @@ class ProfitabilityRebuild:
                     timeframe,
                     self.config.max_bars_per_symbol,
                     close_at_or_before=lockbox_start,
+                    include_boundary=False,
                 )
                 enriched = _engineer_features(frame)
                 development_enriched = enriched.reset_index(drop=True)
