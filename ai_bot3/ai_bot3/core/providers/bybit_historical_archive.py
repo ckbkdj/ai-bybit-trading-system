@@ -182,13 +182,19 @@ def _event_in_archive_day(
     event_time: datetime,
     trading_date: date,
     *,
+    maximum_leading_seconds: float = 0.0,
     maximum_trailing_seconds: float = 0.0,
 ) -> bool:
+    if min(maximum_leading_seconds, maximum_trailing_seconds) < 0:
+        raise ValueError("archive boundary tolerances cannot be negative")
     start = datetime.combine(trading_date, datetime.min.time(), tzinfo=timezone.utc)
     end = start + timedelta(days=1)
-    if event_time < start or event_time > end + timedelta(seconds=maximum_trailing_seconds):
+    if (
+        event_time < start - timedelta(seconds=maximum_leading_seconds)
+        or event_time > end + timedelta(seconds=maximum_trailing_seconds)
+    ):
         raise ValueError("archive contains an event outside its UTC trading date")
-    return event_time < end
+    return start <= event_time < end
 
 
 def _archive_id(
@@ -431,6 +437,7 @@ def replay_orderbook_archive(
                 in_trading_day = _event_in_archive_day(
                     event_time,
                     trading_date,
+                    maximum_leading_seconds=10.0,
                     maximum_trailing_seconds=10.0,
                 )
                 if last_event is not None and event_time < last_event:
@@ -443,9 +450,10 @@ def replay_orderbook_archive(
                 rows_read += 1
                 first_event = first_event or event_time
                 last_event = event_time
-                # Official daily files contain the next day's opening
-                # snapshot and a few preceding deltas. Validate that narrow
-                # overlap, but assign it only to the next UTC archive.
+                # Official daily files can contain a few deltas immediately
+                # before their UTC start and the next day's opening snapshot.
+                # Validate that narrow overlap, but never assign an out-of-day
+                # event to this archive's derived features.
                 if not in_trading_day:
                     continue
                 is_snapshot = event_type == "snapshot"

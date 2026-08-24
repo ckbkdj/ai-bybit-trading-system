@@ -60,6 +60,7 @@ def _book_message(offset_sec: int, sequence: int, *, snapshot: bool) -> dict:
 def _orderbook_zip(path: Path) -> None:
     member = f"{DAY.isoformat()}_{SYMBOL}_ob200.data"
     messages = (
+        _book_message(-1, 0, snapshot=False),
         _book_message(1, 1, snapshot=True),
         _book_message(16, 2, snapshot=False),
         _book_message(31, 3, snapshot=False),
@@ -114,7 +115,7 @@ def test_official_archive_replay_preserves_event_available_ingested_chronology(t
     store.close()
 
     assert evidence.status == "completed"
-    assert evidence.rows_read == 4
+    assert evidence.rows_read == 5
     assert evidence.feature_observation_count == 24
     assert archive_already_completed(
         BybitPublicPITStore(database),
@@ -212,6 +213,38 @@ def test_invalid_archive_is_rejected_before_any_feature_rows_are_committed(tmp_p
             "SELECT COUNT(*) FROM bybit_feature_observations"
         ).fetchone()[0]
     assert count == 0
+
+
+def test_orderbook_archive_rejects_leading_overlap_beyond_ten_seconds(tmp_path):
+    database = tmp_path / "pit.sqlite3"
+    archive = tmp_path / "invalid-leading-book.zip"
+    member = f"{DAY.isoformat()}_{SYMBOL}_ob200.data"
+    messages = (
+        _book_message(-11, 0, snapshot=False),
+        _book_message(1, 1, snapshot=True),
+    )
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
+        output.writestr(member, "\n".join(json.dumps(item) for item in messages))
+    store = BybitPublicPITStore(database)
+
+    try:
+        replay_orderbook_archive(
+            store,
+            archive,
+            symbol=SYMBOL,
+            trading_date=DAY,
+            source_url=orderbook_archive_url(SYMBOL, DAY),
+            fetched_at=FETCHED,
+            feature_emit_interval_sec=15,
+        )
+    except ValueError as exc:
+        assert "outside its UTC trading date" in str(exc)
+    else:
+        raise AssertionError("excessive leading archive overlap was accepted")
+    with store.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM bybit_feature_observations"
+        ).fetchone()[0] == 0
 
 
 def test_completed_archive_evidence_cannot_be_downgraded_by_late_failure(tmp_path):
