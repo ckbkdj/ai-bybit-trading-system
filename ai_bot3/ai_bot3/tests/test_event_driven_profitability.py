@@ -52,6 +52,16 @@ def _bar(
         spread_observed=observed_execution_costs,
         depth_observed=observed_execution_costs,
         funding_observed=observed_execution_costs,
+        close_spread_bps=5 if observed_execution_costs else None,
+        close_depth_usdt=20_000 if observed_execution_costs else None,
+        close_spread_source=(
+            "bybit.public.orderbook" if observed_execution_costs else None
+        ),
+        close_depth_source=(
+            "bybit.public.orderbook" if observed_execution_costs else None
+        ),
+        close_spread_observed=(True if observed_execution_costs else None),
+        close_depth_observed=(True if observed_execution_costs else None),
     )
 
 

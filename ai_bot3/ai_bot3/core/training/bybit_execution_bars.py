@@ -63,20 +63,33 @@ def enrich_market_bars_with_bybit_execution_pit(
     if not bars:
         return [], {
             "bar_count": 0,
+            "direct_open_spread_depth_bar_count": 0,
+            "direct_close_spread_depth_bar_count": 0,
             "direct_spread_depth_bar_count": 0,
             "direct_funding_bar_count": 0,
             "fully_direct_execution_bar_count": 0,
             "fully_direct_execution_bar_ratio": 0.0,
         }
     ordered = list(bars)
-    decisions = pd.DataFrame(
+    open_decisions = pd.DataFrame(
         {
             "symbol": [bar.symbol.upper() for bar in ordered],
             "decision_at": [bar.open_time for bar in ordered],
         }
     )
-    joined = source.join(
-        decisions,
+    close_decisions = pd.DataFrame(
+        {
+            "symbol": [bar.symbol.upper() for bar in ordered],
+            "decision_at": [bar.close_time for bar in ordered],
+        }
+    )
+    open_joined = source.join(
+        open_decisions,
+        names=ORDERBOOK_EXECUTION_FEATURES,
+        history=history,
+    )
+    close_joined = source.join(
+        close_decisions,
         names=ORDERBOOK_EXECUTION_FEATURES,
         history=history,
     )
@@ -102,15 +115,22 @@ def enrich_market_bars_with_bybit_execution_pit(
         )
     completed_funding_days = _completed_funding_days(source_evidence)
     output: list[MarketBar] = []
+    direct_open_spread_depth = 0
+    direct_close_spread_depth = 0
     direct_spread_depth = 0
     direct_funding = 0
     fully_direct = 0
     for position, bar in enumerate(ordered):
-        row = joined.iloc[position]
-        spread = row["orderbook_spread_bps"]
-        depth = row["orderbook_depth_usdt_l5"]
+        open_row = open_joined.iloc[position]
+        close_row = close_joined.iloc[position]
+        spread = open_row["orderbook_spread_bps"]
+        depth = open_row["orderbook_depth_usdt_l5"]
+        close_spread = close_row["orderbook_spread_bps"]
+        close_depth = close_row["orderbook_depth_usdt_l5"]
         spread_observed = pd.notna(spread)
         depth_observed = pd.notna(depth)
+        close_spread_observed = pd.notna(close_spread)
+        close_depth_observed = pd.notna(close_depth)
         required_funding_days = _covered_dates(bar)
         funding_observed = bool(required_funding_days) and all(
             (bar.symbol.upper(), item) in completed_funding_days
@@ -154,21 +174,50 @@ def enrich_market_bars_with_bybit_execution_pit(
             spread_observed=spread_observed,
             depth_observed=depth_observed,
             funding_observed=funding_observed,
+            close_spread_bps=(
+                float(close_spread) if close_spread_observed else None
+            ),
+            close_depth_usdt=(
+                float(close_depth) if close_depth_observed else None
+            ),
+            close_spread_source=(
+                "bybit.public.orderbook"
+                if close_spread_observed
+                else None
+            ),
+            close_depth_source=(
+                "bybit.public.orderbook"
+                if close_depth_observed
+                else None
+            ),
+            close_spread_observed=close_spread_observed,
+            close_depth_observed=close_depth_observed,
         )
         output.append(enriched)
-        spread_depth_complete = spread_observed and depth_observed
+        spread_depth_complete = bool(
+            spread_observed
+            and depth_observed
+            and close_spread_observed
+            and close_depth_observed
+        )
+        direct_open_spread_depth += int(spread_observed and depth_observed)
+        direct_close_spread_depth += int(
+            close_spread_observed and close_depth_observed
+        )
         direct_spread_depth += int(spread_depth_complete)
         direct_funding += int(funding_observed)
         fully_direct += int(spread_depth_complete and funding_observed)
     return output, {
         "bar_count": len(output),
+        "direct_open_spread_depth_bar_count": direct_open_spread_depth,
+        "direct_close_spread_depth_bar_count": direct_close_spread_depth,
         "direct_spread_depth_bar_count": direct_spread_depth,
         "direct_funding_bar_count": direct_funding,
         "fully_direct_execution_bar_count": fully_direct,
         "fully_direct_execution_bar_ratio": fully_direct / len(output),
         "spread_depth_source": "bybit.public.orderbook",
         "funding_source": "bybit.public.funding_history",
-        "orderbook_join_policy": "latest available_at at or before bar open with registry staleness cutoff",
+        "orderbook_join_policy": "separate latest available_at snapshots at or before bar open and bar close, each with registry staleness cutoff",
         "funding_policy": "settled funding events only on completed official funding-history UTC days",
         "ohlc_role": "barrier path only; never execution spread/depth evidence",
     }

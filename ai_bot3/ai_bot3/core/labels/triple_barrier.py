@@ -53,6 +53,16 @@ class MarketBar:
     spread_observed: bool = False
     depth_observed: bool = False
     funding_observed: bool = False
+    # Execution liquidity is time-local.  ``spread_bps``/``depth_usdt`` are
+    # the PIT snapshot at the bar open and may be used for an entry.  A close
+    # fill must use a separately aligned snapshot; falling back to the open
+    # values preserves legacy simulations but cannot upgrade their evidence.
+    close_spread_bps: float | None = None
+    close_depth_usdt: float | None = None
+    close_spread_source: str | None = None
+    close_depth_source: str | None = None
+    close_spread_observed: bool | None = None
+    close_depth_observed: bool | None = None
 
     def __post_init__(self) -> None:
         open_time = _utc(self.open_time)
@@ -72,6 +82,10 @@ class MarketBar:
             for value in (self.spread_source, self.depth_source, self.funding_source)
         ):
             raise ValueError("execution cost provenance sources cannot be empty")
+        if self.close_spread_source is not None and not self.close_spread_source.strip():
+            raise ValueError("close spread provenance source cannot be empty")
+        if self.close_depth_source is not None and not self.close_depth_source.strip():
+            raise ValueError("close depth provenance source cannot be empty")
 
 
 @dataclass(frozen=True)
@@ -180,9 +194,25 @@ class TripleBarrierLabel:
         return payload
 
 
-def _slippage_bps(bar: MarketBar, notional: float, config: TripleBarrierConfig) -> float:
-    spread = bar.spread_bps if bar.spread_bps is not None else config.default_spread_bps
-    depth = bar.depth_usdt if bar.depth_usdt is not None else config.default_depth_usdt
+def _slippage_bps(
+    bar: MarketBar,
+    notional: float,
+    config: TripleBarrierConfig,
+    *,
+    at_close: bool = False,
+) -> float:
+    spread_value = (
+        bar.close_spread_bps
+        if at_close and bar.close_spread_bps is not None
+        else bar.spread_bps
+    )
+    depth_value = (
+        bar.close_depth_usdt
+        if at_close and bar.close_depth_usdt is not None
+        else bar.depth_usdt
+    )
+    spread = spread_value if spread_value is not None else config.default_spread_bps
+    depth = depth_value if depth_value is not None else config.default_depth_usdt
     volatility = bar.volatility_bps if bar.volatility_bps is not None else 0.0
     impact = config.impact_bps_at_full_depth * min(3.0, notional / max(depth, 1.0))
     base = (
@@ -389,7 +419,12 @@ def build_triple_barrier_label(
             mfe=float(max(0.0, mfe)),
         )
 
-    exit_slippage_bps = _slippage_bps(exit_bar, notional * fill_fraction, cfg)
+    exit_slippage_bps = _slippage_bps(
+        exit_bar,
+        notional * fill_fraction,
+        cfg,
+        at_close=True,
+    )
     exit_fill = exit_reference * (1.0 - direction * exit_slippage_bps / 10_000.0)
     gross_return = direction * (exit_reference / entry_reference - 1.0)
     realised_return = direction * (exit_fill / entry_fill - 1.0)
@@ -408,11 +443,21 @@ def build_triple_barrier_label(
     ) * abs(funding_return)
     net_return = gross_return - fee_return - slippage_return - funding_return
     funding_path = [bar for bar in path if bar.close_time <= exit_bar.close_time]
+    exit_spread_observed = (
+        exit_bar.close_spread_observed
+        if exit_bar.close_spread_observed is not None
+        else False
+    )
+    exit_depth_observed = (
+        exit_bar.close_depth_observed
+        if exit_bar.close_depth_observed is not None
+        else False
+    )
     execution_cost_evidence_complete = bool(
         entry_bar.spread_observed
         and entry_bar.depth_observed
-        and exit_bar.spread_observed
-        and exit_bar.depth_observed
+        and exit_spread_observed
+        and exit_depth_observed
         and funding_path
         and all(bar.funding_observed for bar in funding_path)
     )
@@ -452,8 +497,8 @@ def build_triple_barrier_label(
         execution_cost_evidence_complete=execution_cost_evidence_complete,
         entry_spread_source=entry_bar.spread_source,
         entry_depth_source=entry_bar.depth_source,
-        exit_spread_source=exit_bar.spread_source,
-        exit_depth_source=exit_bar.depth_source,
+        exit_spread_source=exit_bar.close_spread_source or "unobserved_at_close",
+        exit_depth_source=exit_bar.close_depth_source or "unobserved_at_close",
         funding_source="+".join(funding_sources) if funding_sources else "unobserved",
     )
 

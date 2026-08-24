@@ -22,8 +22,13 @@ UTC = timezone.utc
 class _DirectOrderbookSource:
     def join(self, decisions, *, names, history):
         output = decisions.copy()
-        output["orderbook_spread_bps"] = 1.5
-        output["orderbook_depth_usdt_l5"] = 2_000_000.0
+        is_close = output["decision_at"].dt.minute.eq(1)
+        output["orderbook_spread_bps"] = is_close.map(
+            {False: 1.5, True: 4.5}
+        )
+        output["orderbook_depth_usdt_l5"] = is_close.map(
+            {False: 2_000_000.0, True: 500_000.0}
+        )
         output["orderbook_spread_bps__available_at"] = output[
             "decision_at"
         ] - pd.Timedelta(seconds=1)
@@ -89,10 +94,17 @@ def test_execution_bar_enrichment_uses_direct_orderbook_and_settled_funding():
     bar = bars[0]
     assert bar.spread_bps == 1.5
     assert bar.depth_usdt == 2_000_000.0
+    assert bar.close_spread_bps == 4.5
+    assert bar.close_depth_usdt == 500_000.0
     assert bar.funding_bps == 1.0
     assert bar.spread_observed and bar.depth_observed and bar.funding_observed
+    assert bar.close_spread_observed and bar.close_depth_observed
     assert bar.spread_source == "bybit.public.orderbook"
+    assert bar.close_spread_source == "bybit.public.orderbook"
     assert bar.funding_source == "bybit.public.funding_history"
+    assert evidence["direct_open_spread_depth_bar_count"] == 1
+    assert evidence["direct_close_spread_depth_bar_count"] == 1
+    assert evidence["direct_spread_depth_bar_count"] == 1
     assert evidence["fully_direct_execution_bar_ratio"] == 1.0
 
 
@@ -106,6 +118,7 @@ def test_execution_bar_enrichment_does_not_infer_funding_coverage_from_a_row():
     )
     bar = bars[0]
     assert bar.spread_observed and bar.depth_observed
+    assert bar.close_spread_observed and bar.close_depth_observed
     assert bar.funding_observed is False
     assert bar.funding_bps == 0.0
     assert bar.funding_source == "zero_proxy"

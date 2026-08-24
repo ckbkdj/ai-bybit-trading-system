@@ -358,7 +358,7 @@ moving-block bootstrap 的 95% 下界不大于零，都不得通过。
 
 `execution_cost_report.json` 必须分别核对：
 
-- `official_pit_cost_inputs_complete`：每笔交易的 entry/exit spread、depth 和持仓 funding 都有官方 PIT provenance；
+- `official_pit_cost_inputs_complete`：每笔交易的 entry spread/depth 必须按 bar open 独立 PIT 对齐，exit spread/depth 必须按实际模拟的 bar close 再做一次 PIT 对齐，持仓 funding 也必须有官方 provenance；禁止把开盘盘口复制成平仓盘口；
 - `proxy_execution_cost_trade_count`：必须为 0；
 - `shadow_or_testnet_fill_receipts_complete`：必须有独立 OOS 成交回执；
 - `queue_position_and_latency_calibration_complete`：必须用这些回执完成校准。

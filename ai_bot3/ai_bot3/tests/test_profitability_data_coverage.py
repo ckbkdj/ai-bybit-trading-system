@@ -296,9 +296,35 @@ def test_direct_execution_window_is_bound_before_buy_sell_outcomes_are_inspected
             spread_observed=True,
             depth_observed=True,
             funding_observed=True,
+            close_spread_bps=1.5,
+            close_depth_usdt=1_000_000.0,
+            close_spread_source="bybit_orderbook_pit",
+            close_depth_source="bybit_orderbook_pit",
+            close_spread_observed=True,
+            close_depth_observed=True,
         )
         for bar in _market_bars(enriched)
     )
+    open_only_bars = tuple(
+        replace(
+            bar,
+            close_spread_bps=None,
+            close_depth_usdt=None,
+            close_spread_source=None,
+            close_depth_source=None,
+            close_spread_observed=None,
+            close_depth_observed=None,
+        )
+        for bar in direct_bars
+    )
+    open_only_labels = _panel_rows(enriched, 180, open_only_bars)
+    assert open_only_labels
+    assert {
+        row["execution_window_evidence_complete"] for row in open_only_labels
+    } == {False}
+    assert {
+        row["execution_cost_evidence_complete"] for row in open_only_labels
+    } == {False}
     labels = _panel_rows(enriched, 180, direct_bars)
 
     assert labels

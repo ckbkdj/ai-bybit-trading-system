@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -91,6 +92,75 @@ def test_triple_barrier_records_partial_fill_and_rejects_future_feature():
     assert 0 < label.fill_fraction < 1
     assert label.partial_fill is True
     assert label.filled_quantity < label.requested_quantity
+
+
+def test_exit_cost_requires_and_uses_a_separate_close_liquidity_snapshot():
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    bar = MarketBar(
+        symbol="BTCUSDT",
+        open_time=start,
+        close_time=start + timedelta(minutes=1),
+        available_at=start + timedelta(minutes=1),
+        open=100.0,
+        high=101.0,
+        low=99.0,
+        close=100.0,
+        volume=1_000.0,
+        spread_bps=1.0,
+        depth_usdt=1_000_000.0,
+        funding_bps=0.0,
+        spread_source="bybit.public.orderbook",
+        depth_source="bybit.public.orderbook",
+        funding_source="bybit.public.funding_history",
+        spread_observed=True,
+        depth_observed=True,
+        funding_observed=True,
+        close_spread_bps=50.0,
+        close_depth_usdt=100.0,
+        close_spread_source="bybit.public.orderbook",
+        close_depth_source="bybit.public.orderbook",
+        close_spread_observed=True,
+        close_depth_observed=True,
+    )
+    spec = EntrySpec(
+        symbol="BTCUSDT",
+        side="BUY",
+        signal_at=start,
+        reference_price=100.0,
+        quantity=1.0,
+        take_profit_bps=10_000.0,
+        stop_loss_bps=10_000.0,
+        max_holding_sec=60,
+    )
+    label = build_triple_barrier_label(
+        spec,
+        [bar],
+        TripleBarrierConfig(
+            maker_fee_bps=0.0,
+            taker_fee_bps=0.0,
+            base_slippage_bps=0.0,
+            volatility_slippage_multiplier=0.0,
+            impact_bps_at_full_depth=4.0,
+            default_spread_bps=0.0,
+            latency_ms=0,
+        ),
+    )
+    assert label.exit_reason == "MAX_HOLDING"
+    assert label.execution_cost_evidence_complete is True
+    assert label.exit_spread_source == "bybit.public.orderbook"
+    assert label.slippage_return is not None
+
+    missing_close = build_triple_barrier_label(
+        spec,
+        [replace(bar, close_spread_bps=None, close_depth_usdt=None,
+                 close_spread_source=None, close_depth_source=None,
+                 close_spread_observed=None, close_depth_observed=None)],
+        TripleBarrierConfig(latency_ms=0),
+    )
+    assert missing_close.execution_cost_evidence_complete is False
+    assert missing_close.exit_spread_source == "unobserved_at_close"
+    assert missing_close.slippage_return is not None
+    assert label.slippage_return > missing_close.slippage_return
 
 
 def test_triple_barrier_evaluates_every_observation_through_max_holding():

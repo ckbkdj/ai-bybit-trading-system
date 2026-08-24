@@ -1424,6 +1424,8 @@ def _panel_frame(
             and all(
                 bar.spread_observed
                 and bar.depth_observed
+                and bar.close_spread_observed is True
+                and bar.close_depth_observed is True
                 and bar.funding_observed
                 for bar in path
             )
