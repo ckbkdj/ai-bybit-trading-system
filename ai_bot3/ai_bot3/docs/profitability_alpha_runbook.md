@@ -365,6 +365,8 @@ liquidation 组必须额外核对 `collection_evidence`。Bybit 官方公开的�
 
 Bybit orderbook 日归档允许验证但不写入特征的窄边界重叠：UTC 起点前最多 10 秒、终点后最多 10 秒。边界外事件必须整包原子失败；边界内的跨日事件计入 `rows_read` 和首尾原始证据，但不得进入当日派生 feature。起点前的 snapshot/delta 只能初始化当日首个 delta 所需的订单簿状态与 sequence，首次 feature 的 `event_time` 必须仍在当日；终点后的事件直接跳过。该规则用于兼容官方文件在零点附近携带的前置 snapshot/delta 和次日 snapshot，不得扩展为任意跨日容忍。
 
+衍生品 REST 日批次也不能因 HTTP 200 就视为完整：open interest 必须包含前置 1 小时并形成完整的 5 分钟网格，mark/index 必须各自形成全天完整 1 分钟网格且时间戳完全一致，funding 的首尾与相邻 settled event 间隔均不得超过 8 小时。任一网格缺点、额外时间戳或冲突值必须整批零写入并登记失败。
+
 ## 11. Lockbox 操作
 
 当前禁止打开新 lockbox。只有 development 报告全部通过后：

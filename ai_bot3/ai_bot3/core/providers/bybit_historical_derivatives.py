@@ -60,6 +60,28 @@ def _day_bounds(trading_date: date) -> tuple[datetime, datetime]:
     return start, start + timedelta(days=1)
 
 
+def _require_complete_grid(
+    values: Mapping[int, object],
+    *,
+    start: datetime,
+    end: datetime,
+    interval_sec: int,
+    label: str,
+) -> None:
+    if interval_sec <= 0:
+        raise ValueError("historical grid interval must be positive")
+    interval_ms = interval_sec * 1000
+    expected = set(range(_ms(start), _ms(end), interval_ms))
+    actual = set(values)
+    if actual != expected:
+        missing = len(expected.difference(actual))
+        unexpected = len(actual.difference(expected))
+        raise ValueError(
+            f"{label} history grid is incomplete: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+
+
 def _url(path: str, parameters: Mapping[str, object]) -> str:
     if path not in ALLOWED_PATHS:
         raise ValueError("Bybit historical API path is not allow-listed")
@@ -372,6 +394,19 @@ def replay_funding_day(
         if timestamp_ms in seen and seen[timestamp_ms] != value:
             raise ValueError("funding history contains conflicting duplicate timestamps")
         seen[timestamp_ms] = value
+    if not seen:
+        raise ValueError("funding history has no settled events for the UTC day")
+    ordered_funding_times = [_from_ms(value) for value in sorted(seen)]
+    funding_gaps = [ordered_funding_times[0] - start]
+    funding_gaps.extend(
+        later - earlier
+        for earlier, later in zip(
+            ordered_funding_times, ordered_funding_times[1:]
+        )
+    )
+    funding_gaps.append(end - ordered_funding_times[-1])
+    if max(funding_gaps) > timedelta(hours=8, seconds=1):
+        raise ValueError("funding history does not continuously cover the UTC day")
     for timestamp_ms, value in sorted(seen.items()):
         event_time = _from_ms(timestamp_ms)
         available_at = event_time + timedelta(seconds=60)
@@ -457,6 +492,13 @@ def replay_open_interest_day(
             if timestamp_ms in values and values[timestamp_ms] != value:
                 raise ValueError("open-interest history contains a conflicting duplicate")
             values[timestamp_ms] = value
+    _require_complete_grid(
+        values,
+        start=start - timedelta(hours=1),
+        end=end,
+        interval_sec=300,
+        label="open-interest",
+    )
     ingested_at = max(
         _utc(datetime.fromisoformat(item.received_at.replace("Z", "+00:00")))
         for item in responses
@@ -576,6 +618,20 @@ def replay_basis_day(
             )
             responses.append(response)
     timestamps = sorted(set(mark).intersection(index))
+    _require_complete_grid(
+        mark,
+        start=start,
+        end=end,
+        interval_sec=60,
+        label="mark-price",
+    )
+    _require_complete_grid(
+        index,
+        start=start,
+        end=end,
+        interval_sec=60,
+        label="index-price",
+    )
     if set(mark) != set(index):
         raise ValueError("mark and index price histories do not have identical timestamps")
     ingested_at = max(

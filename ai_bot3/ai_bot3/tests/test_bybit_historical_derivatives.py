@@ -55,14 +55,17 @@ def _fake_requester(url: str, _timeout_sec: float) -> HTTPPayload:
         event_time = START - timedelta(hours=1)
         while event_time < START + timedelta(days=1):
             if window_start <= event_time <= window_end:
-                hours = int((event_time - (START - timedelta(hours=1))).total_seconds() / 3600)
+                periods = int(
+                    (event_time - (START - timedelta(hours=1))).total_seconds()
+                    / 300
+                )
                 points.append(
                     {
-                        "openInterest": str(1000 + hours * 10),
+                        "openInterest": str(1000 + periods),
                         "timestamp": str(int(event_time.timestamp() * 1000)),
                     }
                 )
-            event_time += timedelta(hours=1)
+            event_time += timedelta(minutes=5)
         result = {"category": "linear", "symbol": SYMBOL, "list": list(reversed(points))}
     elif parsed.path in {
         "/v5/market/mark-price-kline",
@@ -74,15 +77,12 @@ def _fake_requester(url: str, _timeout_sec: float) -> HTTPPayload:
         mark_price = 0.01001
         close = mark_price if "mark-price" in parsed.path else index_price
         points = []
-        for event_time in (
-            START,
-            START + timedelta(minutes=1),
-            START + timedelta(hours=12),
-            START + timedelta(hours=12, minutes=1),
-        ):
+        event_time = window_start
+        while event_time < window_end + timedelta(milliseconds=1):
             if window_start <= event_time <= window_end:
                 stamp = str(int(event_time.timestamp() * 1000))
                 points.append([stamp, str(close), str(close), str(close), str(close)])
+            event_time += timedelta(minutes=1)
         result = {"category": "linear", "symbol": SYMBOL, "list": list(reversed(points))}
     else:  # pragma: no cover - makes unexpected endpoint changes obvious
         raise AssertionError(parsed.path)
@@ -108,8 +108,8 @@ def test_official_derivative_history_is_hashed_and_pit_joinable(tmp_path: Path) 
     )
 
     assert funding.feature_observation_count == 3
-    assert open_interest.feature_observation_count == 24
-    assert basis.feature_observation_count == 4
+    assert open_interest.feature_observation_count == 288
+    assert basis.feature_observation_count == 1440
     assert funding.response_count == 1
     assert open_interest.response_count == 2
     assert basis.response_count == 4
@@ -117,7 +117,7 @@ def test_official_derivative_history_is_hashed_and_pit_joinable(tmp_path: Path) 
     history, evidence = BybitPITFeatureSource(database).load(
         ["funding_rate", "open_interest_change_1h", "perpetual_basis_bps"]
     )
-    assert len(history) == 31
+    assert len(history) == 1731
     assert set(history["source"]) == {
         "bybit.public.funding_history",
         "bybit.public.open_interest_history",
@@ -163,6 +163,46 @@ def test_official_derivative_history_is_hashed_and_pit_joinable(tmp_path: Path) 
     )
     assert pd.isna(joined.loc[0, "perpetual_basis_bps"])
     assert joined.loc[1, "perpetual_basis_bps"] == pytest.approx(10.0)
+
+
+def test_incomplete_basis_grid_fails_atomically(tmp_path: Path) -> None:
+    def incomplete_requester(url: str, timeout_sec: float) -> HTTPPayload:
+        response = _fake_requester(url, timeout_sec)
+        parsed = urlparse(url)
+        if parsed.path not in {
+            "/v5/market/mark-price-kline",
+            "/v5/market/index-price-kline",
+        }:
+            return response
+        payload = json.loads(response.body)
+        payload["result"]["list"] = payload["result"]["list"][1:]
+        return HTTPPayload(
+            body=json.dumps(payload, separators=(",", ":")).encode(),
+            requested_at=response.requested_at,
+            received_at=response.received_at,
+            http_status=response.http_status,
+        )
+
+    database = tmp_path / "incomplete-grid.sqlite3"
+    store = BybitPublicPITStore(database)
+
+    with pytest.raises(ValueError, match="grid is incomplete"):
+        replay_basis_day(
+            store,
+            symbol=SYMBOL,
+            trading_date=DAY,
+            requester=incomplete_requester,
+        )
+    with store.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM bybit_feature_observations"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM bybit_historical_api_batches"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM bybit_historical_api_responses"
+        ).fetchone()[0] == 0
 
 
 def test_historical_api_batch_validation_is_atomic(tmp_path: Path) -> None:
