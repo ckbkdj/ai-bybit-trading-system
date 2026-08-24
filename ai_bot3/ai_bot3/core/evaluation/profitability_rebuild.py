@@ -121,6 +121,7 @@ class ProfitabilityRebuildConfig:
     trad_panel_root: Path | None = None
     verify_trad_panel_sha256: bool = True
     bybit_pit_store_path: Path | None = None
+    lockbox_bybit_pit_store_path: Path | None = None
     macro_pit_store_path: Path | None = None
     verify_macro_raw_hashes: bool = True
     flow_pit_store_path: Path | None = None
@@ -1345,7 +1346,10 @@ class ProfitabilityRebuild:
         bybit_names: tuple[str, ...] = ()
         bybit_pit_evidence: dict[str, object] | None = None
         execution_bar_evidence: dict[str, object] = {}
-        if self.config.bybit_pit_store_path is not None:
+        if (
+            self.config.bybit_pit_store_path is not None
+            or self.config.lockbox_bybit_pit_store_path is not None
+        ):
             bybit_names = tuple(
                 dict.fromkeys(
                     name
@@ -1353,6 +1357,7 @@ class ProfitabilityRebuild:
                     for name in columns
                 )
             )
+        if self.config.bybit_pit_store_path is not None:
             bybit_source = BybitPITFeatureSource(self.config.bybit_pit_store_path)
         lockbox_start_by_horizon: dict[int, datetime] = {}
         for horizon in HORIZONS_SEC:
@@ -1930,29 +1935,95 @@ class ProfitabilityRebuild:
             raise RuntimeError(
                 "kline feature store changed before the lockbox snapshot was opened"
             )
+        lockbox_bybit_source = bybit_source
+        lockbox_bybit_maximum_sequence = self.bybit_pit_snapshot_maximum_sequence
+        lockbox_bybit_snapshot: dict[str, object] = {
+            "policy": "reuse_frozen_development_snapshot",
+            "database": (
+                str(bybit_source.path) if bybit_source is not None else None
+            ),
+            "snapshot_maximum_sequence": lockbox_bybit_maximum_sequence,
+        }
+        if self.config.lockbox_bybit_pit_store_path is not None:
+            # This store is deliberately not instantiated, stat-ed, or queried
+            # until the development profitability gate has passed.  Its frozen
+            # sequence can therefore never influence model/factor selection.
+            lockbox_bybit_source = BybitPITFeatureSource(
+                self.config.lockbox_bybit_pit_store_path
+            )
+            lockbox_bybit_maximum_sequence = (
+                lockbox_bybit_source.maximum_sequence()
+            )
+            lockbox_bybit_snapshot = {
+                "policy": "separate_post_development_snapshot",
+                "database": str(lockbox_bybit_source.path),
+                "snapshot_maximum_sequence": lockbox_bybit_maximum_sequence,
+            }
+        kline_snapshot_sha256 = _sha256_file(self.config.feature_store_path)
+        post_hash_feature_store_stat = self.config.feature_store_path.stat()
+        if (
+            post_hash_feature_store_stat.st_size,
+            post_hash_feature_store_stat.st_mtime_ns,
+        ) != (
+            current_feature_store_stat.st_size,
+            current_feature_store_stat.st_mtime_ns,
+        ):
+            raise RuntimeError(
+                "kline feature store changed while the lockbox snapshot was hashed"
+            )
+        lockbox_source_identity = {
+            "kline_feature_store": {
+                "database": str(self.config.feature_store_path.resolve()),
+                "size_bytes": current_feature_store_stat.st_size,
+                "modified_ns": current_feature_store_stat.st_mtime_ns,
+                "sha256": kline_snapshot_sha256,
+            },
+            "bybit_public_pit": lockbox_bybit_snapshot,
+            "macro_pit_snapshot_maximum_sequence": (
+                self.macro_pit_snapshot_maximum_sequence
+            ),
+            "flow_pit_snapshot_maximum_sequence": (
+                self.flow_pit_snapshot_maximum_sequence
+            ),
+            "lockbox_start_by_horizon": {
+                str(horizon): value.isoformat().replace("+00:00", "Z")
+                for horizon, value in lockbox_start_by_horizon.items()
+            },
+        }
+        lockbox_claim_identity = {
+            "kline_feature_store_sha256": kline_snapshot_sha256,
+            "scope": "all_sealed_lockbox_paths_in_snapshot",
+        }
+        # The claim key identifies the immutable label source, not the trial,
+        # path, boundary choice, or auxiliary features.  Thus copying the same
+        # database, moving the boundary, or changing execution factors cannot
+        # make already-consumed outcomes into a supposedly new lockbox.
+        sealed_lockbox_descriptor = _hash_payload(lockbox_claim_identity)
+        self.ledger.append_event(
+            self.trial_id,
+            "running",
+            {
+                "phase": "lockbox_snapshot_frozen_after_development_pass",
+                "walk_forward_folds": len(walk_forward),
+                "sealed_lockbox_descriptor": sealed_lockbox_descriptor,
+                "lockbox_claim_identity": lockbox_claim_identity,
+                "lockbox_source_identity": lockbox_source_identity,
+            },
+        )
+        self.ledger.claim_lockbox(
+            sealed_lockbox_descriptor, self.trial_id, purpose="final_evaluation"
+        )
         self.ledger.append_event(
             self.trial_id,
             "running",
             {
                 "phase": "open_new_lockbox_after_development_pass",
-                "walk_forward_folds": len(walk_forward),
+                "sealed_lockbox_descriptor": sealed_lockbox_descriptor,
             },
-        )
-        sealed_lockbox_descriptor = _hash_payload(
-            {
-                "trial_id": self.trial_id,
-                "source_evidence": source_evidence,
-                "lockbox_start_by_horizon": {
-                    str(horizon): value.isoformat().replace("+00:00", "Z")
-                    for horizon, value in lockbox_start_by_horizon.items()
-                },
-            }
-        )
-        self.ledger.claim_lockbox(
-            sealed_lockbox_descriptor, self.trial_id, purpose="final_evaluation"
         )
         lockbox_panel_fingerprints: dict[int, str] = {}
         lockbox_signals: list[SignalEvent] = []
+        lockbox_bybit_evidence_by_horizon: dict[int, dict[str, object]] = {}
         for horizon in HORIZONS_SEC:
             lockbox_parts: list[pd.DataFrame] = []
             max_wait_sec = max(30, min(300, horizon // 2))
@@ -1975,20 +2046,25 @@ class ProfitabilityRebuild:
             }
             lockbox_bybit_history: pd.DataFrame | None = None
             lockbox_bybit_evidence: dict[str, object] | None = None
-            if horizon in {180, 900} and bybit_source is not None:
-                lockbox_bybit_history, lockbox_bybit_evidence = bybit_source.load(
-                    bybit_names,
-                    maximum_sequence=self.bybit_pit_snapshot_maximum_sequence,
-                    minimum_decision_at=lockbox_start_by_horizon[horizon],
-                    maximum_decision_at=max(last_complete_by_symbol.values()),
-                    symbols=SYMBOLS,
+            if horizon in {180, 900} and lockbox_bybit_source is not None:
+                lockbox_bybit_history, lockbox_bybit_evidence = (
+                    lockbox_bybit_source.load(
+                        bybit_names,
+                        maximum_sequence=lockbox_bybit_maximum_sequence,
+                        minimum_decision_at=lockbox_start_by_horizon[horizon],
+                        maximum_decision_at=max(last_complete_by_symbol.values()),
+                        symbols=SYMBOLS,
+                    )
+                )
+                lockbox_bybit_evidence_by_horizon[horizon] = (
+                    lockbox_bybit_evidence
                 )
             for symbol in SYMBOLS:
                 enriched, bars = lockbox_history[symbol]
                 if (
                     lockbox_bybit_history is not None
                     and lockbox_bybit_evidence is not None
-                    and bybit_source is not None
+                    and lockbox_bybit_source is not None
                 ):
                     symbol_history = (
                         lockbox_bybit_history[
@@ -2000,7 +2076,7 @@ class ProfitabilityRebuild:
                     )
                     bars, _ = enrich_market_bars_with_bybit_execution_pit(
                         bars,
-                        source=bybit_source,
+                        source=lockbox_bybit_source,
                         history=symbol_history,
                         source_evidence=lockbox_bybit_evidence,
                     )
@@ -2038,10 +2114,10 @@ class ProfitabilityRebuild:
                 )
             if (
                 horizon in {180, 900}
-                and bybit_source is not None
+                and lockbox_bybit_source is not None
                 and lockbox_bybit_history is not None
             ):
-                lockbox_panel = bybit_source.join(
+                lockbox_panel = lockbox_bybit_source.join(
                     lockbox_panel,
                     names=bybit_names,
                     history=lockbox_bybit_history,
@@ -2103,9 +2179,15 @@ class ProfitabilityRebuild:
                 "status": "EVALUATED_ONCE",
                 "lockbox_labels_materialized": True,
                 "sealed_lockbox_descriptor": sealed_lockbox_descriptor,
+                "lockbox_claim_identity": lockbox_claim_identity,
+                "lockbox_source_identity": lockbox_source_identity,
                 "lockbox_fingerprint": lockbox_fingerprint,
                 "used_for_parameter_selection": False,
                 "source_evidence": source_evidence,
+                "lockbox_bybit_source_evidence": {
+                    str(horizon): evidence
+                    for horizon, evidence in lockbox_bybit_evidence_by_horizon.items()
+                },
                 "final_development_selection": final_selection,
                 "result": lockbox_report.to_dict(include_trades=True),
             },

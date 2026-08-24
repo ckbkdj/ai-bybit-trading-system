@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT))
 
 from core.evaluation.profitability_rebuild import (
     MINIMUM_COVERAGE_DAYS,
+    ProfitabilityRebuild,
     ProfitabilityRebuildConfig,
     _engineer_features,
     _market_bars,
@@ -47,6 +48,35 @@ def test_short_horizon_coverage_cannot_silently_collapse_to_six_or_31_days(tmp_p
         code_commit="1" * 40,
     )
     assert config.max_bars_per_symbol >= 175_200
+
+
+def test_separate_lockbox_bybit_store_is_not_opened_during_initialization(tmp_path):
+    feature_store = tmp_path / "features.sqlite3"
+    feature_store.touch()
+    sealed_store = tmp_path / "must-not-be-read-before-development-passes.sqlite3"
+    config = ProfitabilityRebuildConfig(
+        feature_store_path=feature_store,
+        output_dir=tmp_path / "reports",
+        trial_ledger_path=tmp_path / "trials.sqlite3",
+        model_output_dir=tmp_path / "models",
+        code_commit="1" * 40,
+        lockbox_bybit_pit_store_path=sealed_store,
+    )
+
+    # Construction freezes development sources only.  A missing final store
+    # must not be observed until run() has independently passed development.
+    runner = ProfitabilityRebuild(config)
+    assert runner.config.lockbox_bybit_pit_store_path == sealed_store
+
+    alternate = ProfitabilityRebuildConfig(
+        feature_store_path=feature_store,
+        output_dir=tmp_path / "reports",
+        trial_ledger_path=tmp_path / "trials.sqlite3",
+        model_output_dir=tmp_path / "models",
+        code_commit="1" * 40,
+        lockbox_bybit_pit_store_path=tmp_path / "another-sealed-store.sqlite3",
+    )
+    assert ProfitabilityRebuild(alternate).trial_id == runner.trial_id
 
 
 def test_label_decisions_do_not_treat_overlapping_execution_windows_as_independent():

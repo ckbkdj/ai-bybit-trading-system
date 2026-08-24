@@ -221,6 +221,8 @@ def test_lockbox_cannot_be_reused_by_another_trial(tmp_path):
     assert ledger.claim_lockbox(fingerprint, "trial-one") is False
     with pytest.raises(ValueError, match="already consumed"):
         ledger.claim_lockbox(fingerprint, "trial-two")
+    with pytest.raises(ValueError, match="trial already claimed"):
+        ledger.claim_lockbox("c" * 64, "trial-one")
     assert ledger.lockbox_claim_count() == 1
 
 

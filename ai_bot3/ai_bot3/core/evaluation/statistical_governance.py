@@ -136,6 +136,8 @@ class TrialLedger:
                     purpose TEXT NOT NULL,
                     recorded_at TEXT NOT NULL
                 );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_lockbox_trial_once
+                    ON lockbox_evaluations(trial_id);
                 """
             )
 
@@ -241,6 +243,14 @@ class TrialLedger:
                         return False
                     raise ValueError(
                         "lockbox was already consumed; repeated OOS tuning/evaluation is forbidden"
+                    )
+                prior_trial_claim = connection.execute(
+                    "SELECT lockbox_fingerprint,purpose FROM lockbox_evaluations WHERE trial_id=?",
+                    (trial_id,),
+                ).fetchone()
+                if prior_trial_claim:
+                    raise ValueError(
+                        "trial already claimed a different lockbox; repeated final evaluation is forbidden"
                     )
                 connection.execute(
                     "INSERT INTO lockbox_evaluations(lockbox_fingerprint,trial_id,purpose,recorded_at) VALUES(?,?,?,?)",
