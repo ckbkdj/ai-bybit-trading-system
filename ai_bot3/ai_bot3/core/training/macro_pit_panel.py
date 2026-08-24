@@ -118,8 +118,13 @@ class MacroPITFeatureSource:
         return digest.hexdigest()
 
     def _fred_response_evidence(
-        self, *, received_at_maximum: str
+        self,
+        *,
+        received_at_maximum: str,
+        required_series_ids: set[str],
     ) -> list[dict[str, object]]:
+        if not required_series_ids:
+            raise RuntimeError("macro PIT observations have no FRED series identity")
         with closing(self._connect()) as connection:
             table = connection.execute(
                 """SELECT 1 FROM sqlite_master
@@ -127,14 +132,16 @@ class MacroPITFeatureSource:
             ).fetchone()
             if not table:
                 raise RuntimeError("macro PIT database has no response evidence")
+            placeholders = ",".join("?" for _ in required_series_ids)
             rows = connection.execute(
-                """SELECT response_id,series_id,output_type,request_descriptor,
+                f"""SELECT response_id,series_id,output_type,request_descriptor,
                           requested_at,received_at,http_status,content_length,
                           content_sha256,row_count,raw_response_path
                      FROM fred_alfred_responses
-                    WHERE received_at<=?
+                    WHERE series_id IN ({placeholders})
+                      AND julianday(received_at)<=julianday(?)
                     ORDER BY series_id,output_type,response_id""",
-                (received_at_maximum,),
+                tuple(sorted(required_series_ids)) + (received_at_maximum,),
             ).fetchall()
         evidence = [dict(row) for row in rows]
         if not evidence:
@@ -178,7 +185,8 @@ class MacroPITFeatureSource:
                             requested_at,received_at,http_status,content_length,
                             content_sha256,row_count,raw_response_path
                        FROM official_macro_responses
-                      WHERE source IN ({placeholders}) AND received_at<=?
+                      WHERE source IN ({placeholders})
+                        AND julianday(received_at)<=julianday(?)
                       ORDER BY source,document_kind,response_id""",
                 tuple(sorted(required_sources)) + (received_at_maximum,),
             ).fetchall()
@@ -209,11 +217,15 @@ class MacroPITFeatureSource:
         *,
         received_at_maximum: str,
         observed_sources: set[str],
+        observed_series_ids: set[str],
     ) -> list[dict[str, object]]:
         evidence: list[dict[str, object]] = []
         if any(source.startswith("fred.alfred.") for source in observed_sources):
             evidence.extend(
-                self._fred_response_evidence(received_at_maximum=received_at_maximum)
+                self._fred_response_evidence(
+                    received_at_maximum=received_at_maximum,
+                    required_series_ids=observed_series_ids,
+                )
             )
         official_sources = {
             source
@@ -274,14 +286,24 @@ class MacroPITFeatureSource:
                 "response_count": 0,
                 "raw_response_hashes_verified": self.verify_raw_hashes,
             }
-        received_at_maximum = str(frame["ingested_at"].max())
-        observed_sources = set(frame["source"].astype(str))
         for column in ("event_time", "available_at", "ingested_at"):
             frame[column] = pd.to_datetime(
                 frame[column], utc=True, errors="coerce", format="mixed"
             )
         if frame[["event_time", "available_at", "ingested_at"]].isna().any().any():
             raise RuntimeError("macro PIT feature timestamps are invalid")
+        received_at_maximum = (
+            pd.Timestamp(frame["ingested_at"].max())
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        observed_sources = set(frame["source"].astype(str))
+        observed_series_ids = {
+            str(value) for value in frame["series_id"].dropna().astype(str)
+        }
+        if "TIER_A" in observed_series_ids:
+            observed_series_ids.remove("TIER_A")
+            observed_series_ids.update(("CPIAUCSL", "PAYEMS"))
         chronology = ~(
             (frame["event_time"] <= frame["available_at"])
             & (frame["available_at"] <= frame["ingested_at"])
@@ -294,6 +316,7 @@ class MacroPITFeatureSource:
         responses = self._response_evidence(
             received_at_maximum=received_at_maximum,
             observed_sources=observed_sources,
+            observed_series_ids=observed_series_ids,
         )
         for name, group in frame.groupby("name", sort=True):
             contract = MACRO_FEATURE_CONTRACTS[str(name)]

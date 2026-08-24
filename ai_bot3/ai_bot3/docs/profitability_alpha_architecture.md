@@ -157,7 +157,7 @@ loader 会重新核对 capture audit 的 deterministic ID、manifest SHA 格式�
 
 FOMC 采集不能用会议日历日期猜测 14:00，也不能把 minutes、implementation note 或未来会议计划当成已发布声明。2018–2026-06-18 的实际研究仓证据为 70 份声明、79 份官方响应、140 个状态切换，时间顺序违规为 0。
 
-所有宏观响应都保存原始内容 SHA-256；API key 不写入 URL descriptor、数据库、报告或异常。
+所有宏观响应都保存原始内容 SHA-256；API key 不写入 URL descriptor、数据库、报告或异常。训练读取时先把 observation 时间统一解析为 UTC，再用 SQLite `julianday` 比较响应收据，禁止依赖混合 ISO 字符串的字典序；FRED/ALFRED 收据还必须限定在当前观察实际引用的官方 series，其他官方序列不能替它背书。
 
 ### 5.5 Flow
 

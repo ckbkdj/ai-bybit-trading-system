@@ -86,6 +86,61 @@ def test_macro_snapshot_hash_provenance_and_asof_staleness(tmp_path: Path):
     database = tmp_path / "macro.sqlite3"
     raw = tmp_path / "response.json"
     _insert_response_and_vix(database, raw)
+    store = FredAlfredPITStore(database)
+    before_body = b'{"observations":["before"]}'
+    before_raw = tmp_path / "before-offset.json"
+    before_raw.write_bytes(before_body)
+    after_body = b'{"observations":["after"]}'
+    after_raw = tmp_path / "after-offset.json"
+    after_raw.write_bytes(after_body)
+    unrelated_body = b'{"observations":["unrelated"]}'
+    unrelated_raw = tmp_path / "unrelated.json"
+    unrelated_raw.write_bytes(unrelated_body)
+    with store.connect() as connection:
+        for response_id, series_id, received_at, body, path in (
+            (
+                "response-before-offset",
+                "VIXCLS",
+                "2026-01-03T01:00:00+02:00",
+                before_body,
+                before_raw,
+            ),
+            (
+                "response-after-offset",
+                "VIXCLS",
+                "2026-01-02T23:30:00-02:00",
+                after_body,
+                after_raw,
+            ),
+            (
+                "response-unrelated",
+                "UNRELATED",
+                "2026-01-02T00:00:00Z",
+                unrelated_body,
+                unrelated_raw,
+            ),
+        ):
+            connection.execute(
+                """INSERT INTO fred_alfred_responses(
+                       response_id,series_id,output_type,request_descriptor,
+                       requested_at,received_at,http_status,content_length,
+                       content_sha256,row_count,raw_response_path
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    response_id,
+                    series_id,
+                    4,
+                    json.dumps({"series_id": series_id, "response": response_id}),
+                    "2026-01-02T00:00:00Z",
+                    received_at,
+                    200,
+                    len(body),
+                    hashlib.sha256(body).hexdigest(),
+                    1,
+                    str(path.resolve()),
+                ),
+            )
+        connection.commit()
     source = MacroPITFeatureSource(database)
     frozen_sequence = source.maximum_sequence()
     history, evidence = source.load(
@@ -93,7 +148,10 @@ def test_macro_snapshot_hash_provenance_and_asof_staleness(tmp_path: Path):
     )
 
     assert len(history) == 2
-    assert evidence["response_count"] == 1
+    # The +02:00 receipt is chronologically before the snapshot and included;
+    # the lexically earlier -02:00 receipt is actually after it and excluded.
+    # An unrelated official series cannot launder observation provenance.
+    assert evidence["response_count"] == 2
     assert evidence["raw_response_hashes_verified"] is True
     assert len(evidence["snapshot_sha256"]) == 64
     decisions = pd.DataFrame(
