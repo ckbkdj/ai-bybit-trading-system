@@ -568,6 +568,20 @@ def merge_audited_liquidation_capture(
             ).fetchall()
         else:
             queries["invalidations"] = []
+        topic_counts = json.loads(str(audit["topic_counts_json"]))
+        liquidation_raw_count = sum(
+            int(count)
+            for topic, count in topic_counts.items()
+            if str(topic).startswith("allLiquidation.")
+        )
+        if len(queries["raw_events"]) != liquidation_raw_count:
+            raise CaptureConflict(
+                "sealed audit liquidation raw count does not match the snapshot"
+            )
+        if len(queries["features"]) != int(audit["liquidation_feature_count"]):
+            raise CaptureConflict(
+                "sealed audit liquidation feature count does not match the snapshot"
+            )
 
     table_specs = (
         ("sessions", "bybit_capture_sessions", "session_id", session_columns),

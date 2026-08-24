@@ -218,6 +218,8 @@ python scripts/merge_bybit_liquidation_capture.py `
 
 启动 profitability trial 时记录的 Bybit 快照必须同时包含 feature sequence、invalidation rowid、capture audit rowid 和 import receipt rowid。实验启动后新增的 audit/import 不得进入该 trial；需要使用新证据时必须形成新 trial ID。不要手工 UPDATE/DELETE raw、feature、invalidation、completed archive/API batch、API response、audit、interval 或 import 表；数据库 trigger 会失败关闭。
 
+研究 loader 还会复算 audit/import 的 deterministic ID，并核对 interval、boundary、longest duration、topic/event/raw 计数及 selection/count contract。若 development 仓已含 historical archive 或 API batch，liquidation 的 qualifying audit 必须由该仓中的 import receipt 引用；只复制 audit 表或 JSON 报告不会通过。
+
 ## 7. SQLite WAL 安全恢复
 
 ### 7.1 何时处理

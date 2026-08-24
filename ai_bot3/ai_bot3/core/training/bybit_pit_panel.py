@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -80,6 +81,43 @@ def _liquidation_observation_id(raw_event_id: str, symbol: str) -> str:
         f"{event_id}|{symbol}|liquidation_imbalance_5m".encode()
     ).hexdigest()[:48]
     return f"bp_{token}"
+
+
+def _is_sha256(value: object) -> bool:
+    text = str(value)
+    return len(text) == 64 and all(character in "0123456789abcdef" for character in text)
+
+
+def _expected_capture_audit_id(record: Mapping[str, object]) -> str:
+    payload = {
+        "maximum_gap_sec": float(record["maximum_gap_sec"]),
+        "maximum_raw": int(record["snapshot_maximum_raw_sequence"]),
+        "maximum_feature": int(record["snapshot_maximum_feature_sequence"]),
+        "maximum_invalidation": int(
+            record["snapshot_maximum_invalidation_rowid"]
+        ),
+        "manifest_sha256": str(record["manifest_sha256"]),
+    }
+    token = hashlib.sha256(
+        json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+    ).hexdigest()[:48]
+    return f"bca_{token}"
+
+
+def _expected_pit_import_id(record: Mapping[str, object]) -> str:
+    payload = {
+        "source_audit_id": str(record["source_audit_id"]),
+        "manifest_sha256": str(record["manifest_sha256"]),
+        "selection": dict(record["selection"]),
+    }
+    token = hashlib.sha256(
+        json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+    ).hexdigest()[:48]
+    return f"bpi_{token}"
 
 
 class BybitPITFeatureSource:
@@ -673,8 +711,7 @@ class BybitPITFeatureSource:
                               manifest_sha256,status,error
                          FROM bybit_live_capture_audits
                         WHERE status='completed' AND rowid<=?
-                        ORDER BY created_at,audit_id"""
-                    ,
+                        ORDER BY created_at,audit_id""",
                     (frozen_capture_audit_rowid,),
                 ).fetchall()
                 for audit_row in audit_rows:
@@ -688,18 +725,116 @@ class BybitPITFeatureSource:
                     if len(interval_rows) != int(record["interval_count"]):
                         raise RuntimeError("live capture audit interval count mismatch")
                     intervals = [dict(row) for row in interval_rows]
-                    if any(
-                        pd.Timestamp(item["started_at"]) > pd.Timestamp(item["ended_at"])
+                    if not intervals or [
+                        int(item["interval_index"]) for item in intervals
+                    ] != list(range(len(intervals))):
+                        raise RuntimeError("live capture audit interval indices are invalid")
+                    interval_bounds = [
+                        (
+                            pd.Timestamp(item["started_at"]),
+                            pd.Timestamp(item["ended_at"]),
+                        )
                         for item in intervals
-                    ):
+                    ]
+                    if any(start > end for start, end in interval_bounds):
                         raise RuntimeError("live capture audit interval chronology failed")
                     record["symbols"] = json.loads(str(record.pop("symbols_json")))
+                    if (
+                        not isinstance(record["symbols"], list)
+                        or not record["symbols"]
+                        or any(
+                            not str(symbol).strip()
+                            or str(symbol).upper() != str(symbol)
+                            for symbol in record["symbols"]
+                        )
+                        or len(set(record["symbols"])) != len(record["symbols"])
+                    ):
+                        raise RuntimeError("live capture audit symbols are invalid")
                     record["topic_counts"] = json.loads(
                         str(record.pop("topic_counts_json"))
                     )
                     record["event_type_counts"] = json.loads(
                         str(record.pop("event_type_counts_json"))
                     )
+                    if not isinstance(record["topic_counts"], dict) or not isinstance(
+                        record["event_type_counts"], dict
+                    ):
+                        raise RuntimeError("live capture audit count maps are invalid")
+                    raw_event_count = int(record["raw_event_count"])
+                    interval_event_count = sum(
+                        int(item["raw_event_count"]) for item in intervals
+                    )
+                    topic_count = sum(
+                        int(value)
+                        for value in dict(record["topic_counts"]).values()
+                    )
+                    event_type_count = sum(
+                        int(value)
+                        for value in dict(record["event_type_counts"]).values()
+                    )
+                    if (
+                        raw_event_count <= 0
+                        or interval_event_count != raw_event_count
+                        or topic_count != raw_event_count
+                        or event_type_count != raw_event_count
+                    ):
+                        raise RuntimeError("live capture audit event counts do not reconcile")
+                    if any(
+                        int(value) < 0
+                        for counts in (
+                            record["topic_counts"],
+                            record["event_type_counts"],
+                        )
+                        for value in dict(counts).values()
+                    ):
+                        raise RuntimeError("live capture audit contains a negative count")
+                    maximum_gap_sec = float(record["maximum_gap_sec"])
+                    if not 0 < maximum_gap_sec <= 300:
+                        raise RuntimeError("live capture audit gap contract is invalid")
+                    if any(
+                        (following[0] - prior[1]).total_seconds()
+                        <= maximum_gap_sec
+                        for prior, following in zip(
+                            interval_bounds, interval_bounds[1:]
+                        )
+                    ):
+                        raise RuntimeError("live capture audit intervals were split incorrectly")
+                    longest_interval_sec = max(
+                        (end - start).total_seconds()
+                        for start, end in interval_bounds
+                    )
+                    if not math.isclose(
+                        longest_interval_sec,
+                        float(record["longest_interval_sec"]),
+                        rel_tol=0.0,
+                        abs_tol=1e-6,
+                    ):
+                        raise RuntimeError("live capture audit longest interval mismatch")
+                    if (
+                        str(record["first_received_at"])
+                        != str(intervals[0]["started_at"])
+                        or str(record["last_received_at"])
+                        != str(intervals[-1]["ended_at"])
+                    ):
+                        raise RuntimeError("live capture audit boundary mismatch")
+                    if (
+                        not _is_sha256(record["manifest_sha256"])
+                        or str(record["audit_id"])
+                        != _expected_capture_audit_id(record)
+                    ):
+                        raise RuntimeError("live capture audit identity is invalid")
+                    liquidation_feature_count = int(
+                        record["liquidation_feature_count"]
+                    )
+                    liquidation_raw_count = sum(
+                        int(count)
+                        for topic, count in dict(record["topic_counts"]).items()
+                        if str(topic).startswith("allLiquidation.")
+                    )
+                    if not 0 <= liquidation_feature_count <= liquidation_raw_count:
+                        raise RuntimeError(
+                            "live capture audit liquidation counts are invalid"
+                        )
                     record["intervals"] = intervals
                     live_capture_audits.append(record)
             import_table = connection.execute(
@@ -713,13 +848,40 @@ class BybitPITFeatureSource:
                               manifest_sha256,status
                          FROM bybit_pit_imports
                         WHERE status='completed' AND rowid<=?
-                         ORDER BY imported_at,import_id"""
-                    ,
+                         ORDER BY imported_at,import_id""",
                     (frozen_pit_import_rowid,),
                 ).fetchall():
                     record = dict(import_row)
                     for key in ("selection", "source_counts", "inserted_counts"):
                         record[key] = json.loads(str(record.pop(f"{key}_json")))
+                    if (
+                        not _is_sha256(record["manifest_sha256"])
+                        or str(record["import_id"]) != _expected_pit_import_id(record)
+                    ):
+                        raise RuntimeError("Bybit PIT import identity is invalid")
+                    if str(record["source_audit_id"]) not in {
+                        str(item["audit_id"]) for item in live_capture_audits
+                    }:
+                        raise RuntimeError("Bybit PIT import references an unavailable audit")
+                    selection = dict(record["selection"])
+                    if (
+                        selection.get("event_type") != "liquidation"
+                        or selection.get("feature") != "liquidation_imbalance_5m"
+                    ):
+                        raise RuntimeError("Bybit PIT import selection contract is invalid")
+                    source_counts = {
+                        str(key): int(value)
+                        for key, value in dict(record["source_counts"]).items()
+                    }
+                    inserted_counts = {
+                        str(key): int(value)
+                        for key, value in dict(record["inserted_counts"]).items()
+                    }
+                    if any(value < 0 for value in source_counts.values()) or any(
+                        value < 0 or value > source_counts.get(key, -1)
+                        for key, value in inserted_counts.items()
+                    ):
+                        raise RuntimeError("Bybit PIT import counts are invalid")
                     pit_imports.append(record)
         coverage: dict[str, object] = {}
         for (symbol, name), group in frame.groupby(["symbol", "name"], sort=True):

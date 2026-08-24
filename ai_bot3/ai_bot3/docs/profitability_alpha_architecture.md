@@ -118,6 +118,8 @@ capture audit 同时验证官方 public-linear endpoint、sealed session、订�
 
 Bybit trial 除冻结 feature sequence 和 invalidation rowid，还冻结 capture-audit/import receipt rowid，并把四个水位共同写入 trial identity 与 snapshot SHA。raw/features/invalidations/API responses/audits/intervals/imports 在 SQLite trigger 层禁止更新删除；archive/API batch 从 `completed` 起不可修改。失败批次仍可原子重试为 completed，但完成证据不能被后来失败或相同 ID 的另一内容覆盖。
 
+loader 会重新核对 capture audit 的 deterministic ID、manifest SHA 格式、连续 interval 索引/边界/最长时长、raw/topic/event-type/interval 计数守恒和 liquidation raw/feature 数量；import receipt 也要有 deterministic ID、合法 selection、非负计数并引用当前冻结 audit。只要研究库同时含历史 archive/API，liquidation audit 必须有对应 import receipt，手工复制 audit 行不能解锁消融。
+
 ### 5.3 中长周期跨资产
 
 参考服务仅接纳 canonical panel 中显式白名单的基础价格。接入时同时核验最近一次 PASS 收据的 `canonical_sha_before`/`canonical_sha_after`、baseline/canonical 文件哈希，并逐行证明允许标的只追加新日期、没有改写或回填旧价格：

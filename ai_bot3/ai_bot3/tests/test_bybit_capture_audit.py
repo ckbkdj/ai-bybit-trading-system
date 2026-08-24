@@ -332,6 +332,24 @@ def test_audited_liquidations_merge_append_only_and_unlock_continuity(tmp_path):
     assert report["live_capture_continuity_complete"] is True
     assert report["qualifying_live_capture_audit_ids"] == [audit.audit_id]
 
+    missing_import = deepcopy(evidence)
+    missing_import["historical_archive_file_count"] = 1
+    missing_import["pit_imports"] = []
+    unreceipted = _evaluate_bybit_pit_ablation(
+        {},
+        {},
+        None,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        missing_import,
+        factor_groups={"liquidations": ("liquidation_imbalance_5m",)},
+        minimum_history_days=0.99,
+    )["liquidations"]
+    assert unreceipted["oos_ablation_status"] == (
+        "COLLECTING_INSUFFICIENT_PIT_HISTORY"
+    )
+    assert unreceipted["historical_store_requires_import_receipt"] is True
+    assert unreceipted["live_capture_continuity_complete"] is False
+
     nonoverlapping = deepcopy(evidence)
     for item in nonoverlapping["feature_coverage"].values():
         item["start"] = "2027-01-01T00:00:00Z"
@@ -347,6 +365,39 @@ def test_audited_liquidations_merge_append_only_and_unlock_continuity(tmp_path):
     )["liquidations"]
     assert rejected["oos_ablation_status"] == "COLLECTING_INSUFFICIENT_PIT_HISTORY"
     assert rejected["live_capture_continuity_complete"] is False
+
+    destination_store = BybitPublicPITStore(destination_path)
+    forged_audit_id = "bca_" + ("0" * 48)
+    with destination_store.connect() as connection:
+        connection.execute(
+            """INSERT INTO bybit_live_capture_audits(
+                   audit_id,created_at,snapshot_maximum_raw_sequence,
+                   snapshot_maximum_feature_sequence,snapshot_maximum_invalidation_rowid,
+                   first_received_at,last_received_at,maximum_gap_sec,raw_event_count,
+                   liquidation_feature_count,symbols_json,topic_counts_json,
+                   event_type_counts_json,interval_count,longest_interval_sec,
+                   manifest_sha256,status,error
+               )
+               SELECT ?,created_at,snapshot_maximum_raw_sequence,
+                      snapshot_maximum_feature_sequence,
+                      snapshot_maximum_invalidation_rowid,first_received_at,
+                      last_received_at,maximum_gap_sec,raw_event_count,
+                      liquidation_feature_count,symbols_json,topic_counts_json,
+                      event_type_counts_json,0,longest_interval_sec,
+                      manifest_sha256,status,error
+                 FROM bybit_live_capture_audits ORDER BY rowid LIMIT 1""",
+            (forged_audit_id,),
+        )
+        connection.commit()
+    destination_store.close()
+    try:
+        BybitPITFeatureSource(destination_path).load(
+            ["liquidation_imbalance_5m"], symbols=SYMBOLS
+        )
+    except RuntimeError as exc:
+        assert "interval indices" in str(exc)
+    else:
+        raise AssertionError("training accepted a forged capture audit receipt")
 
 
 def test_first_to_last_span_without_daily_or_capture_receipts_stays_collecting():

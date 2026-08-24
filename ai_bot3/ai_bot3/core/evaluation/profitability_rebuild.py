@@ -1563,6 +1563,15 @@ def _evaluate_bybit_pit_ablation(
     results: dict[str, dict[str, object]] = {}
     coverage = dict(source_evidence.get("feature_coverage") or {})
     live_capture_audits = list(source_evidence.get("live_capture_audits") or [])
+    historical_store_requires_import_receipt = bool(
+        int(source_evidence.get("historical_archive_file_count", 0)) > 0
+        or int(source_evidence.get("historical_api_batch_count", 0)) > 0
+    )
+    imported_audit_ids = {
+        str(item.get("source_audit_id"))
+        for item in list(source_evidence.get("pit_imports") or [])
+        if isinstance(item, Mapping)
+    }
     for group, columns in factor_groups.items():
         collection_evidence = dict(
             SHORT_FACTOR_COLLECTION_EVIDENCE.get(group) or {}
@@ -1644,6 +1653,10 @@ def _evaluate_bybit_pit_ablation(
                 and topic_contracts_complete
                 and audited_feature_overlap_complete
                 and (
+                    not historical_store_requires_import_receipt
+                    or str(audit.get("audit_id")) in imported_audit_ids
+                )
+                and (
                     group != "liquidations"
                     or int(audit.get("liquidation_feature_count", 0)) > 0
                 )
@@ -1699,6 +1712,10 @@ def _evaluate_bybit_pit_ablation(
                     str(item["audit_id"]) for item in qualifying_live_audits
                 ],
                 "required_live_topic_prefixes": list(required_topic_prefixes),
+                "historical_store_requires_import_receipt": (
+                    historical_store_requires_import_receipt
+                ),
+                "imported_audit_ids": sorted(imported_audit_ids),
                 "missing_symbol_feature_contracts": missing_contracts,
                 "collection_evidence": collection_evidence,
             }
@@ -1853,6 +1870,10 @@ def _evaluate_bybit_pit_ablation(
                 "qualifying_live_capture_audit_ids": [
                     str(item["audit_id"]) for item in qualifying_live_audits
                 ],
+                "historical_store_requires_import_receipt": (
+                    historical_store_requires_import_receipt
+                ),
+                "imported_audit_ids": sorted(imported_audit_ids),
                 "collection_evidence": collection_evidence,
                 "folds": fold_evidence,
             }
@@ -1880,6 +1901,10 @@ def _evaluate_bybit_pit_ablation(
                 "qualifying_live_capture_audit_ids": [
                     str(item["audit_id"]) for item in qualifying_live_audits
                 ],
+                "historical_store_requires_import_receipt": (
+                    historical_store_requires_import_receipt
+                ),
+                "imported_audit_ids": sorted(imported_audit_ids),
             },
         )
         if insufficient_execution is not None:
@@ -1914,6 +1939,10 @@ def _evaluate_bybit_pit_ablation(
             "qualifying_live_capture_audit_ids": [
                 str(item["audit_id"]) for item in qualifying_live_audits
             ],
+            "historical_store_requires_import_receipt": (
+                historical_store_requires_import_receipt
+            ),
+            "imported_audit_ids": sorted(imported_audit_ids),
             "pit_observation_count": sum(
                 int(item.get("test_rows", 0)) for item in fold_evidence
             ),
