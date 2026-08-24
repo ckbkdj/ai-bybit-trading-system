@@ -124,5 +124,6 @@ def default_registry() -> FactorRegistry:
             FactorDefinition("healthcare_defensive_score", "sector.healthcare.v1", "score", "inferred_rotation_proxy", 86400, 0.7),
             FactorDefinition("major_news_impact", "news.event_impact.v1", "score", "inferred_rotation_proxy", 21600, 0.8),
             FactorDefinition("tier_a_event_state", "news.event_impact.v1", "binary_24h_post_release_window", "direct_observation", 3888000, 0.9),
+            FactorDefinition("fomc_statement_event_state", "news.event_impact.v1", "binary_24h_post_release_window", "direct_observation", 6048000, 1.0),
         ]
     )

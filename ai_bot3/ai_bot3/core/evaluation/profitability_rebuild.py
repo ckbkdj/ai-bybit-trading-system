@@ -100,7 +100,10 @@ LONG_FACTOR_GROUPS: Mapping[str, tuple[str, ...]] = {
         "alfred_cpi_mean_revision_delta",
         "alfred_payrolls_mean_revision_delta",
     ),
-    "tier_a_events": ("tier_a_event_state",),
+    "tier_a_events": (
+        "tier_a_event_state",
+        "fomc_statement_event_state",
+    ),
 }
 MINIMUM_ABLATION_OOS_TRADES = 30
 MINIMUM_ABLATION_TRADED_FOLDS = 2

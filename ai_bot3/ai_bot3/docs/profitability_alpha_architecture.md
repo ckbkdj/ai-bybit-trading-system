@@ -22,6 +22,7 @@ flowchart TD
     C[Bybit 公共 WS / 官方 archive / 官方 REST] --> D[Bybit PIT SQLite<br/>event / available / ingested / hash]
     E[参考 data_service canonical panel<br/>PASS SHA + 显式资产白名单 + 30h lag] --> F[跨资产 PIT returns]
     G[FRED / ALFRED 官方 API<br/>output 4 初值 + output 3 修订] --> H[宏观 vintage PIT SQLite<br/>原始响应哈希]
+    AE[美联储 FOMC 官方新闻索引 + 声明正文<br/>页面明确发布时间] --> H
     AC[Coin Metrics Community API<br/>USDC + USDT SplyCur] --> AD[稳定币发行 flow PIT SQLite<br/>48h lag + 原始响应哈希]
 
     B --> I[Triple Barrier 全持仓路径标签]
@@ -125,6 +126,9 @@ flowchart TD
 | 失业率初值 | UNRATE / output 4 | first release |
 | CPI/非农修订 | CPIAUCSL、PAYEMS / output 3 | 按 vintage 的实际修订 delta |
 | Tier-A 状态 | CPI/非农 release vintage | 发布后 24 小时为 1，随后显式复位为 0 |
+| FOMC 声明状态 | 美联储官方 FOMC 新闻索引和声明正文 | 只在页面明确标注的 release time 后变为 1，24 小时后复位；包含 2020 年紧急声明 |
+
+FOMC 采集不能用会议日历日期猜测 14:00，也不能把 minutes、implementation note 或未来会议计划当成已发布声明。2018–2026-06-18 的实际研究仓证据为 70 份声明、79 份官方响应、140 个状态切换，时间顺序违规为 0。
 
 所有宏观响应都保存原始内容 SHA-256；API key 不写入 URL descriptor、数据库、报告或异常。
 

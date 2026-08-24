@@ -45,6 +45,11 @@ MACRO_FEATURE_CONTRACTS: Mapping[str, MacroFeatureContract] = {
         ("fred.alfred.release_vintage",),
         45 * 86_400,
     ),
+    "fomc_statement_event_state": MacroFeatureContract(
+        "binary_24h_post_release_window",
+        ("federal_reserve.fomc_statement",),
+        70 * 86_400,
+    ),
 }
 
 
@@ -57,7 +62,7 @@ def _sha256(path: Path) -> str:
 
 
 class MacroPITFeatureSource:
-    """Read frozen global FRED/ALFRED observations using strict as-of joins."""
+    """Read frozen official macro observations using strict as-of joins."""
 
     def __init__(self, path: Path, *, verify_raw_hashes: bool = True) -> None:
         self.path = Path(path).expanduser().resolve()
@@ -112,7 +117,7 @@ class MacroPITFeatureSource:
         )
         return digest.hexdigest()
 
-    def _response_evidence(
+    def _fred_response_evidence(
         self, *, received_at_maximum: str
     ) -> list[dict[str, object]]:
         with closing(self._connect()) as connection:
@@ -150,6 +155,80 @@ class MacroPITFeatureSource:
                 raise RuntimeError("macro raw response length does not match evidence")
             if self.verify_raw_hashes and _sha256(raw_path) != digest:
                 raise RuntimeError("macro raw response hash does not match evidence")
+        for item in evidence:
+            item["source_system"] = "fred_alfred"
+        return evidence
+
+    def _official_response_evidence(
+        self,
+        *,
+        received_at_maximum: str,
+        required_sources: set[str],
+    ) -> list[dict[str, object]]:
+        with closing(self._connect()) as connection:
+            table = connection.execute(
+                """SELECT 1 FROM sqlite_master
+                     WHERE type='table' AND name='official_macro_responses'"""
+            ).fetchone()
+            if not table:
+                raise RuntimeError("macro PIT database has no official response evidence")
+            placeholders = ",".join("?" for _ in required_sources)
+            rows = connection.execute(
+                f"""SELECT response_id,source,document_kind,request_url,
+                            requested_at,received_at,http_status,content_length,
+                            content_sha256,row_count,raw_response_path
+                       FROM official_macro_responses
+                      WHERE source IN ({placeholders}) AND received_at<=?
+                      ORDER BY source,document_kind,response_id""",
+                tuple(sorted(required_sources)) + (received_at_maximum,),
+            ).fetchall()
+        evidence = [dict(row) for row in rows]
+        if not evidence:
+            raise RuntimeError("macro PIT database has no matching official responses")
+        for item in evidence:
+            if int(item["http_status"]) != 200:
+                raise RuntimeError("official macro evidence contains a failed request")
+            url = str(item["request_url"])
+            if not url.startswith("https://www.federalreserve.gov/"):
+                raise RuntimeError("official macro evidence has an unapproved origin")
+            digest = str(item["content_sha256"])
+            if len(digest) != 64:
+                raise RuntimeError("official macro evidence has an invalid content hash")
+            raw_path = Path(str(item["raw_response_path"]))
+            if not raw_path.is_file():
+                raise RuntimeError("official macro raw response evidence is missing")
+            if raw_path.stat().st_size != int(item["content_length"]):
+                raise RuntimeError("official macro raw response length does not match evidence")
+            if self.verify_raw_hashes and _sha256(raw_path) != digest:
+                raise RuntimeError("official macro raw response hash does not match evidence")
+            item["source_system"] = "official_macro"
+        return evidence
+
+    def _response_evidence(
+        self,
+        *,
+        received_at_maximum: str,
+        observed_sources: set[str],
+    ) -> list[dict[str, object]]:
+        evidence: list[dict[str, object]] = []
+        if any(source.startswith("fred.alfred.") for source in observed_sources):
+            evidence.extend(
+                self._fred_response_evidence(received_at_maximum=received_at_maximum)
+            )
+        official_sources = {
+            source
+            for source in observed_sources
+            if source.startswith("federal_reserve.")
+        }
+        if official_sources:
+            evidence.extend(
+                self._official_response_evidence(
+                    received_at_maximum=received_at_maximum,
+                    required_sources=official_sources,
+                )
+            )
+        if not evidence:
+            raise RuntimeError("macro PIT observations have no response evidence contract")
         return evidence
 
     def load(
@@ -195,9 +274,8 @@ class MacroPITFeatureSource:
                 "response_count": 0,
                 "raw_response_hashes_verified": self.verify_raw_hashes,
             }
-        responses = self._response_evidence(
-            received_at_maximum=str(frame["ingested_at"].max())
-        )
+        received_at_maximum = str(frame["ingested_at"].max())
+        observed_sources = set(frame["source"].astype(str))
         for column in ("event_time", "available_at", "ingested_at"):
             frame[column] = pd.to_datetime(
                 frame[column], utc=True, errors="coerce", format="mixed"
@@ -213,6 +291,10 @@ class MacroPITFeatureSource:
         frame["value"] = pd.to_numeric(frame["value"], errors="coerce")
         if frame["value"].isna().any():
             raise RuntimeError("macro PIT feature contains non-numeric values")
+        responses = self._response_evidence(
+            received_at_maximum=received_at_maximum,
+            observed_sources=observed_sources,
+        )
         for name, group in frame.groupby("name", sort=True):
             contract = MACRO_FEATURE_CONTRACTS[str(name)]
             if set(group["unit"].astype(str)) != {contract.unit}:

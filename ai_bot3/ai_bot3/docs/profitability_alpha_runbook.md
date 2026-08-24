@@ -75,6 +75,19 @@ python scripts/backfill_fred_alfred_pit.py `
 - output 4 和 output 3 分别保留初值与修订；
 - VIXCLS/DFII10 超过官方 2000 vintage 上限时按 realtime window 分片。
 
+FOMC Tier-A 必须另行抓取美联储官方声明，不能由 FRED vintage 或会议计划日期替代：
+
+```powershell
+python scripts/backfill_fomc_pit.py `
+  --start 2018-01-01 `
+  --end 2026-06-18 `
+  --database data/macro_pit.sqlite3 `
+  --cache-dir data/fomc_pit_cache `
+  --report model_results/evaluation/fomc_pit_backfill_report.json
+```
+
+审计必须逐份验证官方年度索引和声明正文 SHA-256、`For release at` 明示时间、EST/EDT 到 UTC 的换算、声明前不可见、24 小时复位，以及 minutes/implementation note 排除。页面没有明确 release time 时脚本必须失败关闭，禁止猜测。
+
 ## 4. Bybit public-only 实时采集
 
 在启动 Bybit 采集前，可先回填无需密钥的稳定币链上发行 flow：
