@@ -433,6 +433,31 @@ def _market_bars(frame: pd.DataFrame) -> list[MarketBar]:
     return bars
 
 
+def _maximum_execution_window_observed(
+    path: Sequence[MarketBar],
+    *,
+    window_start: datetime,
+    window_end: datetime,
+) -> bool:
+    """Return whether continuous OHLC observations cover the whole window.
+
+    ``available_at`` can legitimately be later than a bar close when settled
+    funding provenance arrives later. It controls PIT label availability, but
+    must never be used to pretend that the OHLC price path extends further.
+    """
+
+    path_cursor = window_start
+    for path_bar in path:
+        # Consecutive candles may meet at the same instant or have a
+        # sub-second exchange boundary. A larger hole is incomplete history.
+        if path_bar.open_time > path_cursor + timedelta(seconds=1):
+            return False
+        path_cursor = max(path_cursor, path_bar.close_time)
+        if path_cursor >= window_end:
+            return True
+    return False
+
+
 def _panel_frame(
     frame: pd.DataFrame,
     horizon_sec: int,
@@ -495,19 +520,11 @@ def _panel_frame(
         while path_end < len(bars) and bars[path_end].open_time <= path_end_time:
             path_end += 1
         path = bars[index + 1 : path_end]
-        path_cursor = signal_at
-        maximum_execution_window_observed = False
-        for path_bar in path:
-            # Consecutive candles may meet at the same instant or have a
-            # sub-second exchange boundary. A larger hole means the maximum
-            # execution window is not fully observable, even if an early TP/SL
-            # happened before the missing interval.
-            if path_bar.open_time > path_cursor + timedelta(seconds=1):
-                break
-            path_cursor = max(path_cursor, path_bar.available_at)
-            if path_cursor >= path_end_time:
-                maximum_execution_window_observed = True
-                break
+        maximum_execution_window_observed = _maximum_execution_window_observed(
+            path,
+            window_start=signal_at,
+            window_end=path_end_time,
+        )
         # Release evidence is selected before labels/outcomes are inspected.
         # Requiring the entire maximum execution window prevents a profitable
         # early exit from being more likely to enter the evidence-complete

@@ -17,14 +17,16 @@ from core.evaluation.profitability_rebuild import (
     MINIMUM_COVERAGE_DAYS,
     ProfitabilityRebuild,
     ProfitabilityRebuildConfig,
-    _engineer_features,
     _build_direct_release_dataset,
     _bybit_names_for_horizon,
+    _engineer_features,
     _market_bars,
+    _maximum_execution_window_observed,
     _panel_rows,
     validate_source_coverage,
 )
 from core.training.pooled_panel import PooledPanelBuilder
+from core.labels.triple_barrier import MarketBar
 
 
 def _frame(days: int) -> pd.DataFrame:
@@ -183,6 +185,37 @@ def test_direct_execution_window_is_bound_before_buy_sell_outcomes_are_inspected
         assert {
             row["execution_window_evidence_complete"] for row in alternatives
         } == {True}
+
+
+def test_late_funding_availability_cannot_extend_the_observed_price_path():
+    start = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    first = MarketBar(
+        symbol="BTCUSDT",
+        open_time=start,
+        close_time=start + timedelta(minutes=2),
+        available_at=start + timedelta(days=1),
+        open=100.0,
+        high=101.0,
+        low=99.0,
+        close=100.0,
+    )
+    second = replace(
+        first,
+        open_time=start + timedelta(minutes=2),
+        close_time=start + timedelta(minutes=4),
+        available_at=start + timedelta(days=1, minutes=1),
+    )
+
+    assert not _maximum_execution_window_observed(
+        (first,),
+        window_start=start,
+        window_end=start + timedelta(minutes=3),
+    )
+    assert _maximum_execution_window_observed(
+        (first, second),
+        window_start=start,
+        window_end=start + timedelta(minutes=3),
+    )
 
 
 def test_release_walk_forward_excludes_proxy_rows_before_splitting():

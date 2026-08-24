@@ -290,6 +290,7 @@ moving-block bootstrap 的 95% 下界不大于零，都不得通过。
 
 - `selection_policy` 必须为 `full_maximum_execution_window_direct_before_outcome_filtering`；
 - `selection_columns` 只能包含 `execution_window_evidence_complete`，不得读取 `net_return`、MAE/MFE 或 exit reason 来选样本；
+- 完整路径必须由连续 K 线 `close_time` 覆盖；较晚的 funding `available_at` 不得被当成价格路径结束时间；
 - `release_walk_forward_ready=true` 后，该周期才允许进入正式 walk-forward 和因子消融；
 - direct 样本不足必须显示 blocker 并保持 rejected，禁止回退到 OHLCV 代理成本凑交易数。
 
