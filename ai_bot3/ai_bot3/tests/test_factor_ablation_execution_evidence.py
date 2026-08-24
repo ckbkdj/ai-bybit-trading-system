@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT))
 
 from core.evaluation.profitability_rebuild import (
     _ablation_execution_evidence,
-    _ablation_score_threshold,
+    _ablation_oof_threshold,
     _ablation_signals_from_predictions,
     _execution_release_evidence,
     _failed_ablation_execution_result,
@@ -194,7 +194,9 @@ def test_ablation_research_budget_measures_rankings_without_faking_deployable_ed
             )
 
     frame = pd.DataFrame(rows)
-    threshold = _ablation_score_threshold(frame, predictions)
+    # The cutoff is already frozen from inner-OOS predictions before this
+    # outer-OOS interval is scored.
+    threshold = _ablation_oof_threshold(SimpleNamespace(oof_score_threshold=0.000475))
     # Doubling the outer-OOS interval with low-score future decisions must not
     # change a cutoff that was fixed on the calibration/training interval.
     for decision in range(100, 200):

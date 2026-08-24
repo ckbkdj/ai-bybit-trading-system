@@ -668,44 +668,13 @@ def _ablation_signals_from_predictions(
     return signals
 
 
-def _ablation_score_threshold(
-    calibration_frame: pd.DataFrame,
-    predictions: Sequence[TwoStagePrediction],
-) -> float:
-    """Pre-commit a score cutoff using outer-training predictions only."""
+def _ablation_oof_threshold(selection: object) -> float:
+    """Require a cutoff calibrated exclusively from inner walk-forward OOS."""
 
-    if len(calibration_frame) != len(predictions):
-        raise ValueError("prediction and calibration frame lengths differ")
-    candidates = calibration_frame.copy().reset_index(drop=True)
-    candidates["_prediction"] = list(predictions)
-    scores: list[float] = []
-    for _, group in candidates.groupby(["symbol", "decision_at"], sort=True):
-        paired: list[float] = []
-        for _, row in group.iterrows():
-            prediction = row["_prediction"]
-            direction_ok = (
-                row["side"] == "BUY" and prediction.p_up >= prediction.p_down
-            ) or (
-                row["side"] == "SELL" and prediction.p_down >= prediction.p_up
-            )
-            if direction_ok:
-                paired.append(
-                    float(
-                        prediction.expected_net_return
-                        - ABLATION_RESEARCH_TAIL_PENALTY * prediction.expected_mae
-                    )
-                )
-        if paired:
-            scores.append(max(paired))
-    if not scores:
-        raise ValueError("ablation calibration produced no direction-consistent scores")
-    return float(
-        np.quantile(
-            np.asarray(scores, dtype=float),
-            1.0 - ABLATION_RESEARCH_SELECTION_FRACTION,
-            method="higher",
-        )
-    )
+    threshold = getattr(selection, "oof_score_threshold", None)
+    if threshold is None or not np.isfinite(float(threshold)):
+        raise ValueError("ablation is missing an inner OOS score threshold")
+    return float(threshold)
 
 
 def _factor_ablation_report(
@@ -746,7 +715,7 @@ def _factor_ablation_report(
             "ranking": "predicted_net_return_minus_fixed_tail_penalty_times_predicted_mae",
             "selection_fraction": ABLATION_RESEARCH_SELECTION_FRACTION,
             "threshold_calibration": (
-                "outer_train_predictions_only_fixed_before_outer_oos"
+                "inner_walk_forward_oos_predictions_only_fixed_before_outer_oos"
             ),
             "tail_penalty": ABLATION_RESEARCH_TAIL_PENALTY,
             "production_lower_bound_gate_relaxed": False,
@@ -949,19 +918,23 @@ def _evaluate_legacy_technical_ablation(
                 )
                 continue
             baseline_selection = selector.select_and_fit(
-                eligible_train, FEATURE_COLUMNS
+                eligible_train,
+                FEATURE_COLUMNS,
+                score_calibration_quantile=(
+                    1.0 - ABLATION_RESEARCH_SELECTION_FRACTION
+                ),
+                score_calibration_tail_penalty=ABLATION_RESEARCH_TAIL_PENALTY,
             )
             augmented_selection = selector.select_and_fit(
-                eligible_train, FEATURE_COLUMNS + tuple(columns)
-            )
-            baseline_threshold = _ablation_score_threshold(
                 eligible_train,
-                baseline_selection.model.predict(eligible_train),
+                FEATURE_COLUMNS + tuple(columns),
+                score_calibration_quantile=(
+                    1.0 - ABLATION_RESEARCH_SELECTION_FRACTION
+                ),
+                score_calibration_tail_penalty=ABLATION_RESEARCH_TAIL_PENALTY,
             )
-            augmented_threshold = _ablation_score_threshold(
-                eligible_train,
-                augmented_selection.model.predict(eligible_train),
-            )
+            baseline_threshold = _ablation_oof_threshold(baseline_selection)
+            augmented_threshold = _ablation_oof_threshold(augmented_selection)
             baseline_predictions = baseline_selection.model.predict(eligible_test)
             augmented_predictions = augmented_selection.model.predict(eligible_test)
             baseline_signals = _ablation_signals_from_predictions(
@@ -994,7 +967,7 @@ def _evaluate_legacy_technical_ablation(
                     "train_rows": len(eligible_train),
                     "test_rows": len(eligible_test),
                     "baseline_signals": len(baseline_signals),
-                    "baseline_outer_train_score_threshold": baseline_threshold,
+                    "baseline_inner_oos_score_threshold": baseline_threshold,
                     "baseline_trades": len(baseline_report.trades),
                     "baseline_net_return": baseline_report.net_return,
                     "baseline_execution": baseline_metrics,
@@ -1004,7 +977,7 @@ def _evaluate_legacy_technical_ablation(
                         meta_threshold=baseline_selection.selected_config.meta_trade_probability,
                     ),
                     "augmented_signals": len(augmented_signals),
-                    "augmented_outer_train_score_threshold": augmented_threshold,
+                    "augmented_inner_oos_score_threshold": augmented_threshold,
                     "augmented_trades": len(augmented_report.trades),
                     "augmented_net_return": augmented_report.net_return,
                     "augmented_execution": augmented_metrics,
@@ -1147,19 +1120,23 @@ def _evaluate_long_factor_ablation(
                     )
                     continue
                 baseline_selection = selector.select_and_fit(
-                    eligible_train, FEATURE_COLUMNS
+                    eligible_train,
+                    FEATURE_COLUMNS,
+                    score_calibration_quantile=(
+                        1.0 - ABLATION_RESEARCH_SELECTION_FRACTION
+                    ),
+                    score_calibration_tail_penalty=ABLATION_RESEARCH_TAIL_PENALTY,
                 )
                 augmented_selection = selector.select_and_fit(
-                    eligible_train, FEATURE_COLUMNS + tuple(columns)
-                )
-                baseline_threshold = _ablation_score_threshold(
                     eligible_train,
-                    baseline_selection.model.predict(eligible_train),
+                    FEATURE_COLUMNS + tuple(columns),
+                    score_calibration_quantile=(
+                        1.0 - ABLATION_RESEARCH_SELECTION_FRACTION
+                    ),
+                    score_calibration_tail_penalty=ABLATION_RESEARCH_TAIL_PENALTY,
                 )
-                augmented_threshold = _ablation_score_threshold(
-                    eligible_train,
-                    augmented_selection.model.predict(eligible_train),
-                )
+                baseline_threshold = _ablation_oof_threshold(baseline_selection)
+                augmented_threshold = _ablation_oof_threshold(augmented_selection)
                 baseline_predictions = baseline_selection.model.predict(eligible_test)
                 augmented_predictions = augmented_selection.model.predict(eligible_test)
                 baseline_signals = _ablation_signals_from_predictions(
@@ -1202,13 +1179,13 @@ def _evaluate_long_factor_ablation(
                         "train_rows": len(eligible_train),
                         "test_rows": len(eligible_test),
                         "baseline_signals": len(baseline_signals),
-                        "baseline_outer_train_score_threshold": baseline_threshold,
+                        "baseline_inner_oos_score_threshold": baseline_threshold,
                         "baseline_trades": len(baseline_report.trades),
                         "baseline_net_return": baseline_report.net_return,
                         "baseline_execution": baseline_metrics,
                         "baseline_prediction_gate": baseline_gate_diagnostics,
                         "augmented_signals": len(augmented_signals),
-                        "augmented_outer_train_score_threshold": augmented_threshold,
+                        "augmented_inner_oos_score_threshold": augmented_threshold,
                         "augmented_trades": len(augmented_report.trades),
                         "augmented_net_return": augmented_report.net_return,
                         "augmented_execution": augmented_metrics,
@@ -1369,19 +1346,23 @@ def _evaluate_bybit_pit_ablation(
                     )
                     continue
                 baseline_selection = selector.select_and_fit(
-                    eligible_train, FEATURE_COLUMNS
+                    eligible_train,
+                    FEATURE_COLUMNS,
+                    score_calibration_quantile=(
+                        1.0 - ABLATION_RESEARCH_SELECTION_FRACTION
+                    ),
+                    score_calibration_tail_penalty=ABLATION_RESEARCH_TAIL_PENALTY,
                 )
                 augmented_selection = selector.select_and_fit(
-                    eligible_train, FEATURE_COLUMNS + tuple(columns)
-                )
-                baseline_threshold = _ablation_score_threshold(
                     eligible_train,
-                    baseline_selection.model.predict(eligible_train),
+                    FEATURE_COLUMNS + tuple(columns),
+                    score_calibration_quantile=(
+                        1.0 - ABLATION_RESEARCH_SELECTION_FRACTION
+                    ),
+                    score_calibration_tail_penalty=ABLATION_RESEARCH_TAIL_PENALTY,
                 )
-                augmented_threshold = _ablation_score_threshold(
-                    eligible_train,
-                    augmented_selection.model.predict(eligible_train),
-                )
+                baseline_threshold = _ablation_oof_threshold(baseline_selection)
+                augmented_threshold = _ablation_oof_threshold(augmented_selection)
                 baseline_predictions = baseline_selection.model.predict(eligible_test)
                 augmented_predictions = augmented_selection.model.predict(eligible_test)
                 baseline_signals = _ablation_signals_from_predictions(
@@ -1414,7 +1395,7 @@ def _evaluate_bybit_pit_ablation(
                         "train_rows": len(eligible_train),
                         "test_rows": len(eligible_test),
                         "baseline_signals": len(baseline_signals),
-                        "baseline_outer_train_score_threshold": baseline_threshold,
+                        "baseline_inner_oos_score_threshold": baseline_threshold,
                         "baseline_trades": len(baseline_report.trades),
                         "baseline_net_return": baseline_report.net_return,
                         "baseline_execution": baseline_metrics,
@@ -1424,7 +1405,7 @@ def _evaluate_bybit_pit_ablation(
                             meta_threshold=baseline_selection.selected_config.meta_trade_probability,
                         ),
                         "augmented_signals": len(augmented_signals),
-                        "augmented_outer_train_score_threshold": augmented_threshold,
+                        "augmented_inner_oos_score_threshold": augmented_threshold,
                         "augmented_trades": len(augmented_report.trades),
                         "augmented_net_return": augmented_report.net_return,
                         "augmented_execution": augmented_metrics,

@@ -22,6 +22,7 @@ from core.models.two_stage import (
 class NestedModelSelection:
     model: TwoStageAlphaModel
     selected_config: TwoStageConfig
+    oof_score_threshold: float | None
     candidate_results: tuple[Mapping[str, object], ...]
     audit: Mapping[str, object]
 
@@ -106,6 +107,43 @@ def _selected_rows(
     )
 
 
+def _direction_consistent_scores(
+    frame: pd.DataFrame,
+    predictions: Sequence[TwoStagePrediction],
+    *,
+    tail_penalty: float,
+) -> list[float]:
+    """Return one causal ranking score per symbol/decision opportunity."""
+
+    if len(frame) != len(predictions):
+        raise ValueError("prediction and score calibration frame lengths differ")
+    candidates = frame.copy().reset_index(drop=True)
+    candidates["_prediction"] = list(predictions)
+    group_columns = [column for column in ("symbol", "decision_at") if column in candidates]
+    groups = candidates.groupby(group_columns, sort=True) if group_columns else [("all", candidates)]
+    scores: list[float] = []
+    for _, group in groups:
+        paired: list[float] = []
+        for _, row in group.iterrows():
+            prediction = row["_prediction"]
+            side = str(row.get("side", "BUY")).upper()
+            direction_ok = (
+                side == "BUY" and prediction.p_up >= prediction.p_down
+            ) or (
+                side == "SELL" and prediction.p_down >= prediction.p_up
+            )
+            if direction_ok:
+                paired.append(
+                    float(
+                        prediction.expected_net_return
+                        - tail_penalty * prediction.expected_mae
+                    )
+                )
+        if paired:
+            scores.append(max(paired))
+    return scores
+
+
 class NestedWalkForwardSelector:
     """Tune on inner walk-forward OOS only, then fit once for an outer OOS fold."""
 
@@ -170,19 +208,37 @@ class NestedWalkForwardSelector:
         self,
         outer_train: pd.DataFrame,
         feature_columns: Sequence[str],
+        *,
+        score_calibration_quantile: float | None = None,
+        score_calibration_tail_penalty: float = 0.0,
     ) -> NestedModelSelection:
         # The selector never mutates the caller's frame. Keeping the original
         # indexed view avoids duplicating a full multi-horizon training fold.
+        if score_calibration_quantile is not None and not (
+            0.0 < score_calibration_quantile < 1.0
+        ):
+            raise ValueError("score calibration quantile must be strictly between 0 and 1")
+        if score_calibration_tail_penalty < 0:
+            raise ValueError("score calibration tail penalty cannot be negative")
         data = outer_train
         folds, purge_sec, embargo_sec = self._folds(data)
         candidate_results: list[dict[str, object]] = []
         for config in self.candidate_configs:
             fold_results: list[dict[str, object]] = []
+            oof_scores: list[float] = []
             for fold_number, (train_positions, validation_positions) in enumerate(folds, start=1):
                 train = data.iloc[train_positions]
                 validation = data.iloc[validation_positions]
                 model = TwoStageAlphaModel(config).fit(train, feature_columns)
                 predictions = model.predict(validation)
+                if score_calibration_quantile is not None:
+                    oof_scores.extend(
+                        _direction_consistent_scores(
+                            validation,
+                            predictions,
+                            tail_penalty=score_calibration_tail_penalty,
+                        )
+                    )
                 gate_diagnostics = prediction_gate_diagnostics(
                     validation,
                     predictions,
@@ -238,6 +294,25 @@ class NestedWalkForwardSelector:
                     [result["mean_utility"] - result["downside_rms"] for result in fold_results]
                 )
             )
+            score_calibration = None
+            if score_calibration_quantile is not None:
+                if not oof_scores:
+                    raise ValueError(
+                        "inner OOS score calibration produced no direction-consistent scores"
+                    )
+                score_calibration = {
+                    "source": "inner_walk_forward_oos_predictions_only",
+                    "quantile": score_calibration_quantile,
+                    "tail_penalty": score_calibration_tail_penalty,
+                    "observation_count": len(oof_scores),
+                    "threshold": float(
+                        np.quantile(
+                            np.asarray(oof_scores, dtype=float),
+                            score_calibration_quantile,
+                            method="higher",
+                        )
+                    ),
+                }
             candidate_results.append(
                 {
                     "config_id": _config_id(config),
@@ -245,6 +320,7 @@ class NestedWalkForwardSelector:
                     "selection_score": score,
                     "positive_inner_fold_ratio": positive_folds / len(fold_results),
                     "inner_folds": fold_results,
+                    "oof_score_calibration": score_calibration,
                     "outer_oos_rows_seen": 0,
                 }
             )
@@ -258,9 +334,16 @@ class NestedWalkForwardSelector:
             if _config_id(config) == selected_result["config_id"]
         )
         final_model = TwoStageAlphaModel(selected_config).fit(data, feature_columns)
+        selected_calibration = selected_result.get("oof_score_calibration")
+        selected_threshold = (
+            float(selected_calibration["threshold"])
+            if isinstance(selected_calibration, Mapping)
+            else None
+        )
         return NestedModelSelection(
             model=final_model,
             selected_config=selected_config,
+            oof_score_threshold=selected_threshold,
             candidate_results=tuple(candidate_results),
             audit={
                 "selection_data": "inner_walk_forward_oos_only",
@@ -272,6 +355,7 @@ class NestedWalkForwardSelector:
                 "inner_purge_sec": purge_sec,
                 "inner_embargo_sec": embargo_sec,
                 "selected_config_id": selected_result["config_id"],
+                "score_calibration": selected_calibration,
                 "outer_train_rows": len(data),
             },
         )

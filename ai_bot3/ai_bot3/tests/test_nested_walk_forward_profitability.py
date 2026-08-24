@@ -46,7 +46,12 @@ def test_nested_selector_uses_inner_oos_only_and_fits_once_for_outer_test():
         ),
         inner_folds=3,
     )
-    selection = selector.select_and_fit(outer_train, ["signal", "symbol"])
+    selection = selector.select_and_fit(
+        outer_train,
+        ["signal", "symbol"],
+        score_calibration_quantile=0.98,
+        score_calibration_tail_penalty=0.5,
+    )
     predictions = selection.model.predict(outer_test)
     assert len(predictions) == len(outer_test)
     assert selection.audit["selection_data"] == "inner_walk_forward_oos_only"
@@ -58,6 +63,12 @@ def test_nested_selector_uses_inner_oos_only_and_fits_once_for_outer_test():
     assert selection.audit["inner_purge_sec"] == 180
     assert selection.audit["inner_embargo_sec"] == 45
     assert len(selection.candidate_results) == 2
+    assert selection.oof_score_threshold is not None
+    assert np.isfinite(selection.oof_score_threshold)
+    assert selection.audit["score_calibration"]["source"] == (
+        "inner_walk_forward_oos_predictions_only"
+    )
+    assert selection.audit["score_calibration"]["quantile"] == 0.98
     assert all(result["outer_oos_rows_seen"] == 0 for result in selection.candidate_results)
     for result in selection.candidate_results:
         for fold in result["inner_folds"]:
