@@ -354,6 +354,7 @@ blocker 只允许表示样本量、fold 或跨币种不足。PIT 违规、混周
 
 - `groups[].horizon_results` 必须覆盖该组全部适用周期；短周期为 180/900 秒，中长周期为 7200/14400/86400 秒，旧 Brain baseline 覆盖全部五个周期；
 - 每个周期独立满足 fold、真实交易、直接执行成本和稳定改善门槛；汇总 `mean_improvement` 只用于诊断；
+- 每个已安排的 outer fold 都必须完成 baseline/augmented 直接成本评分；`scheduled_oos_fold_count` 必须等于 `oos_fold_count`，任何因 PIT 行数、交易数或执行证据不足而跳过的 fold 都使该周期失败关闭；
 - `retained_factor_groups_by_horizon` 决定各周期可装载的因子，禁止把一个周期的 retained 结果传播到另一个周期；
 - `retained_horizons` 可保留已完成周期的研究证据，但只要任一适用周期未完成，组级 `formal_feature_set=false`、`all_required_groups_evaluated=false`，不得晋升 candidate。
 

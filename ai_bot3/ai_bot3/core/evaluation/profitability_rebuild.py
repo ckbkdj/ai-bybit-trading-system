@@ -253,7 +253,9 @@ def _ablation_ledger_summary(result: Mapping[str, object]) -> dict[str, object]:
             for key in (
                 "oos_ablation_status",
                 "evaluated",
+                "scheduled_oos_fold_count",
                 "oos_fold_count",
+                "unevaluated_oos_fold_count",
                 "execution_evidence",
                 "mean_improvement",
                 "bootstrap_lower_mean_improvement",
@@ -943,13 +945,26 @@ def _horizon_scoped_ablation_result(
             "pit_observation_count": sum(
                 int(item.get("test_rows", 0)) for item in horizon_folds
             ),
+            "scheduled_oos_fold_count": len(horizon_folds),
             "oos_fold_count": len(evaluated_folds),
+            "unevaluated_oos_fold_count": (
+                len(horizon_folds) - len(evaluated_folds)
+            ),
             "folds": horizon_folds,
         }
-        if len(evaluated_folds) < MINIMUM_ABLATION_TRADED_FOLDS:
+        if len(horizon_folds) < MINIMUM_ABLATION_TRADED_FOLDS:
             horizon_results[str(horizon)] = {
                 **common,
                 "oos_ablation_status": "FAILED_INSUFFICIENT_HORIZON_OOS_FOLDS",
+                "evaluated": False,
+                "retained": False,
+                "formal_feature_set": False,
+            }
+            continue
+        if len(evaluated_folds) != len(horizon_folds):
+            horizon_results[str(horizon)] = {
+                **common,
+                "oos_ablation_status": "FAILED_INCOMPLETE_HORIZON_OOS_FOLDS",
                 "evaluated": False,
                 "retained": False,
                 "formal_feature_set": False,

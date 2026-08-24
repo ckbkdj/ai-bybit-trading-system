@@ -223,6 +223,57 @@ def test_factor_retention_is_scoped_to_the_horizon_with_complete_oos_evidence():
     assert report["all_required_groups_evaluated"] is False
 
 
+def test_horizon_ablation_rejects_a_skipped_scheduled_outer_fold():
+    complete_arm = {
+        "net_return": 0.01,
+        "signal_count": 15,
+        "trade_count": 15,
+        "direct_execution_cost_trade_count": 15,
+        "proxy_execution_cost_trade_count": 0,
+        "execution_cost_evidence_complete": True,
+        "simulation_complete": True,
+        "unresolved_position_count": 0,
+        "risk_policy_compliant": True,
+        "risk_budget_breach_count": 0,
+    }
+    evaluated = [
+        {
+            "horizon_sec": 180,
+            "fold_id": f"h180-{fold}",
+            "status": "EVALUATED_OOS",
+            "test_rows": 500,
+            "baseline_execution": complete_arm,
+            "augmented_execution": {**complete_arm, "net_return": 0.02},
+        }
+        for fold in (1, 2)
+    ]
+    skipped = {
+        "horizon_sec": 180,
+        "fold_id": "h180-3",
+        "status": "FAILED_INSUFFICIENT_PIT_ROWS",
+        "test_rows": 10,
+    }
+
+    scoped = _horizon_scoped_ablation_result(
+        {
+            "factor_group": "bybit_orderbook",
+            "factors": ["orderbook_spread_bps"],
+            "folds": evaluated + [skipped],
+        },
+        (180,),
+    )
+
+    result = scoped["horizon_results"]["180"]
+    assert result["scheduled_oos_fold_count"] == 3
+    assert result["oos_fold_count"] == 2
+    assert result["unevaluated_oos_fold_count"] == 1
+    assert result["oos_ablation_status"] == (
+        "FAILED_INCOMPLETE_HORIZON_OOS_FOLDS"
+    )
+    assert result["retained"] is False
+    assert scoped["formal_feature_set"] is False
+
+
 def test_ablation_research_budget_measures_rankings_without_faking_deployable_edge():
     start = datetime(2026, 1, 1, tzinfo=timezone.utc)
     rows = []
