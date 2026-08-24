@@ -160,6 +160,65 @@ def test_coinshares_unparsable_article_is_explicitly_excluded(tmp_path: Path):
     assert "no parsable global weekly flow" in report["exclusions"][0]["reason"]
 
 
+def test_flow_source_rejects_conflicting_active_parser_outputs(tmp_path: Path):
+    database = tmp_path / "flows.sqlite3"
+    store = CoinSharesFundFlowPITStore(database)
+    backfill_coinshares_fund_flow_pit(
+        store,
+        cache_dir=tmp_path / "raw",
+        publication_start=START,
+        publication_end=START + timedelta(days=59 * 7),
+        workers=2,
+        requester=_requester,
+    )
+    with store.connect() as connection:
+        original = connection.execute(
+            "SELECT * FROM flow_pit_observations ORDER BY sequence LIMIT 1"
+        ).fetchone()
+        conflicting_id = "conflicting-active-parser-output"
+        connection.execute(
+            """INSERT INTO flow_pit_observations(
+                   observation_id,name,value,unit,event_time,available_at,
+                   ingested_at,source,series_id,observation_date,response_id
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                conflicting_id,
+                original["name"],
+                float(original["value"]) + 1_000_000,
+                original["unit"],
+                original["event_time"],
+                original["available_at"],
+                original["ingested_at"],
+                original["source"],
+                original["series_id"],
+                original["observation_date"],
+                original["response_id"],
+            ),
+        )
+        connection.commit()
+
+    source = FlowPITFeatureSource(database)
+    with pytest.raises(RuntimeError, match="ambiguous active releases"):
+        source.load([FEATURE_NAME])
+
+    with store.connect() as connection:
+        connection.execute(
+            """INSERT INTO flow_pit_observation_invalidations(
+                   observation_id,invalidated_at,reason,parser_version
+               ) VALUES (?,?,?,?)""",
+            (
+                conflicting_id,
+                FETCHED.isoformat(),
+                "test parser output superseded after manual review",
+                "test",
+            ),
+        )
+        connection.commit()
+    history, evidence = source.load([FEATURE_NAME])
+    assert len(history) == 60
+    assert evidence["equivalent_duplicate_count"] == 0
+
+
 def test_coinshares_parser_separates_headline_cumulative_and_nearest_direction():
     body = b"""
         <html><body>

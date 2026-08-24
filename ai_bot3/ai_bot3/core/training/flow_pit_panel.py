@@ -191,26 +191,22 @@ class FlowPITFeatureSource:
         frame = pd.DataFrame([dict(row) for row in rows])
         if frame.empty:
             return frame, {
-                "source": "coinmetrics.community.stablecoin_pit",
+                "source": "audited.append_only.flow_pit",
                 "database": str(self.path),
                 "requested_features": list(requested),
                 "observation_count": 0,
+                "active_observation_count_before_dedup": 0,
+                "equivalent_duplicate_count": 0,
                 "feature_coverage": {},
                 "snapshot_maximum_sequence": frozen_sequence,
                 "snapshot_sha256": hashlib.sha256(b"").hexdigest(),
                 "response_count": 0,
                 "raw_response_hashes_verified": self.verify_raw_hashes,
             }
-        # Parser corrections are append-only. For the same public release
-        # timestamp, the highest active sequence is the current audited value;
-        # invalidated earlier parser outputs remain in SQLite but cannot join.
-        frame = (
-            frame.sort_values("sequence")
-            .drop_duplicates(["name", "available_at"], keep="last")
-            .reset_index(drop=True)
-        )
-        response_ids = sorted(set(frame["response_id"].astype(str)))
-        responses = self._response_evidence(response_ids)
+
+        active_observation_count = len(frame)
+        active_response_ids = sorted(set(frame["response_id"].astype(str)))
+        responses = self._response_evidence(active_response_ids)
         for column in ("event_time", "available_at", "ingested_at"):
             frame[column] = pd.to_datetime(
                 frame[column], utc=True, errors="coerce", format="mixed"
@@ -232,6 +228,51 @@ class FlowPITFeatureSource:
                 raise RuntimeError(f"flow PIT unit contract failed for {name}")
             if not set(group["source"].astype(str)).issubset(contract.sources):
                 raise RuntimeError(f"flow PIT source contract failed for {name}")
+
+        # Corrections are append-only, but a correction is authoritative only after
+        # the superseded observation has an explicit invalidation row.  Silently
+        # selecting the highest sequence makes the feature depend on ingestion order
+        # and can leak a disputed parser result into training.
+        release_identity_columns = (
+            "value",
+            "unit",
+            "event_time",
+            "source",
+            "series_id",
+            "observation_date",
+        )
+        conflicts: list[dict[str, object]] = []
+        for (name, available_at), group in frame.groupby(
+            ["name", "available_at"], sort=True, dropna=False
+        ):
+            differing = [
+                column
+                for column in release_identity_columns
+                if group[column].nunique(dropna=False) > 1
+            ]
+            if differing:
+                conflicts.append(
+                    {
+                        "name": str(name),
+                        "available_at": available_at.isoformat(),
+                        "sequences": [int(value) for value in group["sequence"]],
+                        "differing_fields": differing,
+                    }
+                )
+        if conflicts:
+            sample = json.dumps(conflicts[:5], sort_keys=True, separators=(",", ":"))
+            raise RuntimeError(
+                "flow PIT has ambiguous active releases; append explicit observation "
+                f"invalidations before use: {sample}"
+            )
+
+        # Semantically identical parser outputs are safe to collapse.  All active
+        # responses above were still hash-verified before choosing the latest row.
+        frame = (
+            frame.sort_values("sequence")
+            .drop_duplicates(["name", "available_at"], keep="last")
+            .reset_index(drop=True)
+        )
         coverage: dict[str, object] = {}
         for name, group in frame.groupby("name", sort=True):
             start = group["available_at"].min()
@@ -246,10 +287,12 @@ class FlowPITFeatureSource:
                 ].maximum_age_sec,
             }
         return frame, {
-            "source": "coinmetrics.community.stablecoin_pit",
+            "source": "audited.append_only.flow_pit",
             "database": str(self.path),
             "requested_features": list(requested),
             "observation_count": len(frame),
+            "active_observation_count_before_dedup": active_observation_count,
+            "equivalent_duplicate_count": active_observation_count - len(frame),
             "feature_coverage": coverage,
             "snapshot_maximum_sequence": frozen_sequence,
             "snapshot_sha256": self._snapshot_digest(frame),
@@ -259,10 +302,14 @@ class FlowPITFeatureSource:
             ),
             "raw_response_hashes_verified": self.verify_raw_hashes,
             "pit_policy": (
-                "USDC+USDT ledger-derived supply, available 48h after metric day; "
-                "latest available_at at or before decision_at with staleness cutoff"
+                "feature-specific available_at at or before decision_at with contract "
+                "staleness cutoff; conflicting active parser outputs fail closed"
             ),
-            "semantic_scope": "net issuance/redemption, not exchange netflow",
+            "semantic_scope": (
+                "stablecoin features are issuer-ledger net issuance/redemption, not "
+                "exchange netflow; digital-asset fund flow is CoinShares' published "
+                "global weekly investment-product flow"
+            ),
         }
 
     def join(
