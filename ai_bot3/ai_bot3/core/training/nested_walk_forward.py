@@ -64,7 +64,46 @@ def _selected_rows(
                 )
         if qualified:
             selected.append(max(qualified, key=lambda item: (item[0], item[1]))[2])
-    return pd.DataFrame(selected)
+    if not selected:
+        return pd.DataFrame()
+
+    # Inner-OOS model selection must score executable signal paths, not every
+    # overlapping label as if capital could open a new same-symbol position at
+    # each decision.  The label availability timestamp is a conservative exit
+    # boundary when the panel does not carry an explicit exit timestamp.
+    candidates = pd.DataFrame(selected)
+    required = {"decision_at", "label_available_at"}
+    if missing := sorted(required.difference(candidates.columns)):
+        raise ValueError(f"nested selection is missing holding timestamps: {missing}")
+    candidates["_decision_at"] = pd.to_datetime(
+        candidates["decision_at"], utc=True, errors="coerce"
+    )
+    candidates["_holding_end"] = pd.to_datetime(
+        candidates.get("exit_at", candidates["label_available_at"]),
+        utc=True,
+        errors="coerce",
+    )
+    if candidates[["_decision_at", "_holding_end"]].isna().any().any():
+        raise ValueError("nested selection holding timestamps are invalid")
+    if (candidates["_holding_end"] <= candidates["_decision_at"]).any():
+        raise ValueError("nested selection holding interval must be positive")
+
+    accepted: list[pd.Series] = []
+    symbol_groups = (
+        candidates.groupby("symbol", sort=True)
+        if "symbol" in candidates
+        else [("__portfolio__", candidates)]
+    )
+    for _, symbol_rows in symbol_groups:
+        active_until: pd.Timestamp | None = None
+        for _, row in symbol_rows.sort_values("_decision_at").iterrows():
+            if active_until is not None and row["_decision_at"] < active_until:
+                continue
+            accepted.append(row)
+            active_until = row["_holding_end"]
+    return pd.DataFrame(accepted).drop(
+        columns=["_decision_at", "_holding_end", "_prediction"], errors="ignore"
+    )
 
 
 class NestedWalkForwardSelector:
@@ -150,6 +189,10 @@ class NestedWalkForwardSelector:
                     meta_threshold=config.meta_trade_probability,
                 )
                 selected = _selected_rows(validation, predictions)
+                gate_diagnostics["non_overlapping_selected_decisions"] = len(selected)
+                gate_diagnostics["overlap_policy"] = (
+                    "one_active_position_per_symbol_until_exit_or_label_available_at"
+                )
                 if selected.empty:
                     net_utility = -1.0
                     mean_utility = -1.0
@@ -222,6 +265,9 @@ class NestedWalkForwardSelector:
             audit={
                 "selection_data": "inner_walk_forward_oos_only",
                 "outer_oos_used_for_selection": False,
+                "inner_oos_overlap_policy": (
+                    "one_active_position_per_symbol_until_exit_or_label_available_at"
+                ),
                 "inner_fold_count": len(folds),
                 "inner_purge_sec": purge_sec,
                 "inner_embargo_sec": embargo_sec,
