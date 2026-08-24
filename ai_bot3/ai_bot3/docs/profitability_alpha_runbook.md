@@ -255,9 +255,9 @@ python -c "import sqlite3; c=sqlite3.connect(r'data/bybit_public_pit.sqlite3', t
 
 ## 8. Development-only 盈利实验
 
-### 8.1 先构建独立版本的 K 线历史库
+### 8.1 先构建独立版本的同交易所 K 线历史库
 
-正式实验的最低连续历史为：3m=180 天、15m=365 天、2h/4h=1095 天、1d=1825 天。旧实验正在读取的数据库禁止原地回填；先复制成新版本，再从 Binance 官方 USD-M 月度归档下载 ZIP 与 `.CHECKSUM`：
+正式实验的最低连续历史为：3m=180 天、15m=365 天、2h/4h=1095 天、1d=1825 天。旧实验正在读取的数据库禁止原地回填。Binance 官方 USD-M 月度 ZIP/`.CHECKSUM` 版本继续保留为跨交易所参考基线：
 
 ```powershell
 python scripts/backfill_binance_kline_archive.py `
@@ -266,20 +266,34 @@ python scripts/backfill_binance_kline_archive.py `
   --cache-dir data/raw/binance-kline-archive
 ```
 
-每个月必须满足官方 URL、保留的原始 ZIP/Checksum、SHA-256、月内连续网格和 OHLC 不变量后，才在同一事务写入 `raw_kline` 与 completed manifest。脚本中断后可重跑，completed 月不会改写。不能以“币种较新”为理由手工降门槛；只有首个官方归档月已校验、紧邻前一月的 archive 与 checksum 都真实返回 HTTP 404 时，才生成不可修改的 `VERIFIED_SINCE_LISTING` 收据。研究预检会重新读取保留的 ZIP/Checksum 并计算 SHA-256，同时逐字段复核该收据；文件缺失、损坏或收据不一致时仍按固定历史门槛失败。下载循环结束后脚本还会生成 `kline_archive_backfill_report.json` 并对 25 个 symbol×timeframe 序列做跨月逐 bar 连续性和历史下限复核；不是 25/25 时退出码为 2，不得把数据库解释成 ready。
+每个月必须满足官方 URL、保留的原始 ZIP/Checksum、SHA-256、月内连续网格和 OHLC 不变量后，才在同一事务写入 `raw_kline` 与 completed manifest。该库不是 Bybit 标签、成交或候选发布证据；显式使用 `--kline-source binance` 时 development 必须失败关闭且不得打开 lockbox。
+
+正式价格路径另建 Bybit 版本库。`--completed-end` 是排他的 UTC 日边界，必须在下载前预先写定；改变边界时使用新的 `--output`，不能覆盖或扩写已冻结窗口：
+
+```powershell
+python scripts/backfill_bybit_kline_history.py `
+  --source data/kline_feature_store.profitability-v2.sqlite3 `
+  --output data/kline_feature_store.profitability-v3-bybit.sqlite3 `
+  --cache-dir data/raw/bybit-kline-history `
+  --completed-end 2026-08-24T00:00:00Z `
+  --report model_results/evaluation/bybit_kline_history_backfill_report.json
+```
+
+该脚本只调用 Bybit 公开 market endpoint，不需要 key，也不下单。每个 Kline 请求和 instrument 请求都保留 URL、请求/接收时间、原始正文、长度、SHA-256 和窗口；`launchTime`、品种身份、反向返回顺序、逐 bar OHLCV、子窗口连续分区、完整结束边界和不可变 trigger 都会重新验证。报告必须是 25/25；任一 series 失败时退出码为 2。较新品种只有在官方 launch 回执与从 launch 起连续网格同时通过时才可使用 `VERIFIED_SINCE_LAUNCH`，不能手工缩短历史。
 
 回填结束后把实验命令的 feature store 显式切换为新版本：
 
 ```powershell
 python scripts/run_profitability_rebuild.py `
-  --feature-store data/kline_feature_store.profitability-v2.sqlite3 `
+  --feature-store data/kline_feature_store.profitability-v3-bybit.sqlite3 `
+  --kline-source bybit `
   --trad-panel-root D:\lh\trad_data_service_20260821\data_service `
   --macro-pit-store data/macro_pit.sqlite3 `
   --flow-pit-store data/flow_pit.sqlite3 `
   --bybit-pit-store data/bybit_public_pit.prelockbox.sqlite3 `
   --lockbox-bybit-pit-store data/bybit_public_pit.sqlite3 `
   --max-bars-per-symbol 200000 `
-  --walk-forward-folds 3
+  --walk-forward-folds 6
 ```
 
 新 lockbox 数据库参数只会在 development 全部门禁（包括 production replay）通过后被实例化和读取。
@@ -290,12 +304,14 @@ python scripts/run_profitability_rebuild.py `
 
 ```powershell
 python scripts/run_profitability_rebuild.py `
+  --feature-store D:\Money\ai_bot3\ai_bot3\data\kline_feature_store.profitability-v3-bybit.sqlite3 `
+  --kline-source bybit `
   --trad-panel-root D:\lh\trad_data_service_20260821\data_service `
   --macro-pit-store D:\Money\ai_bot3\ai_bot3\data\macro_pit.sqlite3 `
   --flow-pit-store D:\Money\ai_bot3\ai_bot3\data\flow_pit.sqlite3 `
   --bybit-pit-store D:\Money\ai_bot3\ai_bot3\data\bybit_public_pit.sqlite3 `
   --max-bars-per-symbol 200000 `
-  --walk-forward-folds 3
+  --walk-forward-folds 6
 ```
 
 退出码：
@@ -315,12 +331,15 @@ python scripts/run_profitability_rebuild.py `
 生产 shadow 推理若模型签名包含对应因子，必须同时配置：
 
 ```powershell
+$env:AI_BOT_PROFITABILITY_MODEL_BUNDLE='D:\Money\ai_bot3\ai_bot3\models\profitability\<trial_id>\model_bundle.json'
+$env:AI_BOT_PROFITABILITY_REPORT='D:\Money\ai_bot3\ai_bot3\model_results\evaluation\profitability_report.json'
+$env:AI_BOT_CANDIDATE_RELEASE_MANIFEST='D:\Money\ai_bot3\ai_bot3\model_results\evaluation\candidate_release_manifest.json'
 $env:BYBIT_PUBLIC_PIT_STORE='D:\Money\ai_bot3\ai_bot3\data\bybit_public_pit.sqlite3'
 $env:MACRO_PIT_STORE='D:\Money\ai_bot3\ai_bot3\data\macro_pit.sqlite3'
 $env:FLOW_PIT_STORE='D:\Money\ai_bot3\ai_bot3\data\flow_pit.sqlite3'
 ```
 
-runtime 会校验模型和 bundle 哈希、逐列 staleness、`available_at <= decision_at`、原始响应长度/SHA 和 candidate manifest。任一条件不满足都只输出 `NO_TRADE`，不得由 Brain 或默认值补位。
+runtime 会为新 Alpha 独立抓取 Bybit public linear last-trade Kline，不复用旧 Brain 的 Binance frame；随后校验训练/推理同为 Bybit、Kline 新鲜且连续、模型和 bundle 哈希、逐列 staleness、`available_at <= decision_at`、原始响应长度/SHA 和 candidate manifest。任一条件不满足都只输出 `NO_TRADE`，不得回退 Binance、Brain 或默认值补位。`ResultManager` 会再次核验 `feature_evidence.price_path.same_venue=true` 后才可能形成 OperationTicket。
 
 ## 9. 报告阅读顺序
 

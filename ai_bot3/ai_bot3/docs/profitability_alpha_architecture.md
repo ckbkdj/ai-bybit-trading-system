@@ -19,8 +19,10 @@
 ```mermaid
 flowchart TD
     A[旧线上 K 线与 Brain 逻辑<br/>只读复用] --> B[因果技术特征 baseline]
-    AG[Binance 官方 USD-M 月度 K 线<br/>ZIP + CHECKSUM] --> AH[独立版本 K 线库<br/>月级 manifest + raw SHA + 连续网格]
+    AG[Binance 官方 USD-M 月度 K 线<br/>ZIP + CHECKSUM] --> AH[跨交易所参考基线<br/>不作为 Bybit 成交证据]
     AH --> B
+    AI[Bybit 官方 last-trade Kline REST<br/>instrument launch + raw response SHA] --> AJ[正式同交易所价格库<br/>逐请求 manifest + 连续网格]
+    AJ --> B
     C[Bybit 公共 WS] --> CA[实时采集 PIT 库<br/>public-only / append-only]
     CA --> CB[停机后哈希与连续区间审计<br/>只迁移 sealed liquidation evidence]
     CC[Bybit 官方 archive / 官方 REST] --> D[development PIT 研究库<br/>逐日 manifest / response SHA]
@@ -64,7 +66,7 @@ flowchart TD
 
 | 层 | 主要模块 | 只负责什么 | 不允许做什么 |
 |---|---|---|---|
-| 原始数据 | `core/providers/*` | 抓取、解析、哈希、PIT 时间和 append-only 证据；Binance K 线只回填新版本库 | 原地改写旧实验数据库、训练、调参、生成交易信号 |
+| 原始数据 | `core/providers/*` | 抓取、解析、哈希、PIT 时间和 append-only 证据；Bybit K 线是正式价格路径，Binance 仅作参考基线 | 原地改写旧实验数据库、用 Binance 冒充 Bybit 价格/成交证据、训练、调参、生成交易信号 |
 | PIT 接入 | `core/training/bybit_pit_panel.py`、`macro_pit_panel.py`、`flow_pit_panel.py`、`pit_factor_panel.py` | 冻结 sequence/SHA，按决策时间 as-of join，执行 staleness 和来源契约；Bybit 训练快照先按 development 决策窗裁剪 | 广播当前值到历史、整库载入无关未来观测、填造缺失因子 |
 | 标签 | `core/labels/triple_barrier.py` | entry fill、TP/SL、max holding、费用、MAE/MFE、partial fill、exit reason | close-to-close 冒充成交结果 |
 | 数据集 | `core/training/pooled_panel.py`、`core/evaluation/profitability_rebuild.py` | pooled panel、因果 regime、完整最大执行窗 direct-evidence release 子集、purge、embargo、sealed lockbox | 使用全样本定义 regime、按收益/退出原因选择 direct 样本、让 OHLCV 代理成本进入候选 folds、物化封存 lockbox 标签 |
@@ -73,7 +75,7 @@ flowchart TD
 | 回测 | `core/backtest/event_driven.py` | 手续费、点差、动态滑点、funding、partial fill、timeout、latency、路径、MTM | 省略成本、只算收盘收益 |
 | 门禁 | `core/evaluation/profitability_gate.py` | development/lockbox 盈利、回撤、稳定性、集中度和压力测试 | 降低门槛迁就模型 |
 | 发布 | `core/release/*` | 绑定模型、报告、commit、lockbox fingerprint，并逐份验证 walk-forward、lockbox、消融、成本、风控、统计、覆盖、校准和生产 replay 的内容语义 | 只凭文件存在或 SHA 就接受不完整报告；未过门禁生成 candidate/live |
-| 生产推理 | `core/models/profitability_runtime.py`、`core/result_manager.py` | 按签名 feature contract 读取 trad、Bybit、macro、flow 的最新严格 PIT 值，验证 release manifest 后产生并消费 `alpha_prediction` | 缺特征时降级填造、Brain baseline 独立出票 |
+| 生产推理 | `core/data_fetch.py`、`core/models/profitability_runtime.py`、`core/result_manager.py` | 独立抓取新鲜 Bybit last-trade Kline，按签名 feature contract 读取 trad、Bybit、macro、flow 的最新严格 PIT 值，验证 release manifest 后产生并消费 `alpha_prediction` | 训练/推理跨交易所、Bybit 失败时回退 Binance、缺特征时填造、Brain baseline 独立出票 |
 | 交易安全 | 原 hardening 交易模块 | cancel/REPLACE、hedge、kill switch、双开关 | 被研究代码绕过 |
 
 ## 4. 固定周期契约
@@ -97,7 +99,10 @@ flowchart TD
 - 价格、成交量和 Brain 技术逻辑仍作为 `legacy_brain_technical` baseline。
 - 旧模型、数据库和策略均保留，当前状态为 rejected/baseline，不独立出票。
 - 因果技术特征只使用决策点之前的 K 线；regime 在每个训练窗口内因果计算。
-- 正式 v2 实验不在旧 K 线库上原地补历史；先通过 SQLite snapshot 复制到 `kline_feature_store.profitability-v2.sqlite3`，再读取 Binance 官方 USD-M 月度 ZIP 与 `.CHECKSUM`。
+- 旧 K 线库和 Binance 官方月度归档继续保留，用于复现旧线上经验与跨交易所参考；它们不能授权 Bybit 正式标签、回测或候选发布。
+- 正式实验先复制成新版本 `kline_feature_store.profitability-v3-bybit.sqlite3`，再从 Bybit 官方 `/v5/market/kline` 读取 last-trade OHLCV；每个请求保存完整 URL、请求/接收时间、原始响应 BLOB、长度、SHA-256 和子窗口边界。
+- 每个 symbol 另存 `/v5/market/instruments-info` 原始回执并核对 `LinearPerpetual`、USDT、Trading 和 `launchTime`。请求子窗口必须无重复、无越界且连续覆盖预注册窗口；响应和 `raw_kline(source=bybit)` 必须逐行一致。
+- Binance 基线仍通过 SQLite snapshot 复制到 `kline_feature_store.profitability-v2.sqlite3`，读取官方 USD-M 月度 ZIP 与 `.CHECKSUM`，但 `kline_source=binance` 会在 development 门禁失败并禁止打开 lockbox。
 - 每个月同时校验官方 URL、ZIP/Checksum SHA-256、唯一 CSV member、毫秒时间戳、OHLC 不变量、周期长度、月内连续网格和月份归属；完成 manifest 不可修改。
 - 3m/15m/2h/4h/1d 的固定最低连续历史分别为 180/365/1095/1095/1825 天。较新币种只有在首个官方月验真、紧邻前月的 archive 与 checksum 均为真实 404，且实验预检重新哈希保留文件后，才允许使用 `VERIFIED_SINCE_LISTING` 边界；否则仍按固定门槛失败。
 
@@ -187,6 +192,7 @@ FOMC 采集不能用会议日历日期猜测 14:00，也不能把 minutes、impl
 16. development 预检只允许查询 K 线时间网格以预注册边界；OHLCV 在 SQL 读取层截断到 lockbox 之前。production replay 同样按其 development OOS 决策时间截断查询，禁止先加载/工程化 lockbox 价格再在 DataFrame 中过滤。完整 lockbox OHLCV 只有 development 全门禁通过并写入 claim 后才可读取。
 17. development 内部再按时间把外层 OOS 拆成两段：较早一段只用于真实因子消融和冻结 feature set，较晚一段只用于冻结特征后的正式 development 评估。两段测试行不得重叠并保留 embargo；较晚 evaluation OOS 的收益、标签和门禁结果禁止反向改变 retained factors。默认至少六个 walk-forward folds，配置少于四个时直接拒绝启动。
 18. 交易所 K 线若以 `interval_end - 1 ms` 表示最后一个有效毫秒，特征可用时间必须正规化到下一毫秒的真实 interval end；禁止在最后一个成交毫秒尚未结束时使用整根 K 线的 high/low/close。
+19. 正式标签、训练、事件回测和生产推理必须使用 Bybit 同交易所 last-trade Kline。每根 `MarketBar`、每个标签和每笔回测交易都携带 `price_source/price_observed`；模型 bundle 绑定 `kline_source=bybit`。生产运行若收到 Binance frame、Bybit 断档或陈旧数据，Alpha 与 `ResultManager` 必须双重失败关闭。
 
 ## 7. 事件回测和回撤
 
