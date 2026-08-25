@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import sqlite3
 import threading
 from contextlib import closing, contextmanager
@@ -14,13 +13,14 @@ from contracts.execution_receipt_v1 import ExecutionReceipt
 from contracts.forecast_v1 import ForecastEnvelope
 from contracts.operation_ticket_v1 import OperationTicket
 from contracts.portfolio_intent_v1 import PortfolioIntent
+from shadow_contracts.repository import resolve_code_commit
 
 
 SCHEMA_VERSION = 2
 SCHEMA_CHECKSUM = hashlib.sha256(
     b"control-plane:v2:portfolio-intents:claim-epoch:immutable-outbox"
 ).hexdigest()
-CODE_COMMIT = os.environ.get("APP_CODE_COMMIT", "workspace-uncommitted")
+CODE_COMMIT = resolve_code_commit(Path(__file__).resolve().parents[3])
 
 
 def _utc_now() -> datetime:
@@ -76,7 +76,10 @@ class ControlPlaneRepository:
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS schema_migrations (
                     version INTEGER PRIMARY KEY,
-                    applied_at TEXT NOT NULL
+                    applied_at TEXT NOT NULL,
+                    migration_id TEXT NOT NULL,
+                    code_commit TEXT NOT NULL,
+                    schema_checksum TEXT NOT NULL
                 )"""
             )
             current = connection.execute(
@@ -98,6 +101,25 @@ class ControlPlaneRepository:
                     connection.execute(
                         f"ALTER TABLE schema_migrations ADD COLUMN {name} {declaration}"
                     )
+            for row in connection.execute(
+                "SELECT version,migration_id,code_commit,schema_checksum FROM schema_migrations"
+            ).fetchall():
+                version = int(row["version"])
+                checksum = (
+                    SCHEMA_CHECKSUM
+                    if version == SCHEMA_VERSION
+                    else hashlib.sha256(
+                        f"control-plane:legacy-import:v{version}".encode("utf-8")
+                    ).hexdigest()
+                )
+                connection.execute(
+                    """UPDATE schema_migrations
+                       SET migration_id=COALESCE(migration_id, ?),
+                           code_commit=COALESCE(code_commit, ?),
+                           schema_checksum=COALESCE(schema_checksum, ?)
+                       WHERE version=?""",
+                    (f"control-plane-legacy-v{version}", CODE_COMMIT, checksum, version),
+                )
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS schema_migrations (

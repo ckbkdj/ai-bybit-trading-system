@@ -10,8 +10,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from shadow_contracts.repository import resolve_code_commit  # noqa: E402
+
+
 NETWORK_GUARD = ROOT / "scripts" / "truth_network_guard"
 SECRET_ENV_KEYS = (
     "BYBIT_API_KEY",
@@ -62,28 +66,7 @@ def _run(name: str, command: list[str], *, cwd: Path = ROOT, env: dict[str, str]
 
 
 def _git_commit() -> str:
-    split_git_dir = ROOT / ".version-history"
-    command = (
-        [
-            "git",
-            f"--git-dir={split_git_dir}",
-            f"--work-tree={ROOT}",
-            "rev-parse",
-            "HEAD",
-        ]
-        if split_git_dir.exists()
-        else ["git", "-C", str(ROOT), "rev-parse", "HEAD"]
-    )
-    try:
-        return subprocess.run(
-            command,
-            check=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-        ).stdout.strip()
-    except Exception:
-        return "unknown"
+    return resolve_code_commit(ROOT)
 
 
 def _environment_gate() -> dict[str, Any]:

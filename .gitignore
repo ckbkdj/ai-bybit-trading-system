@@ -6,6 +6,7 @@
 **/.env
 **/.env.*
 !**/.env.example
+!**/.env.*.example
 ai_bot3/ai_bot3/config.yml
 ai_bot3/ai_bot3/config.yml.bak_*
 
@@ -26,6 +27,8 @@ ai_bot3/ai_bot3/config.yml.bak_*
 truth-regression.json
 supply-chain-audit.json
 pip-audit.json
+npm-audit.json
+sbom.cdx.json
 
 # Large model, market-data and runtime outputs
 ai_bot3/ai_bot3/data/
@@ -34,6 +37,7 @@ ai_bot3/ai_bot3/model_results/
 ai_bot3/ai_bot3/model_results/*
 !ai_bot3/ai_bot3/model_results/evaluation/
 ai_bot3/ai_bot3/model_results/evaluation/*
+!ai_bot3/ai_bot3/model_results/evaluation/current_release_status.json
 ai_bot3/ai_bot3/models/
 ai_bot3/ai_bot3/logs/
 ai_bot3/ai_bot3/err

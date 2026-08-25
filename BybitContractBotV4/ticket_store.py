@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import sqlite3
 import threading
 from contextlib import closing, contextmanager
@@ -13,6 +12,7 @@ from typing import Any, Iterator, Optional
 from contracts.operation_ticket_v1 import OperationTicket
 from execution_state import ExecutionState, TERMINAL_STATES, require_transition
 from incident_modes import IncidentMode
+from shadow_contracts.repository import resolve_code_commit
 
 
 def utc_now() -> datetime:
@@ -44,7 +44,7 @@ SCHEMA_VERSION = 5
 SCHEMA_CHECKSUM = hashlib.sha256(
     b"execution-store:v5:claim-epoch:commands:position-owner:incident-runtime:soak-metrics"
 ).hexdigest()
-CODE_COMMIT = os.environ.get("APP_CODE_COMMIT", "workspace-uncommitted")
+CODE_COMMIT = resolve_code_commit(Path(__file__).resolve().parents[1])
 
 
 class ExecutionStore:
@@ -84,7 +84,10 @@ class ExecutionStore:
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS schema_migrations(
                     version INTEGER PRIMARY KEY,
-                    applied_at TEXT NOT NULL
+                    applied_at TEXT NOT NULL,
+                    migration_id TEXT NOT NULL,
+                    code_commit TEXT NOT NULL,
+                    schema_checksum TEXT NOT NULL
                 )"""
             )
             current = connection.execute(
@@ -106,6 +109,25 @@ class ExecutionStore:
                     connection.execute(
                         f"ALTER TABLE schema_migrations ADD COLUMN {name} {declaration}"
                     )
+            for row in connection.execute(
+                "SELECT version,migration_id,code_commit,schema_checksum FROM schema_migrations"
+            ).fetchall():
+                version = int(row["version"])
+                checksum = (
+                    SCHEMA_CHECKSUM
+                    if version == SCHEMA_VERSION
+                    else hashlib.sha256(
+                        f"execution-store:legacy-import:v{version}".encode("utf-8")
+                    ).hexdigest()
+                )
+                connection.execute(
+                    """UPDATE schema_migrations
+                       SET migration_id=COALESCE(migration_id, ?),
+                           code_commit=COALESCE(code_commit, ?),
+                           schema_checksum=COALESCE(schema_checksum, ?)
+                       WHERE version=?""",
+                    (f"execution-store-legacy-v{version}", self.code_commit, checksum, version),
+                )
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS schema_migrations(
