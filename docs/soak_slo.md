@@ -34,7 +34,7 @@
 
 ```powershell
 Set-Location D:\Money
-& 'D:\lh\trad_data_service_20260821\data_service\.venv\Scripts\python.exe' scripts\soak_status.py --db D:\Money\BybitContractBotV4\execution_state.sqlite3
+python scripts\soak_status.py --db BybitContractBotV4\execution_state.sqlite3
 ```
 
 不足 30 天、样本不足或任一 SLO 不满足时，命令返回 `BLOCKED` 是正确行为。

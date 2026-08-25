@@ -31,6 +31,23 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(settings.live_approval_id, "")
         self.assertEqual(settings.api_key, "")
         self.assertIn("BTCUSDT", settings.correlated_symbols)
+        self.assertEqual(settings.max_risk_per_trade_pct, 0.0025)
+        self.assertEqual(settings.max_daily_loss_pct, 0.005)
+        self.assertEqual(settings.max_weekly_loss_pct, 0.015)
+        self.assertEqual(settings.max_equity_drawdown_pct, 0.03)
+        self.assertEqual(settings.max_gross_leverage, 2.0)
+
+    def test_capital_preservation_limits_cannot_be_relaxed_by_environment(self):
+        for key, value in (
+            ("MAX_RISK_PER_TRADE_PCT", "0.0026"),
+            ("MAX_DAILY_LOSS_PCT", "0.0051"),
+            ("MAX_WEEKLY_LOSS_PCT", "0.0151"),
+            ("MAX_EQUITY_DRAWDOWN_PCT", "0.0301"),
+            ("MAX_GROSS_LEVERAGE", "2.01"),
+        ):
+            with self.subTest(key=key):
+                with self.assertRaises(SettingsError):
+                    self.load({key: value})
 
     def test_correlated_symbol_group_is_explicit_and_normalized(self):
         settings = self.load({"CORRELATED_SYMBOLS": "btcusdt, ethusdt"})
@@ -134,24 +151,27 @@ class ShadowExchangeTests(unittest.TestCase):
         self.assertEqual(calls, ["created"])
 
     def test_shadow_order_never_uses_ccxt_or_private_network(self):
-        settings = TradingSettings.load(BOT_ROOT, environ={})
-        client = build_exchange_gateway(settings)
-        self.assertIsInstance(client.exchange, ShadowExchange)
+        # Use an isolated root so a developer's untracked .env.local cannot
+        # relax or otherwise alter the safety baseline under test.
+        with tempfile.TemporaryDirectory() as directory:
+            settings = TradingSettings.load(Path(directory), environ={})
+            client = build_exchange_gateway(settings)
+            self.assertIsInstance(client.exchange, ShadowExchange)
 
-        order = client.create_ticket_order(
-            symbol="ETHUSDT",
-            side="BUY",
-            order_type="MARKET",
-            amount=0.025,
-            price=None,
-            leverage=5,
-            order_link_id="shadow-test-entry",
-        )
+            order = client.create_ticket_order(
+                symbol="ETHUSDT",
+                side="BUY",
+                order_type="MARKET",
+                amount=0.025,
+                price=None,
+                leverage=2,
+                order_link_id="shadow-test-entry",
+            )
 
-        self.assertTrue(order["shadow"])
-        self.assertTrue(order["id"].startswith("shadow-"))
-        self.assertEqual(len(client.exchange.orders), 1)
-        self.assertEqual(client.exchange.orders[0]["symbol"], "ETHUSDT")
+            self.assertTrue(order["shadow"])
+            self.assertTrue(order["id"].startswith("shadow-"))
+            self.assertEqual(len(client.exchange.orders), 1)
+            self.assertEqual(client.exchange.orders[0]["symbol"], "ETHUSDT")
 
 
 class PredictionContractTests(unittest.TestCase):

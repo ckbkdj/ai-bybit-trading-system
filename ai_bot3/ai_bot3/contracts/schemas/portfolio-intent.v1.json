@@ -123,7 +123,7 @@
       "type": "string"
     },
     "risk_budget_pct": {
-      "maximum": 0.1,
+      "maximum": 0.0025,
       "minimum": 0,
       "title": "Risk Budget Pct",
       "type": "number"

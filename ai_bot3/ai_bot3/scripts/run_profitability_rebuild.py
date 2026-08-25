@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -17,7 +19,14 @@ from core.evaluation.profitability_rebuild import (
 )
 
 
-def _local_head_commit() -> str:
+def _validate_commit(value: str, *, source: str) -> str:
+    value = value.strip().lower()
+    if len(value) != 40 or any(character not in "0123456789abcdef" for character in value):
+        raise RuntimeError(f"{source} did not resolve to a SHA-1 commit")
+    return value
+
+
+def _private_history_head_commit() -> str:
     git_dir = WORKSPACE / ".version-history"
     head_file = git_dir / "HEAD"
     if not head_file.exists():
@@ -28,9 +37,28 @@ def _local_head_commit() -> str:
         if not reference.exists():
             raise RuntimeError(f"local version-history reference is missing: {reference}")
         value = reference.read_text(encoding="utf-8").strip()
-    if len(value) != 40 or any(character not in "0123456789abcdef" for character in value.lower()):
-        raise RuntimeError("local version-history HEAD is not a SHA-1 commit")
-    return value.lower()
+    return _validate_commit(value, source="local version-history HEAD")
+
+
+def _local_head_commit() -> str:
+    """Resolve HEAD in a regular clone, with local history compatibility."""
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD"],
+            cwd=WORKSPACE,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as git_error:
+        try:
+            return _private_history_head_commit()
+        except RuntimeError as history_error:
+            raise RuntimeError(
+                "cannot resolve repository HEAD with standard Git or local "
+                f"version history: {history_error}"
+            ) from git_error
+    return _validate_commit(completed.stdout, source="git rev-parse HEAD")
 
 
 def main() -> int:
@@ -38,7 +66,16 @@ def main() -> int:
     parser.add_argument(
         "--feature-store",
         type=Path,
-        default=ROOT / "data" / "kline_feature_store.rebuilt.20260822.sqlite3",
+        default=ROOT / "data" / "kline_feature_store.profitability-v3-bybit.sqlite3",
+    )
+    parser.add_argument(
+        "--kline-source",
+        choices=("bybit", "binance"),
+        default="bybit",
+        help=(
+            "formal release requires bybit; binance remains a rejected reference "
+            "baseline and cannot open the lockbox"
+        ),
     )
     parser.add_argument(
         "--output-dir", type=Path, default=ROOT / "model_results" / "evaluation"
@@ -50,8 +87,48 @@ def main() -> int:
         "--model-output-dir", type=Path, default=ROOT / "models" / "profitability"
     )
     parser.add_argument("--code-commit")
-    parser.add_argument("--max-bars-per-symbol", type=int, default=3000)
-    parser.add_argument("--walk-forward-folds", type=int, default=3)
+    configured_trad_root = os.environ.get("TRAD_DATA_SERVICE_ROOT", "").strip()
+    parser.add_argument(
+        "--trad-panel-root",
+        type=Path,
+        default=Path(configured_trad_root) if configured_trad_root else None,
+    )
+    configured_bybit_pit = os.environ.get("BYBIT_PUBLIC_PIT_STORE", "").strip()
+    parser.add_argument(
+        "--bybit-pit-store",
+        type=Path,
+        default=Path(configured_bybit_pit) if configured_bybit_pit else None,
+    )
+    configured_lockbox_bybit_pit = os.environ.get(
+        "BYBIT_LOCKBOX_PUBLIC_PIT_STORE", ""
+    ).strip()
+    parser.add_argument(
+        "--lockbox-bybit-pit-store",
+        type=Path,
+        default=(
+            Path(configured_lockbox_bybit_pit)
+            if configured_lockbox_bybit_pit
+            else None
+        ),
+        help=(
+            "separate final-OOS Bybit PIT store; it is not opened until the "
+            "development profitability gate passes"
+        ),
+    )
+    configured_macro_pit = os.environ.get("MACRO_PIT_STORE", "").strip()
+    parser.add_argument(
+        "--macro-pit-store",
+        type=Path,
+        default=Path(configured_macro_pit) if configured_macro_pit else None,
+    )
+    configured_flow_pit = os.environ.get("FLOW_PIT_STORE", "").strip()
+    parser.add_argument(
+        "--flow-pit-store",
+        type=Path,
+        default=Path(configured_flow_pit) if configured_flow_pit else None,
+    )
+    parser.add_argument("--max-bars-per-symbol", type=int, default=200_000)
+    parser.add_argument("--walk-forward-folds", type=int, default=6)
     args = parser.parse_args()
     head_commit = _local_head_commit()
     if args.code_commit and args.code_commit.lower() != head_commit:
@@ -64,6 +141,12 @@ def main() -> int:
         trial_ledger_path=args.trial_ledger,
         model_output_dir=args.model_output_dir,
         code_commit=head_commit,
+        trad_panel_root=args.trad_panel_root,
+        bybit_pit_store_path=args.bybit_pit_store,
+        lockbox_bybit_pit_store_path=args.lockbox_bybit_pit_store,
+        macro_pit_store_path=args.macro_pit_store,
+        flow_pit_store_path=args.flow_pit_store,
+        kline_source=args.kline_source,
         max_bars_per_symbol=args.max_bars_per_symbol,
         walk_forward_folds=args.walk_forward_folds,
     )

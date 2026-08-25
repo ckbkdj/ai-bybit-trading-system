@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from itertools import count
 from typing import Any, Callable
 
@@ -264,13 +264,14 @@ class ExchangeGateway:
         return self.exchange.fetch_open_orders()
 
     def get_daily_risk_metrics(self, now=None) -> dict[str, Any]:
-        """Replay today's official account ledger; partial evidence fails closed."""
+        """Replay this UTC week's official ledger; partial evidence fails closed."""
 
         current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
         if self.mode == "shadow":
             return {
                 "healthy": True,
                 "realised_pnl": 0.0,
+                "realised_pnl_week": 0.0,
                 "consecutive_losses": 0,
                 "last_loss_at": None,
                 "record_count": 0,
@@ -284,12 +285,16 @@ class ExchangeGateway:
         ):
             return dict(cache[2])
 
-        start = current.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_start = current.replace(hour=0, minute=0, second=0, microsecond=0)
+        start = day_start - timedelta(days=day_start.weekday())
+        start_ms = int(start.timestamp() * 1000)
+        current_ms = int(current.timestamp() * 1000)
         params = {
             "accountType": "UNIFIED",
             "category": "linear",
-            "startTime": int(start.timestamp() * 1000),
-            "endTime": int(current.timestamp() * 1000),
+            "currency": "USDT",
+            "startTime": start_ms,
+            "endTime": current_ms,
             "limit": 50,
         }
         endpoint = getattr(self.exchange, "private_get_v5_account_transaction_log", None)
@@ -301,11 +306,26 @@ class ExchangeGateway:
         try:
             for page_number in range(20):
                 response = endpoint(dict(params))
+                if not isinstance(response, dict) or int(
+                    response.get("retCode", -1)
+                ) != 0:
+                    return self._unhealthy_risk(
+                        "transaction_log_exchange_rejected", len(records)
+                    )
                 result = (response or {}).get("result") or {}
-                records.extend(result.get("list") or [])
+                page_records = result.get("list") or []
+                if not isinstance(page_records, list):
+                    return self._unhealthy_risk(
+                        "transaction_log_response_invalid", len(records)
+                    )
+                records.extend(page_records)
                 cursor = str(result.get("nextPageCursor") or "")
-                if not cursor or cursor in seen_cursors:
+                if not cursor:
                     break
+                if cursor in seen_cursors:
+                    return self._unhealthy_risk(
+                        "transaction_log_cursor_repeated", len(records)
+                    )
                 seen_cursors.add(cursor)
                 params["cursor"] = cursor
                 if page_number == 19:
@@ -318,18 +338,47 @@ class ExchangeGateway:
             return self._unhealthy_risk("transaction_log_pagination_limit_exceeded", len(records))
 
         realised = 0.0
+        realised_week = 0.0
         closed_orders: dict[str, dict[str, Any]] = {}
+        seen_records: set[tuple[str, ...]] = set()
         for record in records:
             event_type = str(record.get("type") or "").upper()
             if event_type not in {"TRADE", "SETTLEMENT", "DELIVERY"}:
                 continue
+            record_id = str(record.get("id") or "")
+            if not record_id:
+                return self._unhealthy_risk(
+                    "transaction_log_record_id_missing", len(records)
+                )
+            record_identity = (
+                record_id,
+                event_type,
+                str(record.get("transactionTime") or ""),
+                str(record.get("tradeId") or ""),
+                str(record.get("orderId") or ""),
+                str(record.get("change") or ""),
+                str(record.get("fee") or ""),
+                str(record.get("funding") or ""),
+                str(record.get("cashFlow") or ""),
+            )
+            if record_identity in seen_records:
+                continue
+            seen_records.add(record_identity)
             try:
                 change = float(record.get("change") or 0)
                 cash_flow = float(record.get("cashFlow") or 0)
                 event_ms = int(record.get("transactionTime") or 0)
             except (TypeError, ValueError):
-                continue
-            realised += change
+                return self._unhealthy_risk(
+                    "invalid_transaction_log_record", len(records)
+                )
+            if not start_ms <= event_ms <= current_ms:
+                return self._unhealthy_risk(
+                    "transaction_log_record_outside_requested_week", len(records)
+                )
+            realised_week += change
+            if event_ms >= int(day_start.timestamp() * 1000):
+                realised += change
             if event_type == "TRADE" and abs(cash_flow) > 1e-15:
                 key = str(
                     record.get("orderId") or record.get("tradeId") or record.get("id") or ""
@@ -352,6 +401,7 @@ class ExchangeGateway:
         metrics = {
             "healthy": True,
             "realised_pnl": realised,
+            "realised_pnl_week": realised_week,
             "consecutive_losses": consecutive_losses,
             "last_loss_at": last_loss_at,
             "record_count": len(records),
@@ -364,6 +414,7 @@ class ExchangeGateway:
         return {
             "healthy": False,
             "realised_pnl": 0.0,
+            "realised_pnl_week": 0.0,
             "consecutive_losses": 0,
             "last_loss_at": None,
             "record_count": record_count,

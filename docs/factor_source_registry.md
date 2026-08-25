@@ -1,6 +1,6 @@
 # 因子与数据源登记表
 
-更新时间：2026-08-23
+更新时间：2026-08-24
 
 ## 结论
 
@@ -18,15 +18,17 @@
 | LLM 辅助 | 结构化 score、summary | 配置中的内网 OpenAI-compatible/Qwen 端点 | 请求只携带结构化快照；失败返回中性 | 仅为辅助因子，不能单独出票、调仓、绕过风险门禁 |
 | 在线校准 | bias、scale、adaptive threshold、direction confidence | `online_learning.sqlite3` 中已到期预测 | 只有 settled 样本达到 min_samples 才是 `valid` | 现在会显式输出 `valid/insufficient_samples/disabled`；没有 valid 就不出票 |
 | range guard | scaler 空间训练范围违例率与最大超界 | 当前 LSTM 输入和训练期 scaler | 每次推理 | 不再误称 OOD；它只是范围报警。缺 scaler 或非有限值时失败关闭 |
-| 跨资产影子上下文 | SPY/QQQ/TLT/GLD/USO/UUP/GBTC/COIN 的 1/5/20 日收益 | `D:\lh\trad_data_service_20260821\data_service\data\canonical\panel.parquet`，只读四列 | `ts <= as_of-30h`，并校验最后 PASS 发布收据 SHA | 已真实跑通但 `fusion_eligible=false`；只做研究/影子记录，不影响方向或出票 |
+| 跨资产影子上下文 | SPY/QQQ/TLT/UUP/GLD/USO/XLV/IBB/FXI/KWEB/COIN/MSTR（运行时另观察 GBTC）的 1/5/20 日收益 | `TRAD_DATA_SERVICE_ROOT` 指向的 canonical + baseline，只读 `symbol/ts/close/asset_family` | `ts <= as_of-30h`；PASS before/after SHA；允许标的逐行只追加；SHA 绑定基础价格范围审计 | 基线机器曾核验 12 个训练标的；当前部署必须重新生成自己的面板与 SHA 证据。缺失或 degraded 时，正式签名若要求该组就必须 NO_TRADE |
 | Bybit 执行快照 | mark/bid/ask、instrument rules、账户、仓位、订单、fill、服务器时钟 | Bybit V5 公共与私有接口 | 决策前/执行中实时核对 | 是最终执行真值；Binance 只是预测市场，短周期必须有 basis 证据 |
 
 ## 已实现计算，但尚未证明为在线生产输入
 
 | 因子族 | 已有能力 | 推荐第一方/权威源 | 当前状态 |
 |---|---|---|---|
-| Bybit 订单簿 | spread、L5 imbalance、bid/ask depth | Bybit V5 public orderbook snapshot/delta，校验 `u/seq` 并在 gap 后重建 snapshot | 计算函数已实现；尚无持续 collector 证据，不进入真钱模型 |
-| Bybit 主动成交 | aggressive buy/sell、CVD、成交笔数、平均名义 | Bybit V5 public trade | 计算函数已实现；尚无持续 collector 证据 |
+| Bybit 订单簿 | spread、L5 delta/imbalance/depth、microprice、滚动 OFI、top-5 扫单完成比例与 VWAP slippage | Bybit 官方历史归档 + V5 public orderbook snapshot/delta，校验 `u/seq` 并重建每次 L2 状态 | 归档回放和实时 collector 已实现；一日真实文件验算通过，正式多币种覆盖、消融和成交回执仍未完成，不进入真钱模型 |
+| Bybit 主动成交 | aggressive buy/sell、滚动 CVD、成交笔数和名义 | Bybit 官方历史归档 + V5 public trade | 归档回放和实时 collector 已实现；一日真实文件验算通过，正式覆盖和消融未完成 |
+| Bybit funding/OI/basis | 实际结算 funding、严格向后 1 小时 OI 变化、1 分钟 mark/index basis | Bybit V5 funding history、open-interest、mark/index price kline | 官方 REST 日批次回放已实现；一日真实响应验算为 3/288/1,440 条，正式多币种覆盖与消融未完成 |
+| Bybit liquidation | 5 分钟多/空强平名义不平衡 | Bybit V5 `allLiquidation.{symbol}` 实时流；`S=Buy` 是多仓被强平，`S=Sell` 是空仓被强平 | 已修复旧实现的方向反转；v1 只追加失效标记不删除，原始事件可重建为 `bybit.public.liquidations.v2`；官方无历史 REST，覆盖仍不足 |
 | 链上交易所流 | stablecoin/coin exchange netflow、确认数、标签修订风险 | 经批准的专业链上数据供应商或自建节点+版本化标签 | 数据结构已实现；无已批准 provider |
 | 美元流动性/宏观 | Fed balance sheet、RRP、TGA、实际利率、DXY、信用、增长/通胀 surprise | FRED/ALFRED vintage；美国财政部/纽约联储；EIA 等官方源 | PIT/vintage 存储和状态聚合已实现；未配置数据流 |
 | 监管/公司事件 | 申报、监管公告、重要公司文件 | SEC EDGAR API 和各监管机构第一方发布 | 研究任务/source tier 已实现；未配置数据流 |
@@ -34,9 +36,15 @@
 
 参考面板虽然含 5,332 列，但 `asset_family` 有历史错标/漂移，故禁止按分类标签批量取因子，也禁止把全部字段直接输入模型。当前适配器只按显式 symbol 白名单读取基础收盘价，标签只输出供审计。
 
+Bybit 历史归档适配器会登记原始 URL、文件 SHA-256、事件范围、读取行数、派生特征数和 `historical_archive_replay` 来源，并强制 `event_time <= available_at <= ingested_at`。2026-08-01 的 1000PEPEUSDT 官方文件隔离验算读取 528,558 条订单簿事件和 118,194 条成交，PIT 时间违规为 0。这个结果只证明真实来源和回放正确性，不等于足量 OOS 数据或 execution evidence：top-5 深度扫单完成比例不是 maker 排队成交概率，真实 fill/partial fill 仍必须来自 shadow/testnet ExecutionReceipt。
+
+衍生品 REST 历史回放使用独立的 `historical_api_replay` 来源。每个日批次保留请求 URL、响应体 SHA-256、行数、请求/接收时间和请求清单哈希；basis 的一分钟收盘值只在 K 线结束并增加保守延迟后可用，OI 变化只引用一小时前已存在的观测。2026-08-01 的 1000PEPEUSDT 实测合计 1,731 个特征、7 个官方响应、PIT 时间违规为 0。Bybit 官方公开接口仍未提供可追溯的历史 liquidation REST 数据，所以不得用 OHLCV、普通成交或 OI 变化伪造爆仓流。
+
+Liquidation 另有一项已确认的语义修复：旧代码把 `S=Buy` 当作空仓被强平，与 Bybit 官方字段说明相反。v1 特征行会保留原样供审计，但通过追加失效表从所有 PIT 读取中排除；新 collector 和原始事件重建只写 v2 来源。这个修复不会把数小时实时采集扩张成历史覆盖，正式因子组仍需足量持续采集或经授权的可审计历史源。
+
 权威接口：
 
-- [Bybit Orderbook](https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook)、[Public Trades](https://bybit-exchange.github.io/docs/v5/websocket/public/trade)、[Instrument Info](https://bybit-exchange.github.io/docs/v5/market/instrument)
+- [Bybit Orderbook](https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook)、[Public Trades](https://bybit-exchange.github.io/docs/v5/websocket/public/trade)、[Funding History](https://bybit-exchange.github.io/docs/v5/market/history-fund-rate)、[Open Interest](https://bybit-exchange.github.io/docs/v5/market/open-interest)、[Mark Price Kline](https://bybit-exchange.github.io/docs/v5/market/mark-kline)、[Index Price Kline](https://bybit-exchange.github.io/docs/v5/market/index-kline)、[Instrument Info](https://bybit-exchange.github.io/docs/v5/market/instrument)
 - [FRED real-time periods](https://fred.stlouisfed.org/docs/api/fred/realtime_period.html)、[vintage dates](https://fred.stlouisfed.org/docs/api/fred/series_vintagedates.html)
 - [SEC EDGAR APIs](https://www.sec.gov/search-filings/edgar-application-programming-interfaces)、[EIA Open Data](https://www.eia.gov/opendata/index.php/api)
 - [Binance USDⓈ-M Market Data](https://developers.binance.com/en/docs/derivatives/usds-margined-futures/market-data/rest-api)：K 线可分页；OI history 仅约 1 个月，long/short 与 taker history 仅约 30 天，不能从当前官方接口恢复完整三年历史。

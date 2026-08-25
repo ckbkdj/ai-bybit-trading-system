@@ -27,6 +27,18 @@ class TicketPolicyConfig:
     default_take_profit_multiple: float = 1.8
     order_type: str = "LIMIT"
 
+    def __post_init__(self) -> None:
+        if not 0 < self.risk_budget_pct <= 0.0025:
+            raise ValueError("risk_budget_pct cannot exceed the 0.25% hard limit")
+        if not 0 < self.leverage_cap <= 2.0:
+            raise ValueError("leverage_cap cannot exceed the 2x hard limit")
+        if not 0 < self.target_exposure_pct <= 1:
+            raise ValueError("target_exposure_pct must be in (0, 1]")
+        if self.max_notional_usdt <= 0:
+            raise ValueError("max_notional_usdt must be positive")
+        if self.order_type not in {"MARKET", "LIMIT"}:
+            raise ValueError("order_type must be MARKET or LIMIT")
+
 
 @dataclass(frozen=True)
 class TicketDecision:

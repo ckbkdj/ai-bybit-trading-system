@@ -111,7 +111,10 @@ class PositionSizer:
             raise SizingError("invalid account balance")
 
         leverage = min(decimal(ticket.intent.leverage_cap), decimal(self.risk_limits.max_gross_leverage))
-        risk_amount = equity * decimal(ticket.intent.risk_budget_pct)
+        risk_amount = equity * min(
+            decimal(ticket.intent.risk_budget_pct),
+            decimal(self.risk_limits.max_risk_per_trade_pct),
+        )
         risk_qty = risk_amount / stop_distance
         notional_cap_qty = decimal(ticket.intent.max_notional_usdt) / reference
         exposure_qty = equity * decimal(ticket.intent.target_exposure_pct) / reference

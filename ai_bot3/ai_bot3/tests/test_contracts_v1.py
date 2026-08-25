@@ -20,6 +20,11 @@ from contracts.operation_ticket_v1 import OperationTicket
 from contracts.schema_validation import SchemaValidationError, validate_schema_file
 
 
+def test_cross_service_contracts_use_the_shared_package():
+    assert OperationTicket.__module__ == "shadow_contracts.operation_ticket_v1"
+    assert ExecutionReceipt.__module__ == "shadow_contracts.execution_receipt_v1"
+
+
 NOW = datetime(2026, 8, 21, 8, 0, tzinfo=timezone.utc)
 
 
@@ -39,9 +44,9 @@ def operation_payload():
             "side": "BUY",
             "position_effect": "OPEN_OR_INCREASE",
             "target_exposure_pct": 0.08,
-            "risk_budget_pct": 0.003,
+            "risk_budget_pct": 0.0025,
             "max_notional_usdt": 5000,
-            "leverage_cap": 3,
+            "leverage_cap": 2,
         },
         "entry": {
             "order_type": "LIMIT",
@@ -80,6 +85,19 @@ def operation_payload():
 
 
 class ContractTests(unittest.TestCase):
+    def test_checked_in_schemas_match_current_contract_models(self):
+        committed = ROOT / "contracts" / "schemas"
+        with tempfile.TemporaryDirectory() as directory:
+            generated = generate(Path(directory))
+            for generated_path in generated:
+                committed_path = committed / generated_path.name
+                self.assertTrue(committed_path.is_file(), generated_path.name)
+                self.assertEqual(
+                    json.loads(committed_path.read_text(encoding="utf-8")),
+                    json.loads(generated_path.read_text(encoding="utf-8")),
+                    generated_path.name,
+                )
+
     def test_forecast_passes_pydantic_and_json_schema(self):
         forecast = LegacyForecastAdapter().adapt(
             "BTCUSDT",
@@ -143,6 +161,13 @@ class ContractTests(unittest.TestCase):
         payload["protection"]["stop_loss"] = None
         with self.assertRaises(ValidationError):
             OperationTicket.model_validate(payload)
+
+    def test_contract_rejects_risk_or_leverage_above_capital_preservation_limits(self):
+        for field, unsafe in (("risk_budget_pct", 0.0025001), ("leverage_cap", 2.0001)):
+            payload = operation_payload()
+            payload["intent"][field] = unsafe
+            with self.assertRaises(ValidationError):
+                OperationTicket.model_validate(payload)
 
     def test_schema_validation_is_independent(self):
         ticket = OperationTicket.model_validate(operation_payload()).model_dump(mode="json")

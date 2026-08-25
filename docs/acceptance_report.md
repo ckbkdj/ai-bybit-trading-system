@@ -1,6 +1,6 @@
 # 验收矩阵
 
-更新时间：2026-08-22
+更新时间：2026-08-25
 
 状态含义：PASS 为离线或本机影子自动测试已通过；GATED 为代码已失败关闭，但仍需使用用户测试网凭证做外部验收。
 
@@ -44,12 +44,19 @@
 | 36 | 短期 soak 必须 BLOCKED，不洁重启只计一次 | PASS | `test_soak_monitor` |
 | 37 | 高于程序支持版本的 DB 拒绝启动 | PASS | schema migration gate tests |
 | 38 | testnet/live 必须白名单 release id | PASS | runtime config + ticket validator tests |
+| 39 | 普通 Git clone 可解析盈利 CLI 的 HEAD | PASS | `test_cli_resolves_head_from_a_regular_git_clone` |
+| 40 | 三类环境模板和 runtime data manifest 一致 | PASS | `test_repository_layout` |
+| 41 | CI 仅从平台锁安装应用依赖 | PASS | CI YAML/lock parity 回归 |
+| 42 | Windows Python 3.12 预测回归 | PASS | 本机 CPython 3.12.13 全量预测测试 |
+| 43 | 盈利重建拆分但旧 import surface 不变 | PASS | 盈利/PIT 定向回归 38 项 |
+| 44 | Bybit PIT store/collector/audit 拆分且兼容 | PASS | `test_bybit_public_pit`、capture audit tests |
+| 45 | 预测端与执行端使用同一合同实现 | PASS | shared contract module/schema parity tests |
 
 额外已通过：claim lease、游标 outbox、不可变冲突、费用后门槛、REDUCE/CLOSE、CANCEL、cancel/fill 竞争、止损附带、幂等止盈子单、限流头、kill switch、研究 checkpoint/revision/Tier A blackout、PIT vintage、因子语义、walk-forward/purge/embargo、成本回测和因子组消融。
 
 本机 HTTP 影子 E2E 结果要求并已观测：`cursor=1`、`state=SUBMITTED`、`shadow_order_count=1`、`control_plane_receipt_count=1`。
 
-最终全量回归：预测端 `pytest` 为 **121 passed / 0 failed**；交易端 `pytest` 为 **59 passed / 0 failed**。本机 HTTP 影子闭环再次通过。
+本次整理分支最终全量回归：Windows CPython 3.12.13 预测端为 **347 passed / 0 failed**；交易端为 **75 passed + 5 subtests / 0 failed**。真实性回归为 `overall_status=PASS`、`release_conclusion=SHADOW_ONLY`；本机 HTTP 影子闭环再次得到 `state=SUBMITTED`、`shadow_order_count=1`、`control_plane_receipt_count=1`。当前漏洞 attestation 仍由 CI 单独生成，不因真实性回归通过而自动解除发布门禁。
 
 新增数据验收：损坏特征库已非破坏重建，raw/enhanced 各 **2,587,737 行、25 组**且 `quick_check=ok`，生产路径未切换；参考 `trad_data_service` 2.2 GB canonical 面板的 SHA 已按最后 PASS 收据验证，但最新更新任务为 BLOCKED，适配结果保持 degraded/shadow-only。
 
