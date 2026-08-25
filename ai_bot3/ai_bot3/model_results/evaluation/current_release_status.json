@@ -1,0 +1,12 @@
+{
+  "schema_version": "current-release-status.v1",
+  "generated_at": "2026-08-25T02:10:35Z",
+  "code_commit": "9596046ad6a7198d49fb5288a778102b0be3799e",
+  "profitability_evidence": "STALE_NOT_REGENERATED",
+  "profitability_gate": "FAILED",
+  "candidate_count": 0,
+  "live_count": 0,
+  "mainnet_allowed": false,
+  "success_claim": false,
+  "note": "This fail-closed status was generated from the last committed RC source state. Release artifacts regenerate it from APP_CODE_COMMIT/HEAD. Zero candidates and zero live releases are not a profitability success."
+}
