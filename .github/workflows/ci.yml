@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - "review/**"
+      - "release/**"
   pull_request:
 
 permissions:
@@ -25,7 +26,7 @@ jobs:
         include:
           - os: ubuntu-latest
             python-version: "3.11"
-            lock-file: requirements/ubuntu-py311.lock
+            lock-file: requirements/linux-py311.lock
           - os: windows-latest
             python-version: "3.12"
             lock-file: requirements/windows-py312.lock
@@ -36,11 +37,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
           cache-dependency-path: ${{ matrix.lock-file }}
-      - name: Install locked dependencies (Ubuntu)
-        if: runner.os != 'Windows'
-        run: python -m pip install -r ${{ matrix.lock-file }}
-      - name: Install hash-locked dependencies (Windows)
-        if: runner.os == 'Windows'
+      - name: Install hash-locked dependencies
         run: python -m pip install --require-hashes -r ${{ matrix.lock-file }}
       - name: Run execution regression
         run: python -m pytest BybitContractBotV4/tests -q
@@ -57,7 +54,7 @@ jobs:
         include:
           - os: ubuntu-latest
             python-version: "3.11"
-            lock-file: requirements/ubuntu-py311.lock
+            lock-file: requirements/linux-py311.lock
           - os: windows-latest
             python-version: "3.12"
             lock-file: requirements/windows-py312.lock
@@ -68,11 +65,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
           cache-dependency-path: ${{ matrix.lock-file }}
-      - name: Install locked dependencies (Ubuntu)
-        if: runner.os != 'Windows'
-        run: python -m pip install -r ${{ matrix.lock-file }}
-      - name: Install hash-locked dependencies (Windows)
-        if: runner.os == 'Windows'
+      - name: Install hash-locked dependencies
         run: python -m pip install --require-hashes -r ${{ matrix.lock-file }}
       - name: Run prediction regression
         working-directory: ai_bot3/ai_bot3
@@ -90,9 +83,9 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-          cache-dependency-path: requirements/ubuntu-py311.lock
+          cache-dependency-path: requirements/linux-py311.lock
       - name: Install locked E2E dependencies
-        run: python -m pip install -r requirements/ubuntu-py311.lock
+        run: python -m pip install --require-hashes -r requirements/linux-py311.lock
       - name: Run real HTTP shadow loop
         run: python scripts/run_shadow_e2e.py
 
@@ -108,12 +101,12 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install locked vulnerability auditor
-        run: python -m pip install -r requirements/audit.lock
+        run: python -m pip install --require-hashes -r requirements/audit.lock
       - name: Generate audit evidence
         shell: bash
         run: |
           python -m pip_audit \
-            --requirement requirements/windows-py312.lock \
+            --requirement requirements/linux-py311.lock \
             --disable-pip --format json --output pip-audit.json \
             --progress-spinner off || audit_status=$?
           audit_status=${audit_status:-0}
@@ -127,6 +120,21 @@ jobs:
           status=$?
           set -e
           if [ "$status" -ne 0 ]; then exit "$status"; fi
+          python -m pip_audit \
+            --requirement requirements/linux-py311.lock \
+            --disable-pip --format cyclonedx-json --output sbom.cdx.json \
+            --progress-spinner off || sbom_status=$?
+          sbom_status=${sbom_status:-0}
+          if [ "$sbom_status" -ne 0 ] && [ "$sbom_status" -ne 1 ]; then
+            exit "$sbom_status"
+          fi
+          cd ai_bot3/ai_bot3
+          npm audit --package-lock-only --json > ../../npm-audit.json || npm_status=$?
+          npm_status=${npm_status:-0}
+          if [ "$npm_status" -ne 0 ] && [ "$npm_status" -ne 1 ]; then
+            exit "$npm_status"
+          fi
+          cd ../..
           python - <<'PY'
           import json
           from pathlib import Path
@@ -146,6 +154,9 @@ jobs:
           vulnerability = report["vulnerability_scan"]
           if vulnerability["status"] != "PASS":
               raise SystemExit("current vulnerability attestation did not pass")
+          npm = json.loads(Path("npm-audit.json").read_text(encoding="utf-8"))
+          if (npm.get("metadata", {}).get("vulnerabilities", {}).get("total") or 0) != 0:
+              raise SystemExit("npm audit reported vulnerabilities")
           print("Repository, dependency-lock and current vulnerability audit passed.")
           PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -155,6 +166,8 @@ jobs:
           path: |
             supply-chain-audit.json
             pip-audit.json
+            npm-audit.json
+            sbom.cdx.json
           if-no-files-found: error
 
   truth-regression:
@@ -176,16 +189,16 @@ jobs:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: |
-            requirements/ubuntu-py311.lock
+            requirements/linux-py311.lock
             requirements/audit.lock
       - name: Install locked authenticity dependencies
         run: |
-          python -m pip install -r requirements/ubuntu-py311.lock
-          python -m pip install -r requirements/audit.lock
+          python -m pip install --require-hashes -r requirements/linux-py311.lock
+          python -m pip install --require-hashes -r requirements/audit.lock
       - name: Create current dependency vulnerability evidence
         run: |
           python -m pip_audit \
-            --requirement requirements/windows-py312.lock \
+            --requirement requirements/linux-py311.lock \
             --disable-pip --format json --output pip-audit.json \
             --progress-spinner off
       - name: Run evidence-producing authenticity regression

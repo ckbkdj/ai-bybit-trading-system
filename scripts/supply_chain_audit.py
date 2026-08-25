@@ -5,17 +5,28 @@ import hashlib
 import json
 import re
 import subprocess
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from shadow_contracts.repository import resolve_code_commit  # noqa: E402
+
+
 REQUIREMENTS = (
     ROOT / "ai_bot3" / "ai_bot3" / "requirements.txt",
     ROOT / "ai_bot3" / "ai_bot3" / "requirements-dev.txt",
     ROOT / "BybitContractBotV4" / "requirements.txt",
 )
-PYTHON_LOCKS = (ROOT / "requirements" / "windows-py312.lock",)
+PYTHON_LOCKS = (
+    ROOT / "requirements" / "windows-py312.lock",
+    ROOT / "requirements" / "windows-py311.lock",
+    ROOT / "requirements" / "linux-py311.lock",
+)
 LOCKFILES = (ROOT / "ai_bot3" / "ai_bot3" / "package-lock.json",)
 SECRET_PATTERNS = {
     "private_key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
@@ -33,6 +44,7 @@ LOCKED_REQUIREMENT = re.compile(
     r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s;]+)\s+"
     r"--hash=sha256:([0-9a-f]{64})$"
 )
+ENV_EXAMPLE = re.compile(r"^\.env(?:\.[a-z0-9_-]+)?\.example$", re.IGNORECASE)
 
 
 def sha256(path: Path) -> str:
@@ -77,14 +89,16 @@ def dependency_pinning() -> dict[str, Any]:
             )
         files.append({"path": str(path.relative_to(ROOT)), "sha256": sha256(path)})
 
-    locked: dict[str, str] = {}
+    locked_by_file: dict[str, dict[str, str]] = {}
     invalid_lock_entries = []
     lock_files = []
     for path in PYTHON_LOCKS:
         if not path.is_file():
             invalid_lock_entries.append({"path": str(path.relative_to(ROOT)), "reason": "missing"})
             continue
-        lock_files.append({"path": str(path.relative_to(ROOT)), "sha256": sha256(path)})
+        relative_lock = str(path.relative_to(ROOT)).replace("\\", "/")
+        lock_files.append({"path": relative_lock, "sha256": sha256(path)})
+        locked: dict[str, str] = {}
         for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             line = raw.split("#", 1)[0].strip()
             if not line:
@@ -93,7 +107,7 @@ def dependency_pinning() -> dict[str, Any]:
             if not match:
                 invalid_lock_entries.append(
                     {
-                        "path": str(path.relative_to(ROOT)),
+                        "path": relative_lock,
                         "line": number,
                         "reason": "not_exactly_pinned_and_sha256_hashed",
                     }
@@ -104,24 +118,37 @@ def dependency_pinning() -> dict[str, Any]:
             if name in locked and locked[name] != version:
                 invalid_lock_entries.append(
                     {
-                        "path": str(path.relative_to(ROOT)),
+                        "path": relative_lock,
                         "line": number,
                         "reason": "conflicting_locked_versions",
                     }
                 )
                 continue
             locked[name] = version
+        locked_by_file[relative_lock] = locked
 
-    unpinned = [
-        {"path": item["path"], "line": item["line"], "name": item["name"]}
-        for item in declared
-        if not item["name"] or item["name"] not in locked
-    ]
+    unpinned = []
+    for lock_path, locked in locked_by_file.items():
+        unpinned.extend(
+            {
+                "lock_path": lock_path,
+                "path": item["path"],
+                "line": item["line"],
+                "name": item["name"],
+            }
+            for item in declared
+            if not item["name"] or item["name"] not in locked
+        )
+    primary = locked_by_file.get("requirements/linux-py311.lock", {})
     return {
         "files": files,
         "lock_files": lock_files,
-        "locked_package_count": len(locked),
-        "locked_packages": locked,
+        "locked_package_count": len(primary),
+        "locked_packages": primary,
+        "platform_lock_package_counts": {
+            path: len(packages) for path, packages in locked_by_file.items()
+        },
+        "platform_locked_packages": locked_by_file,
         "unpinned_entries": unpinned,
         "invalid_lock_entries": invalid_lock_entries,
     }
@@ -179,11 +206,20 @@ def vulnerability_scan(path: Path | None, locked_packages: Mapping[str, str]) ->
             )
     missing = sorted(set(locked_packages) - audited)
     status = "PASS" if not findings and not missing and not skipped else "BLOCKED"
+    queried_at = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat().replace(
+        "+00:00", "Z"
+    )
     return {
         "status": status,
         "report_attached": True,
         "report_path": str(path),
         "report_sha256": sha256(path),
+        "auditor": {"name": "pip-audit", "version": "2.10.1"},
+        "advisory_database": {
+            "name": "PyPI advisory database via OSV",
+            "version": "unversioned-live-query",
+            "queried_at": queried_at,
+        },
         "audited_package_count": len(audited),
         "finding_count": len(findings),
         "findings": findings,
@@ -265,7 +301,7 @@ def secret_scan() -> dict[str, Any]:
     for path in tracked_files():
         relative = str(path.relative_to(ROOT)).replace("\\", "/")
         lowered = relative.lower()
-        if ".env" in Path(relative).name.lower() and not lowered.endswith(".env.example"):
+        if ".env" in Path(relative).name.lower() and not ENV_EXAMPLE.fullmatch(Path(relative).name):
             sensitive_paths.append(relative)
         if not path.is_file() or path.suffix.lower() in {".png", ".jpg", ".pdf", ".sqlite3"}:
             continue
@@ -336,7 +372,7 @@ def history_secret_scan() -> dict[str, Any]:
             skipped_large += 1
             continue
         normalized = path.replace("\\", "/")
-        if ".env" in Path(normalized).name.lower() and not normalized.lower().endswith(".env.example"):
+        if ".env" in Path(normalized).name.lower() and not ENV_EXAMPLE.fullmatch(Path(normalized).name):
             sensitive_paths.append({"path": normalized, "blob_sha": object_id})
         completed = subprocess.run(
             _git_command("cat-file", "blob", object_id),
@@ -390,6 +426,9 @@ def main() -> int:
     if vulnerabilities["status"] != "PASS":
         blockers.append("current vulnerability scan attestation did not pass")
     payload = {
+        "schema_version": "supply-chain-report.v1",
+        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "code_commit": resolve_code_commit(ROOT),
         "status": "BLOCKED" if blockers else "PASS",
         "blockers": blockers,
         "python_dependency_pinning": pinning,
