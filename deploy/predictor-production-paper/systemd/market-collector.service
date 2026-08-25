@@ -1,0 +1,22 @@
+[Unit]
+Description=AI-Bybit public market collector
+After=network-online.target
+
+[Service]
+Type=simple
+User=ai-bybit
+WorkingDirectory=/opt/ai-bybit/ai_bot3/ai_bot3
+EnvironmentFile=/etc/ai-bybit/predictor-production-paper.env
+ExecStart=/opt/ai-bybit/.venv/bin/python scripts/run_bybit_public_pit_collector.py --database /var/lib/ai-bybit/market-collector/bybit-public.sqlite3
+Restart=on-failure
+CPUQuota=50%
+MemoryMax=1G
+Nice=0
+IOWeight=500
+TasksMax=96
+ReadWritePaths=/var/lib/ai-bybit/market-collector
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -4,7 +4,7 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -35,12 +35,13 @@ class ControlPlaneApiTests(unittest.TestCase):
         self.environment.start()
         self.router = create_control_plane_router(ROOT)
         self.repository = self.router.control_repository
+        generated_at = datetime.now(timezone.utc)
         self.forecast = LegacyForecastAdapter().adapt(
             "BTCUSDT",
             "scalping",
             {
-                "generated_at": "2026-08-22T08:00:00Z",
-                "latest_kline_ts": "2026-08-22T07:59:55Z",
+                "generated_at": generated_at.isoformat(),
+                "latest_kline_ts": (generated_at - timedelta(seconds=5)).isoformat(),
                 "trend": "up",
                 "calibrated_trend": "up",
                 "confidence": 0.9,
@@ -83,6 +84,12 @@ class ControlPlaneApiTests(unittest.TestCase):
 
         health = self.endpoint("/v1/health")()
         self.assertEqual(health["status"], "ok")
+        self.assertEqual(self.endpoint("/v1/health/live")()["status"], "live")
+        self.assertEqual(self.endpoint("/v1/health/ready")()["status"], "ready")
+        capabilities = self.endpoint("/v1/capabilities")()
+        self.assertIn("operation-ticket.v1", capabilities["supported_ticket_schemas"])
+        self.assertGreaterEqual(capabilities["latest_forecast_age_seconds"], 0)
+        self.assertIn("unix_time", self.endpoint("/v1/time")())
         schema_response = self.endpoint("/v1/schema/{schema_name}")("operation-ticket")
         self.assertIn(b"operation-ticket.v1", schema_response.body)
         latest = self.endpoint("/v1/forecasts/latest")(symbol="BTCUSDT")

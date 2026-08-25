@@ -8,6 +8,12 @@ Testnet needs a separate human task and dedicated credentials. Mainnet remains
 disabled.
 
 - [Architecture](ARCHITECTURE.md)
+- [Two-node production-paper architecture](TWO_NODE_ARCHITECTURE.md)
+- [Two-node failure matrix](TWO_NODE_FAILURE_MATRIX.md)
+- [Predictor continuity runbook](PREDICTOR_CONTINUITY_RUNBOOK.md)
+- [Executor autonomy runbook](EXECUTOR_AUTONOMY_RUNBOOK.md)
+- [Two-node security](TWO_NODE_SECURITY.md)
+- [Two-node deployment](TWO_NODE_DEPLOYMENT.md)
 - [Shadow deployment](SHADOW_DEPLOYMENT.md)
 - [Testnet deployment preflight](TESTNET_DEPLOYMENT.md)
 - [Runtime data dependencies](RUNTIME_DATA_DEPENDENCIES.md)

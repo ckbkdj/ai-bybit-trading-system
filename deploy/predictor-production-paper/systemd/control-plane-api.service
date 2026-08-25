@@ -1,0 +1,22 @@
+[Unit]
+Description=AI-Bybit control-plane API (loopback behind mTLS proxy)
+After=network-online.target
+
+[Service]
+Type=simple
+User=ai-bybit
+WorkingDirectory=/opt/ai-bybit/ai_bot3/ai_bot3
+EnvironmentFile=/etc/ai-bybit/predictor-production-paper.env
+ExecStart=/opt/ai-bybit/.venv/bin/python api/api_server.py
+Restart=on-failure
+CPUQuota=50%
+MemoryMax=1G
+Nice=-2
+IOWeight=700
+TasksMax=96
+ReadWritePaths=/var/lib/ai-bybit/control-plane
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

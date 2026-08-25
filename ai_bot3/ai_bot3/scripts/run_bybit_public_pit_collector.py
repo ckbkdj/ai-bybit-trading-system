@@ -6,9 +6,12 @@ import json
 import sys
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+from core.service_runtime import load_predictor_runtime
+
+load_predictor_runtime()
 
 from core.providers.bybit_public_pit_collector import BybitPublicPITCollector
 from core.providers.bybit_public_pit_store import BybitPublicPITStore

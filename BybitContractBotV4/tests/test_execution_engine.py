@@ -194,6 +194,36 @@ class ExecutionEngineTests(unittest.TestCase):
         )
         self.assertEqual(stop_command["status"], "REST_ACCEPTED")
 
+    def test_one_hundred_replays_do_not_duplicate_or_move_state_or_cursor_backwards(self):
+        ticket = OperationTicket.model_validate(ticket_payload("tk_jitter_replay_001"))
+        for _ in range(100):
+            self.consumer.process(ticket, now=NOW)
+        link = order_link_id(ticket.ticket_id)
+        order = self.store.order(link)
+        stream = PrivateStreamHandler(self.store)
+        fill = {
+            "execId": "exec-jitter-replay-001",
+            "orderLinkId": link,
+            "orderId": order["bybit_order_id"],
+            "execQty": order["quantity"],
+            "execPrice": 99990,
+            "execFee": 0.1,
+            "execTime": int(NOW.timestamp() * 1000),
+        }
+        for cursor in range(1, 101):
+            stream.on_order({"data": [{"orderLinkId": link, "orderStatus": "New"}]})
+            stream.on_execution({"data": [fill]})
+            self.store.advance_consumer_cursor("consumer-a", cursor)
+        for cursor in range(99, -1, -1):
+            self.store.advance_consumer_cursor("consumer-a", cursor)
+
+        self.assertEqual(len(self.client.exchange.orders), 1)
+        self.assertEqual(len(self.store.orders_for_ticket(ticket.ticket_id)), 1)
+        self.assertEqual(len(self.store.fills_for_ticket(ticket.ticket_id)), 1)
+        self.assertEqual(self.store.state(ticket.ticket_id), ExecutionState.FILLED)
+        self.assertEqual(self.store.consumer_cursor("consumer-a"), 100)
+        self.assertEqual(self.store.operational_counts()["duplicate_order_count"], 0)
+
     def test_equity_high_water_drawdown_blocks_new_risk(self):
         ticket = OperationTicket.model_validate(ticket_payload("tk_drawdown_guard_001"))
         self.context.account_snapshot = replace(

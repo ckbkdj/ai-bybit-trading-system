@@ -17,6 +17,7 @@ from exchange_gateway import (
 )
 from prediction_client import PredictionUnavailable, parse_prediction_payload
 from runtime_config import SettingsError, TradingMode, TradingSettings
+from shadow_contracts.runtime import ExecutionMode
 
 
 class RuntimeConfigTests(unittest.TestCase):
@@ -27,6 +28,7 @@ class RuntimeConfigTests(unittest.TestCase):
     def test_default_mode_is_shadow_and_needs_no_credentials(self):
         settings = self.load()
         self.assertIs(settings.mode, TradingMode.SHADOW)
+        self.assertIs(settings.execution_mode, ExecutionMode.PAPER)
         self.assertFalse(settings.enable_live)
         self.assertEqual(settings.live_approval_id, "")
         self.assertEqual(settings.api_key, "")
@@ -36,6 +38,54 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(settings.max_weekly_loss_pct, 0.015)
         self.assertEqual(settings.max_equity_drawdown_pct, 0.03)
         self.assertEqual(settings.max_gross_leverage, 2.0)
+
+    def test_shadow_compatibility_and_modern_mode_must_agree(self):
+        settings = self.load(
+            {"EXECUTION_MODE": "paper", "BYBIT_TRADING_MODE": "shadow"}
+        )
+        self.assertIs(settings.execution_mode, ExecutionMode.PAPER)
+        with self.assertRaisesRegex(SettingsError, "different modes"):
+            self.load(
+                {"EXECUTION_MODE": "paper", "BYBIT_TRADING_MODE": "testnet"}
+            )
+
+    def test_executor_role_rejects_prediction_internal_data_paths(self):
+        with self.assertRaisesRegex(SettingsError, "SERVICE_ROLE=executor forbids"):
+            self.load(
+                {
+                    "SERVICE_ROLE": "executor",
+                    "AI_BOT_KLINE_FEATURE_STORE_PATH": "C:/shared/features.sqlite3",
+                }
+            )
+
+    def test_production_executor_requires_identity_token_and_mtls(self):
+        base = {
+            "APP_ENV": "production",
+            "SERVICE_ROLE": "executor",
+            "EXECUTION_MODE": "paper",
+            "HOST_ID": "executor-01",
+            "CLUSTER_ID": "two-node-primary",
+            "DEPLOYMENT_ID": "paper-20260825",
+        }
+        with self.assertRaisesRegex(SettingsError, "security is incomplete"):
+            self.load(base)
+        settings = self.load(
+            {
+                **base,
+                "TICKET_API_BASE_URL": "https://10.20.0.10",
+                "TICKET_CONSUMER_ID": "executor-01",
+                "CONTROL_PLANE_CERT_IDENTITY": "executor-01",
+                "CONTROL_PLANE_API_TOKEN": "example-token-not-a-secret",
+                "CONTROL_PLANE_MTLS_CERT": "C:/certs/executor.crt",
+                "CONTROL_PLANE_MTLS_KEY": "C:/certs/executor.key",
+                "PREDICTION_CA_BUNDLE": "C:/certs/cluster-ca.crt",
+            }
+        )
+        self.assertEqual(settings.host_id, "executor-01")
+        self.assertEqual(
+            settings.requests_client_cert,
+            ("C:/certs/executor.crt", "C:/certs/executor.key"),
+        )
 
     def test_capital_preservation_limits_cannot_be_relaxed_by_environment(self):
         for key, value in (

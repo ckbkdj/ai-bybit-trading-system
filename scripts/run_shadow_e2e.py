@@ -459,6 +459,7 @@ def publish_release_gated_ticket(temp: Path, control_db: Path, now: datetime) ->
             ),
         )
     )
+    manager.publish_pending()
     with closing(sqlite3.connect(control_db)) as connection:
         first_ticket_count = int(
             connection.execute("SELECT COUNT(*) FROM operation_tickets").fetchone()[0]
@@ -478,6 +479,7 @@ def publish_release_gated_ticket(temp: Path, control_db: Path, now: datetime) ->
             ),
         )
     )
+    manager.publish_pending()
     with closing(sqlite3.connect(control_db)) as connection:
         forecast_count = int(connection.execute("SELECT COUNT(*) FROM forecasts").fetchone()[0])
         ticket_count = int(

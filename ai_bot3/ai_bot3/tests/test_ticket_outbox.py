@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import sys
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -124,6 +126,107 @@ class TicketAndOutboxTests(unittest.TestCase):
         self.assertNotEqual(original.ticket_id, replacement.ticket_id)
         self.assertEqual(replacement.supersedes_ticket_id, original.ticket_id)
         self.assertEqual(replacement.intent.action, "REPLACE")
+
+    def test_ten_thousand_expired_tickets_fast_forward_without_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = ControlPlaneRepository(Path(directory) / "control.sqlite3")
+            forecast = actionable_forecast(
+                generated_at=datetime.now(timezone.utc).isoformat()
+            )
+            repository.publish(forecast, None)
+            template = TicketBuilder().build_open_ticket(
+                forecast, reference_price=100_000, required_position_version=0
+            ).model_dump(mode="json")
+            expired_at = datetime.now(timezone.utc) - timedelta(hours=1)
+            rows = []
+            for index in range(10_000):
+                payload = dict(template)
+                payload["ticket_id"] = f"tk_expired_{index:05d}"
+                payload["created_at"] = (expired_at - timedelta(minutes=2)).isoformat()
+                payload["valid_from"] = (expired_at - timedelta(minutes=1)).isoformat()
+                payload["expires_at"] = expired_at.isoformat()
+                payload_json = json.dumps(payload, sort_keys=True)
+                rows.append(
+                    (
+                        payload["ticket_id"],
+                        forecast.forecast_id,
+                        forecast.revision,
+                        None,
+                        "BTCUSDT",
+                        index + 1,
+                        None,
+                        payload["created_at"],
+                        payload["expires_at"],
+                        payload_json,
+                        "0" * 64,
+                    )
+                )
+            with repository.transaction(immediate=True) as connection:
+                connection.executemany(
+                    """INSERT INTO operation_tickets(
+                        ticket_id,forecast_id,forecast_revision,supersedes_ticket_id,symbol,
+                        decision_version,allowed_consumer_id,created_at,expires_at,
+                        payload_json,payload_sha256
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    rows,
+                )
+            live = TicketBuilder().build_open_ticket(
+                forecast, reference_price=100_100, required_position_version=0
+            )
+            repository.publish(forecast, live)
+            page, cursor, skipped = repository.eligible_ticket_page(
+                0, "executor-a", scan_limit=20_000
+            )
+            self.assertEqual([item.ticket_id for _, item in page], [live.ticket_id])
+            self.assertEqual(skipped["expired_skipped"], 10_000)
+            self.assertEqual(cursor, 10_001)
+
+    def test_second_executor_cannot_take_active_consumer_account(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = ControlPlaneRepository(Path(directory) / "control.sqlite3")
+            now = datetime.now(timezone.utc)
+            first = repository.activate_consumer(
+                "executor-a", "instance-one", "account-001", now=now
+            )
+            second = repository.activate_consumer(
+                "executor-a", "instance-two", "account-001", now=now
+            )
+            renewed = repository.activate_consumer(
+                "executor-a", "instance-one", "account-001", now=now
+            )
+            self.assertEqual(first, 1)
+            self.assertIsNone(second)
+            self.assertEqual(renewed, 1)
+
+    def test_highest_decision_version_wins_even_if_published_earlier(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = ControlPlaneRepository(Path(directory) / "control.sqlite3")
+            now = datetime.now(timezone.utc)
+            forecast = actionable_forecast(generated_at=now.isoformat())
+            first = TicketBuilder().build_open_ticket(
+                forecast, reference_price=100_000, required_position_version=0
+            )
+            second = TicketBuilder().build_open_ticket(
+                forecast,
+                reference_price=100_100,
+                required_position_version=0,
+                supersedes_ticket_id=first.ticket_id,
+            )
+            repository.publish(forecast, first)
+            repository.publish(forecast, second)
+            with repository.transaction(immediate=True) as connection:
+                connection.execute(
+                    "UPDATE operation_tickets SET decision_version=10 WHERE ticket_id=?",
+                    (first.ticket_id,),
+                )
+                connection.execute(
+                    "UPDATE operation_tickets SET decision_version=9 WHERE ticket_id=?",
+                    (second.ticket_id,),
+                )
+            page, cursor, skipped = repository.eligible_ticket_page(0, "executor-a")
+            self.assertEqual([ticket.ticket_id for _, ticket in page], [first.ticket_id])
+            self.assertEqual(cursor, 2)
+            self.assertEqual(skipped["superseded_skipped"], 1)
 
 
 if __name__ == "__main__":

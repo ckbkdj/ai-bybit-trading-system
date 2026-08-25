@@ -46,7 +46,7 @@ from core.market_context import (
     build_market_feature_snapshot,
     repair_mojibake_value,
 )
-from api.control_plane_api import create_control_plane_router
+from api.control_plane_api import create_control_plane_router, validate_control_plane_bind
 
 app = FastAPI()
 
@@ -1620,4 +1620,6 @@ def get_status():
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    bind_host = os.environ.get("CONTROL_PLANE_BIND_HOST", "127.0.0.1")
+    validate_control_plane_bind(bind_host)
+    uvicorn.run(app, host=bind_host, port=8000)

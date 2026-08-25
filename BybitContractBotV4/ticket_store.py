@@ -40,9 +40,9 @@ class StaleFencingToken(TicketConflict):
     pass
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 SCHEMA_CHECKSUM = hashlib.sha256(
-    b"execution-store:v5:claim-epoch:commands:position-owner:incident-runtime:soak-metrics"
+    b"execution-store:v6:receipt-retry:dead-letter:independent-delivery"
 ).hexdigest()
 CODE_COMMIT = resolve_code_commit(Path(__file__).resolve().parents[1])
 
@@ -245,6 +245,25 @@ class ExecutionStore:
                     payload_sha256 TEXT NOT NULL,
                     delivered_at TEXT,
                     created_at TEXT NOT NULL,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at TEXT,
+                    last_http_status INTEGER,
+                    last_error_code TEXT,
+                    last_error TEXT,
+                    dead_lettered_at TEXT,
+                    FOREIGN KEY(ticket_id) REFERENCES tickets(ticket_id)
+                );
+                CREATE TABLE IF NOT EXISTS receipt_dead_letter(
+                    receipt_id TEXT PRIMARY KEY,
+                    ticket_id TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    payload_sha256 TEXT NOT NULL,
+                    retry_count INTEGER NOT NULL,
+                    last_http_status INTEGER,
+                    last_error_code TEXT NOT NULL,
+                    last_error TEXT,
+                    dead_lettered_at TEXT NOT NULL,
+                    operator_acknowledged_at TEXT,
                     FOREIGN KEY(ticket_id) REFERENCES tickets(ticket_id)
                 );
                 CREATE TABLE IF NOT EXISTS consumer_cursors(
@@ -292,6 +311,26 @@ class ExecutionStore:
                     """ALTER TABLE position_snapshots ADD COLUMN position_owner_id TEXT
                        NOT NULL DEFAULT 'legacy-unowned'"""
                 )
+            receipt_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(receipt_outbox)")
+            }
+            for name, declaration in (
+                ("retry_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("next_attempt_at", "TEXT"),
+                ("last_http_status", "INTEGER"),
+                ("last_error_code", "TEXT"),
+                ("last_error", "TEXT"),
+                ("dead_lettered_at", "TEXT"),
+            ):
+                if name not in receipt_columns:
+                    connection.execute(
+                        f"ALTER TABLE receipt_outbox ADD COLUMN {name} {declaration}"
+                    )
+            connection.execute(
+                """UPDATE receipt_outbox SET next_attempt_at=created_at
+                   WHERE next_attempt_at IS NULL"""
+            )
             connection.execute(
                 """INSERT OR IGNORE INTO system_runtime(
                     singleton, incident_mode, reconciliation_complete, reason, updated_at
@@ -305,7 +344,7 @@ class ExecutionStore:
                 (
                     SCHEMA_VERSION,
                     iso(utc_now()),
-                    "execution-store-v5",
+                    "execution-store-v6",
                     self.code_commit,
                     SCHEMA_CHECKSUM,
                 ),
@@ -1408,8 +1447,12 @@ class ExecutionStore:
         with closing(self.connect()) as connection:
             pending_receipts = int(
                 connection.execute(
-                    "SELECT COUNT(*) FROM receipt_outbox WHERE delivered_at IS NULL"
+                    """SELECT COUNT(*) FROM receipt_outbox
+                       WHERE delivered_at IS NULL AND dead_lettered_at IS NULL"""
                 ).fetchone()[0]
+            )
+            dead_letters = int(
+                connection.execute("SELECT COUNT(*) FROM receipt_dead_letter").fetchone()[0]
             )
             incomplete = len(self.incomplete_ticket_ids())
             failed = int(
@@ -1425,6 +1468,7 @@ class ExecutionStore:
             )
         return {
             "receipt_outbox_backlog": pending_receipts,
+            "receipt_dead_letter_count": dead_letters,
             "incomplete_ticket_count": incomplete,
             "failed_ticket_count": failed,
             "duplicate_order_count": order_count - distinct_orders,
@@ -1617,18 +1661,34 @@ class ExecutionStore:
                 return False
             connection.execute(
                 """INSERT INTO receipt_outbox(
-                    receipt_id, ticket_id, payload_json, payload_sha256, created_at
-                ) VALUES (?, ?, ?, ?, ?)""",
-                (receipt_id, ticket_id, payload_json, payload_hash, iso(utc_now())),
+                    receipt_id, ticket_id, payload_json, payload_sha256,
+                    created_at, next_attempt_at
+                ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    receipt_id,
+                    ticket_id,
+                    payload_json,
+                    payload_hash,
+                    iso(utc_now()),
+                    iso(utc_now()),
+                ),
             )
             return True
 
-    def pending_receipts(self, limit: int = 100) -> list[dict[str, Any]]:
+    def pending_receipts(
+        self, limit: int = 100, *, now: datetime | None = None
+    ) -> list[dict[str, Any]]:
+        point = (now or utc_now()).astimezone(timezone.utc)
         with closing(self.connect()) as connection:
             rows = connection.execute(
-                """SELECT sequence, receipt_id, ticket_id, payload_json
-                   FROM receipt_outbox WHERE delivered_at IS NULL ORDER BY sequence LIMIT ?""",
-                (max(1, min(int(limit), 500)),),
+                """SELECT sequence, receipt_id, ticket_id, payload_json,
+                          retry_count, next_attempt_at, last_http_status,
+                          last_error_code, last_error
+                   FROM receipt_outbox
+                   WHERE delivered_at IS NULL AND dead_lettered_at IS NULL
+                     AND COALESCE(next_attempt_at, created_at)<=?
+                   ORDER BY sequence LIMIT ?""",
+                (iso(point), max(1, min(int(limit), 500))),
             ).fetchall()
         return [
             {
@@ -1636,6 +1696,11 @@ class ExecutionStore:
                 "receipt_id": row["receipt_id"],
                 "ticket_id": row["ticket_id"],
                 "payload": json.loads(row["payload_json"]),
+                "retry_count": int(row["retry_count"] or 0),
+                "next_attempt_at": row["next_attempt_at"],
+                "last_http_status": row["last_http_status"],
+                "last_error_code": row["last_error_code"],
+                "last_error": row["last_error"],
             }
             for row in rows
         ]
@@ -1646,6 +1711,106 @@ class ExecutionStore:
                 "UPDATE receipt_outbox SET delivered_at=? WHERE receipt_id=?",
                 (iso(utc_now()), receipt_id),
             )
+
+    def record_receipt_retry(
+        self,
+        receipt_id: str,
+        *,
+        http_status: int | None,
+        error_code: str,
+        error: str,
+        now: datetime | None = None,
+    ) -> int:
+        point = (now or utc_now()).astimezone(timezone.utc)
+        with self.transaction(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT retry_count FROM receipt_outbox WHERE receipt_id=?",
+                (receipt_id,),
+            ).fetchone()
+            if not row:
+                raise KeyError(receipt_id)
+            retry_count = int(row["retry_count"] or 0) + 1
+            delay_seconds = min(3600, 2 ** min(retry_count, 12))
+            connection.execute(
+                """UPDATE receipt_outbox SET retry_count=?, next_attempt_at=?,
+                       last_http_status=?, last_error_code=?, last_error=?
+                   WHERE receipt_id=?""",
+                (
+                    retry_count,
+                    iso(point + timedelta(seconds=delay_seconds)),
+                    http_status,
+                    error_code[:80],
+                    error[:1000],
+                    receipt_id,
+                ),
+            )
+            return retry_count
+
+    def dead_letter_receipt(
+        self,
+        receipt_id: str,
+        *,
+        http_status: int | None,
+        error_code: str,
+        error: str,
+        now: datetime | None = None,
+    ) -> bool:
+        point = (now or utc_now()).astimezone(timezone.utc)
+        with self.transaction(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT * FROM receipt_outbox WHERE receipt_id=?",
+                (receipt_id,),
+            ).fetchone()
+            if not row:
+                raise KeyError(receipt_id)
+            existing = connection.execute(
+                "SELECT payload_sha256 FROM receipt_dead_letter WHERE receipt_id=?",
+                (receipt_id,),
+            ).fetchone()
+            if existing:
+                if existing["payload_sha256"] != row["payload_sha256"]:
+                    raise TicketConflict("dead-letter receipt content conflict")
+                return False
+            connection.execute(
+                """INSERT INTO receipt_dead_letter(
+                    receipt_id,ticket_id,payload_json,payload_sha256,retry_count,
+                    last_http_status,last_error_code,last_error,dead_lettered_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    receipt_id,
+                    row["ticket_id"],
+                    row["payload_json"],
+                    row["payload_sha256"],
+                    int(row["retry_count"] or 0),
+                    http_status,
+                    error_code[:80],
+                    error[:1000],
+                    iso(point),
+                ),
+            )
+            connection.execute(
+                """UPDATE receipt_outbox SET dead_lettered_at=?, last_http_status=?,
+                       last_error_code=?, last_error=? WHERE receipt_id=?""",
+                (iso(point), http_status, error_code[:80], error[:1000], receipt_id),
+            )
+            return True
+
+    def acknowledge_dead_letter(
+        self, receipt_id: str, *, now: datetime | None = None
+    ) -> None:
+        with self.transaction(immediate=True) as connection:
+            connection.execute(
+                """UPDATE receipt_dead_letter SET operator_acknowledged_at=?
+                   WHERE receipt_id=?""",
+                (iso(now or utc_now()), receipt_id),
+            )
+
+    def receipt_dead_letters(self) -> list[dict[str, Any]]:
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                "SELECT * FROM receipt_dead_letter ORDER BY dead_lettered_at, receipt_id"
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def consumer_cursor(self, consumer_id: str) -> int:
         with closing(self.connect()) as connection:

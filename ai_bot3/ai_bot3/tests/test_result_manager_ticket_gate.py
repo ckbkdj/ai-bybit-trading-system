@@ -392,12 +392,18 @@ def _counts(db_path: Path) -> tuple[int, int]:
     return int(forecasts), int(tickets)
 
 
+def _save_and_publish(manager: ResultManager, symbol: str, mode: str, payload: dict) -> None:
+    asyncio.run(manager.save_result(symbol, mode, payload))
+    result = manager.publish_pending()
+    assert result["retried"] == 0
+
+
 def test_brain_never_authorizes_ticket_even_with_stale_live_release():
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         db = root / "control.sqlite3"
         manager = ResultManager(root / "results", control_plane_db=db, tickets_enabled=True)
-        asyncio.run(manager.save_result("BTCUSDT", "scalping", _prediction("live")))
+        _save_and_publish(manager, "BTCUSDT", "scalping", _prediction("live"))
         assert _counts(db) == (1, 0)
 
         manager = ResultManager(
@@ -406,7 +412,7 @@ def test_brain_never_authorizes_ticket_even_with_stale_live_release():
             tickets_enabled=True,
             strategy_release_bundle=_bundle("live"),
         )
-        asyncio.run(manager.save_result("BTCUSDT", "mid_short", _prediction("live")))
+        _save_and_publish(manager, "BTCUSDT", "mid_short", _prediction("live"))
         assert _counts(db) == (2, 0)
 
 
@@ -421,9 +427,9 @@ def test_candidate_stage_without_profitability_evidence_fails_closed():
             required_brain_release_stage="candidate",
             strategy_release_bundle=_bundle("candidate"),
         )
-        asyncio.run(manager.save_result("BTCUSDT", "scalping", _prediction("candidate")))
+        _save_and_publish(manager, "BTCUSDT", "scalping", _prediction("candidate"))
         assert _counts(db) == (1, 0)
-        asyncio.run(manager.save_result("BTCUSDT", "mid_short", _prediction("candidate")))
+        _save_and_publish(manager, "BTCUSDT", "mid_short", _prediction("candidate"))
         assert _counts(db) == (2, 0)
 
 
@@ -457,9 +463,9 @@ def test_verified_profitability_release_can_create_candidate_ticket_only():
         far["context_completeness"] = {"score": 0.0}
         far["calibration_status"] = "invalid"
         far["range_guard_score"] = 1.0
-        asyncio.run(manager.save_result("BTCUSDT", "scalping", near))
+        _save_and_publish(manager, "BTCUSDT", "scalping", near)
         assert _counts(db) == (1, 0)
-        asyncio.run(manager.save_result("BTCUSDT", "mid_short", far))
+        _save_and_publish(manager, "BTCUSDT", "mid_short", far)
         assert _counts(db) == (2, 1)
         active = manager.control_plane.active_forecasts(
             "BTCUSDT", strategy_release_id=manager.strategy_release_bundle.strategy_release_id
@@ -569,8 +575,8 @@ def test_candidate_ticket_rejects_malformed_edge_or_runtime_price_contract():
                 ] = 999_999
             far["alpha_prediction"] = far_alpha
 
-            asyncio.run(manager.save_result("BTCUSDT", "scalping", near))
-            asyncio.run(manager.save_result("BTCUSDT", "mid_short", far))
+            _save_and_publish(manager, "BTCUSDT", "scalping", near)
+            _save_and_publish(manager, "BTCUSDT", "mid_short", far)
 
             assert _counts(db) == (2, 0)
             active = manager.control_plane.active_forecasts(
@@ -604,8 +610,8 @@ def test_candidate_ticket_revalidates_release_evidence_after_startup():
         near["alpha_prediction"] = _authorized_alpha(manifest, horizon_sec=180)
         far = _prediction("rejected")
         far["alpha_prediction"] = _authorized_alpha(manifest, horizon_sec=900)
-        asyncio.run(manager.save_result("BTCUSDT", "scalping", near))
-        asyncio.run(manager.save_result("BTCUSDT", "mid_short", far))
+        _save_and_publish(manager, "BTCUSDT", "scalping", near)
+        _save_and_publish(manager, "BTCUSDT", "mid_short", far)
 
         assert _counts(db) == (2, 0)
         assert manager.profitability_authorized is False
@@ -627,7 +633,7 @@ def test_prediction_file_is_atomic_and_read_does_not_refresh_its_age():
             control_plane_db=root / "control.sqlite3",
             tickets_enabled=False,
         )
-        asyncio.run(manager.save_result("BTCUSDT", "scalping", _prediction("shadow")))
+        _save_and_publish(manager, "BTCUSDT", "scalping", _prediction("shadow"))
         path = root / "results" / "BTCUSDT_scalping.json"
         first = json.loads(path.read_text(encoding="utf-8"))
         loaded = manager.get_latest_results()["BTCUSDT"]["details"]["scalping"]

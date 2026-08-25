@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import time
+import shutil
+import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -52,6 +54,10 @@ class TradingExecutionService:
         self.soak_monitor = SoakMonitor(self.store, log_paths=log_paths)
         self._last_soak_sample_monotonic = 0.0
         self._reconcile_inconsistencies = 0
+        self.instance_id = (
+            f"{settings.deployment_id or 'local'}:{settings.host_id or 'host'}:"
+            f"{uuid.uuid4().hex[:16]}"
+        )
         self.account_client = build_exchange_gateway(settings)
         self.public_exchange = _public_exchange(settings)
         self.ticket_client = TicketHttpClient(
@@ -59,6 +65,8 @@ class TradingExecutionService:
             token=settings.ticket_api_token,
             timeout_seconds=settings.prediction_timeout_seconds,
             verify=settings.requests_verify,
+            client_cert=settings.requests_client_cert,
+            consumer_id=settings.ticket_consumer_id,
         )
         self.stream_handler = PrivateStreamHandler(self.store)
         self.websocket = None
@@ -105,6 +113,7 @@ class TradingExecutionService:
             consumer=consumer,
             reporter=self.reporter,
             store=self.store,
+            service_session_id=self.instance_id,
         )
         self.reconciler = ExecutionReconciler(
             self.store, BybitReconciliationGateway(self.account_client)
@@ -112,6 +121,11 @@ class TradingExecutionService:
         self.last_poll_at = None
         self.last_poll_result = None
         self.last_error = None
+        self.last_reconciliation_error = None
+        self.last_control_error = None
+        self.last_control_handshake = None
+        self.control_plane_ready = False
+        self._control_freeze_owned = False
         self.last_ownership_audit = None
         self.health_server = HealthServer(
             settings.health_host, settings.health_port, self.health_snapshot
@@ -285,35 +299,134 @@ class TradingExecutionService:
                 int(age_seconds),
             )
 
+    def _freeze_for_control_plane(self, reason: str) -> None:
+        runtime = self.store.system_runtime()
+        if runtime.get("incident_mode") == IncidentMode.NORMAL.value:
+            self.store.set_incident_mode(IncidentMode.FREEZE_NEW_RISK, reason)
+            self._control_freeze_owned = True
+
+    def _refresh_control_plane_handshake(self):
+        result = self.ticket_client.handshake(
+            consumer_id=self.settings.ticket_consumer_id,
+            instance_id=self.instance_id,
+            account_id=self.settings.position_owner_id,
+            executor_version=self.settings.executor_version,
+            expected_cluster_id=self.settings.cluster_id,
+            expected_deployment_id=self.settings.deployment_id,
+            max_clock_skew_seconds=self.settings.max_control_plane_clock_drift_seconds,
+        )
+        self.last_control_handshake = result
+        self.control_plane_ready = bool(result.ready)
+        if result.ready:
+            self.last_control_error = None
+            if (
+                self._control_freeze_owned
+                and self.store.system_runtime().get("incident_mode")
+                == IncidentMode.FREEZE_NEW_RISK.value
+            ):
+                self.store.set_incident_mode(
+                    IncidentMode.NORMAL, "control-plane handshake recovered"
+                )
+            self._control_freeze_owned = False
+        else:
+            self.last_control_error = result.reason
+            self._freeze_for_control_plane(
+                f"control-plane handshake blocked ticket intake: {result.reason}"
+            )
+        return result
+
     def health_snapshot(self) -> dict:
         runtime = self.store.system_runtime()
         websocket_healthy = self.stream_handler.health_confirmed()
+        control_ready = bool(getattr(self, "control_plane_ready", True))
+        counts = self.store.operational_counts()
+        ownership = self.last_ownership_audit or {}
+        reconciliation_ready = bool(runtime.get("reconciliation_complete"))
+        live_websocket_required = self.settings.mode in {
+            TradingMode.TESTNET,
+            TradingMode.LIVE,
+        }
+        handshake = getattr(self, "last_control_handshake", None)
+        latest_forecast_age = (
+            (handshake.capabilities or {}).get("latest_forecast_age_seconds")
+            if handshake is not None
+            else None
+        )
+        market_freshness_required = hasattr(
+            self.settings, "prediction_max_age_seconds"
+        )
+        market_data_ready = bool(
+            latest_forecast_age is not None
+            and float(latest_forecast_age)
+            <= float(getattr(self.settings, "prediction_max_age_seconds", 600))
+        )
+        setting_value = lambda name, default: getattr(
+            getattr(self.settings, name, default), "value", getattr(self.settings, name, default)
+        )
         degraded = bool(
             self.last_error
-            or not runtime.get("reconciliation_complete")
+            or not reconciliation_ready
+            or not control_ready
+            or (market_freshness_required and not market_data_ready)
             or runtime.get("incident_mode") != IncidentMode.NORMAL.value
-            or (
-                self.settings.mode in {TradingMode.TESTNET, TradingMode.LIVE}
-                and not websocket_healthy
-            )
+            or (live_websocket_required and not websocket_healthy)
         )
+        ready = not degraded and not self.store.kill_switch_enabled()
         return {
             "status": "degraded" if degraded else "ok",
+            "ready": ready,
             "mode": self.settings.mode.value,
+            "deployment_environment": setting_value("app_environment", "development"),
+            "service_role": setting_value("service_role", "executor"),
+            "execution_mode": setting_value("execution_mode", self.settings.mode.value),
             "kill_switch": self.store.kill_switch_enabled(),
             "incident_mode": runtime.get("incident_mode"),
-            "reconciliation_complete": bool(runtime.get("reconciliation_complete")),
+            "prediction_node_connected": control_ready,
+            "control_plane_ready": control_ready,
+            "ticket_intake": "ready" if ready else "frozen",
+            "receipt_delivery": {
+                "status": "blocked" if counts["receipt_dead_letter_count"] else "ready",
+                "outbox_depth": counts["receipt_outbox_backlog"],
+                "dead_letter_count": counts["receipt_dead_letter_count"],
+            },
+            "exchange_reconciliation": {
+                "ready": reconciliation_ready,
+                "last_error": getattr(self, "last_reconciliation_error", None),
+            },
+            "reconciliation_complete": reconciliation_ready,
             "account_ownership": self.last_ownership_audit,
+            "position_protection": "ready" if reconciliation_ready else "degraded",
+            "private_websocket": {
+                "required": live_websocket_required,
+                "connected": websocket_healthy,
+            },
             "private_websocket_connected": websocket_healthy,
             "private_websocket_last_message_at": (
                 self.stream_handler.last_message_at.isoformat()
                 if self.stream_handler.last_message_at else None
             ),
             "private_stream_ignored_records": self.stream_handler.ignored_records,
+            "market_data": (
+                "ready"
+                if market_data_ready
+                else ("stale" if latest_forecast_age is not None else "unknown")
+            ),
+            "clock_skew": {
+                "control_plane_seconds": (
+                    handshake.clock_skew_seconds if handshake is not None else None
+                ),
+                "exchange_seconds": getattr(self, "_last_exchange_clock_drift", None),
+            },
+            "outbox_depth": counts["receipt_outbox_backlog"],
+            "dead_letter_count": counts["receipt_dead_letter_count"],
+            "disk_free": shutil.disk_usage(self.store.db_path.parent).free,
+            "model_loaded": False,
+            "latest_forecast_age": latest_forecast_age,
             "incomplete_ticket_count": len(self.store.incomplete_ticket_ids()),
             "last_poll_at": self.last_poll_at,
             "last_poll_result": self.last_poll_result,
             "last_error": self.last_error,
+            "last_control_error": getattr(self, "last_control_error", None),
             "soak_run_id": self.soak_monitor.run_id,
         }
 
@@ -360,6 +473,9 @@ class TradingExecutionService:
             self._enforce_max_holding()
             self._recover_take_profits()
             self.store.set_reconciliation_complete(True, "startup reconciliation complete")
+            self.last_reconciliation_error = None
+            self._refresh_control_plane_handshake()
+            self.last_error = self.last_control_error
             self.health_server.start()
         except Exception:
             if self.websocket is not None:
@@ -370,6 +486,7 @@ class TradingExecutionService:
             raise
 
     def run_once(self) -> None:
+        exchange_ready = False
         try:
             self.store.set_reconciliation_complete(False, "periodic reconciliation in progress")
             if self.settings.mode in {TradingMode.TESTNET, TradingMode.LIVE}:
@@ -381,16 +498,31 @@ class TradingExecutionService:
             self._enforce_max_holding()
             self._recover_take_profits()
             self.store.set_reconciliation_complete(True, "periodic reconciliation complete")
-            result = self.consumer_service.run_once()
-            self.last_poll_at = datetime.now(timezone.utc).isoformat()
-            self.last_poll_result = result.__dict__
-            self.last_error = None
+            self.last_reconciliation_error = None
+            exchange_ready = True
         except Exception as exc:
             self._reconcile_inconsistencies += 1
             self.store.set_reconciliation_complete(False, "periodic reconciliation failed")
-            self.last_error = f"{type(exc).__name__}: {exc}"
-            logger.exception("ticket consumer iteration failed")
+            self.last_reconciliation_error = f"{type(exc).__name__}: {exc}"
+            logger.exception("exchange reconciliation/protection iteration failed")
+        try:
+            handshake = self._refresh_control_plane_handshake()
+            if handshake.ready and exchange_ready:
+                result = self.consumer_service.run_once()
+                self.last_poll_at = datetime.now(timezone.utc).isoformat()
+                self.last_poll_result = result.__dict__
+                self.last_control_error = None
+            elif handshake.ready:
+                self.last_control_error = "exchange reconciliation is not ready"
+        except Exception as exc:
+            self.control_plane_ready = False
+            self.last_control_error = f"{type(exc).__name__}: {exc}"
+            self._freeze_for_control_plane(
+                f"ticket intake failed closed: {self.last_control_error}"
+            )
+            logger.exception("control-plane ticket intake iteration failed")
         finally:
+            self.last_error = self.last_reconciliation_error or self.last_control_error
             self._sample_soak()
 
     def run_forever(self) -> None:

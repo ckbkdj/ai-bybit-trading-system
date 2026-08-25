@@ -1,0 +1,15 @@
+groups:
+  - name: ai-bybit-executor-paper
+    rules:
+      - alert: ExecutorReconciliationFailed
+        expr: ai_bybit_exchange_reconciliation_ready != 1
+        for: 1m
+      - alert: ExecutorControlPlaneDisconnected
+        expr: ai_bybit_control_plane_ready != 1
+        for: 2m
+      - alert: ExecutorReceiptDeadLetter
+        expr: ai_bybit_receipt_dead_letter_count > 0
+        for: 1m
+      - alert: ExecutorClockSkew
+        expr: abs(ai_bybit_control_plane_clock_skew_seconds) > 5
+        for: 1m

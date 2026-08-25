@@ -3,6 +3,10 @@ import logging
 import signal
 import sys
 
+from core.service_runtime import load_predictor_runtime
+
+load_predictor_runtime()
+
 from core.config_loader import load_config
 from core.portfolio3_3_fixed import PortfolioPredictor
 from core.scheduler import Scheduler, Job

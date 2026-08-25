@@ -1,0 +1,8 @@
+# The executor does not expose a control-plane reverse proxy.
+# Its HTTPS client must trust only control-plane-ca.crt and present executor-paper-01.crt/key.
+# The server-side reference configuration is:
+# ../predictor-production-paper/nginx/control-plane-mtls.conf
+TICKET_API_BASE_URL=https://predictor-paper.internal:8443
+CONTROL_PLANE_MTLS_CERT=/etc/ai-bybit/pki/executor-paper-01.crt
+CONTROL_PLANE_MTLS_KEY=/etc/ai-bybit/pki/executor-paper-01.key
+PREDICTION_CA_BUNDLE=/etc/ai-bybit/pki/control-plane-ca.crt

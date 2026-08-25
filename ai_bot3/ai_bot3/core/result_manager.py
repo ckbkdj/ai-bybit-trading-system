@@ -14,6 +14,7 @@ from adapters.legacy_forecast_adapter import LegacyForecastAdapter
 from contracts.horizons import MAX_CANDIDATE_KLINE_AGE_SEC, horizon_for_mode
 from core.control_plane import ControlPlaneRepository
 from core.decision.ticket_builder import TicketBuilder
+from core.publication_outbox import ForecastPublicationOutbox, PublicationWorker
 from core.release.profitability_release import verify_candidate_authorization
 
 
@@ -166,6 +167,7 @@ class ResultManager:
         results_dir: Path,
         *,
         control_plane_db: Path | None = None,
+        publication_outbox_db: Path | None = None,
         tickets_enabled: bool | None = None,
         required_brain_release_stage: str | None = None,
         strategy_release_bundle=None,
@@ -187,7 +189,15 @@ class ResultManager:
         if self.required_brain_release_stage not in {"candidate", "live"}:
             raise ValueError("required_brain_release_stage must be candidate or live")
         default_db = self.results_dir.parent / "data" / "control_plane.sqlite3"
-        self.control_plane = ControlPlaneRepository(control_plane_db or default_db)
+        self.control_plane_db = Path(control_plane_db or default_db)
+        self._control_plane: ControlPlaneRepository | None = None
+        default_outbox = self.results_dir.parent / "data" / "forecast_publication_outbox.sqlite3"
+        self.publication_outbox = ForecastPublicationOutbox(
+            Path(publication_outbox_db or default_outbox)
+        )
+        self.publication_worker = PublicationWorker(
+            self.publication_outbox, lambda: self.control_plane
+        )
         self.forecast_adapter = LegacyForecastAdapter()
         self.ticket_builder = TicketBuilder()
         from core.decision.portfolio_intent import PortfolioIntentBuilder
@@ -219,6 +229,17 @@ class ResultManager:
         self.profitability_authorization_reason = "not_verified"
         self.profitability_manifest = None
         self._refresh_profitability_authorization()
+
+    @property
+    def control_plane(self) -> ControlPlaneRepository:
+        if self._control_plane is None:
+            self._control_plane = ControlPlaneRepository(self.control_plane_db)
+        return self._control_plane
+
+    def publish_pending(self, *, limit: int = 100) -> dict[str, int]:
+        """Test/maintenance hook; production runs this in the publisher process."""
+
+        return self.publication_worker.run_once(limit=limit)
 
     def _refresh_profitability_authorization(self) -> bool:
         """Revalidate mutable release evidence before every candidate ticket."""
@@ -396,20 +417,19 @@ class ResultManager:
             normalized["training_metadata"] = meta
         file_path = self._get_file_path(symbol, mode)
         await asyncio.to_thread(_atomic_json_write, file_path, normalized)
+        ticket_authorized = bool(
+            self.tickets_enabled
+            and self._brain_authorized_for_ticket(normalized, mode)
+        )
+        forecast = self.forecast_adapter.adapt(
+            symbol,
+            mode,
+            normalized,
+            execution_authorized=ticket_authorized,
+        )
+        ticket = None
+        portfolio_intent = None
         try:
-            ticket_authorized = bool(
-                self.tickets_enabled
-                and self._brain_authorized_for_ticket(normalized, mode)
-            )
-            forecast = self.forecast_adapter.adapt(
-                symbol,
-                mode,
-                normalized,
-                execution_authorized=ticket_authorized,
-            )
-            await asyncio.to_thread(self.control_plane.publish, forecast, None)
-            ticket = None
-            portfolio_intent = None
             if ticket_authorized:
                 reference_price = _finite_float(
                     normalized["alpha_prediction"]["feature_evidence"][
@@ -423,6 +443,12 @@ class ResultManager:
                         symbol,
                         strategy_release_id=release_id,
                     )
+                    if all(
+                        (item.forecast_id, item.revision)
+                        != (forecast.forecast_id, forecast.revision)
+                        for item in forecasts
+                    ):
+                        forecasts = [*forecasts, forecast]
                     decision_version = await asyncio.to_thread(
                         self.control_plane.next_portfolio_decision_version, symbol
                     )
@@ -455,13 +481,23 @@ class ResultManager:
                             reference_price=reference_price,
                             required_position_version=position_version,
                         )
-            if ticket and portfolio_intent:
-                await asyncio.to_thread(
-                    self.control_plane.publish, forecast, ticket, portfolio_intent
-                )
         except Exception as exc:
-            # The legacy prediction remains available, but ticket generation is fail-closed.
-            logging.exception("预测契约/操作票落盘失败，已禁止该结果进入执行通道: %s", exc)
+            # Forecast publication remains durable; only ticket creation fails closed.
+            ticket = None
+            portfolio_intent = None
+            logging.exception("操作票生成失败，Forecast 仍进入持久发布队列: %s", exc)
+        try:
+            await asyncio.to_thread(
+                self.publication_outbox.enqueue,
+                forecast,
+                ticket,
+                portfolio_intent,
+            )
+        except Exception:
+            # The visible prediction file exists, but callers must observe that its
+            # publication contract was not made durable. Never silently drop it.
+            logging.critical("Forecast publication outbox enqueue failed", exc_info=True)
+            raise
         logging.info(f"已保存 {symbol} 在 {mode} 时间粒度下的预测结果到 {file_path}")
 
     def save_training_metadata(self, symbol: str, mode: str, metadata: Dict[str, Any]) -> None:

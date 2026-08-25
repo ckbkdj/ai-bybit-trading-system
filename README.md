@@ -5,6 +5,8 @@ and Bybit execution. It is ready for continued release hardening; it is not a
 profitability claim and it does not authorize mainnet trading.
 
 - [Current release documentation](docs/current/README.md)
+- [Two-node production-paper architecture](docs/current/TWO_NODE_ARCHITECTURE.md)
+- [Two-node deployment](docs/current/TWO_NODE_DEPLOYMENT.md)
 - [Shadow deployment](docs/current/SHADOW_DEPLOYMENT.md)
 - [Testnet preflight](docs/current/TESTNET_DEPLOYMENT.md)
 - [Profitability and mainnet status](docs/current/PROFITABILITY_STATUS.md)
