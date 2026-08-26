@@ -104,8 +104,8 @@ def main() -> int:
         "deploy/practical/predictor.compose.yml",
         "deploy/practical/executor.compose.yml",
         "deploy/practical/shadow-lab.compose.yml",
-        "deploy/practical/predictor.env.example",
-        "deploy/practical/executor.env.example",
+        "deploy/practical/.env.predictor.example",
+        "deploy/practical/.env.executor.example",
         "deploy/practical/nginx.conf",
         "deploy/practical/bootstrap-shadow-pki.sh",
         "deploy/practical/up.sh",
@@ -172,8 +172,8 @@ def main() -> int:
             raise RuntimeError(f"mTLS proxy contract missing: {required_line}")
 
     for env_file in (
-        "deploy/practical/predictor.env.example",
-        "deploy/practical/executor.env.example",
+        "deploy/practical/.env.predictor.example",
+        "deploy/practical/.env.executor.example",
     ):
         content = read(env_file)
         if "BYBIT_ENABLE_LIVE=false" not in content or "MAINNET_ALLOWED=false" not in content:

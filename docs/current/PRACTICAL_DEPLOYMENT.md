@@ -29,8 +29,8 @@ deploy/docker/Dockerfile
 deploy/practical/predictor.compose.yml
 deploy/practical/executor.compose.yml
 deploy/practical/shadow-lab.compose.yml
-deploy/practical/predictor.env.example
-deploy/practical/executor.env.example
+deploy/practical/.env.predictor.example
+deploy/practical/.env.executor.example
 deploy/practical/bootstrap-shadow-pki.sh
 deploy/practical/up.sh
 deploy/practical/up.ps1
@@ -79,7 +79,7 @@ your existing private CA.
 ## 3. Predictor host
 
 ```bash
-cp deploy/practical/predictor.env.example deploy/practical/predictor.env
+cp deploy/practical/.env.predictor.example deploy/practical/predictor.env
 ```
 
 Replace every `<replace-...>` value and set `APP_CODE_COMMIT` to the exact SHA.
@@ -118,7 +118,7 @@ Telegram alerts are enabled only when `TELEGRAM_BOT_TOKEN` and
 ## 4. Executor host
 
 ```bash
-cp deploy/practical/executor.env.example deploy/practical/executor.env
+cp deploy/practical/.env.executor.example deploy/practical/executor.env
 ```
 
 Set the same `CLUSTER_ID`, `DEPLOYMENT_ID` and exact `APP_CODE_COMMIT` as the
