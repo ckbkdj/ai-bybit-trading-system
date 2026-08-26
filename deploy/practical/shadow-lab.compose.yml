@@ -20,20 +20,22 @@ services:
       PREDICTOR_DATA_DIR: /var/lib/ai-bybit/predictor-realtime
       FORECAST_PUBLICATION_OUTBOX_DB: /var/lib/ai-bybit/publication-worker/outbox.sqlite3
       CONTROL_PLANE_DB: /var/lib/ai-bybit/control-plane/control.sqlite3
-      RESEARCH_JOB_DB: /var/lib/ai-bybit/control-plane/research-disabled.sqlite3
+      RESEARCH_JOB_DB: /var/lib/ai-bybit/control-plane/research.sqlite3
       AI_BOT_TICKETS_ENABLED: "true"
       MAINNET_ALLOWED: "false"
     volumes:
       - lab-control:/var/lib/ai-bybit/control-plane
       - lab-publication:/var/lib/ai-bybit/publication-worker
-    expose: ["8000"]
+    ports:
+      - "127.0.0.1:${LAB_CONTROL_PORT:-18000}:8000"
     restart: unless-stopped
     init: true
     healthcheck:
       test: ["CMD", "python", "/opt/ai-bybit/tcp_healthcheck.py", "--port", "8000"]
       interval: 5s
       timeout: 2s
-      retries: 10
+      retries: 12
+      start_period: 10s
 
   executor:
     build:
@@ -57,6 +59,8 @@ services:
       SHADOW_ACCOUNT_EQUITY_USDT: "10000"
       HEALTH_HOST: 0.0.0.0
       HEALTH_PORT: "8787"
+      BYBIT_POSITION_MODE: one_way
+      BYBIT_ALLOW_MANUAL_ORDERS: "false"
       BYBIT_ENABLE_LIVE: "false"
       MAINNET_ALLOWED: "false"
     depends_on:
@@ -65,9 +69,15 @@ services:
     volumes:
       - lab-executor:/var/lib/ai-bybit/executor
     ports:
-      - "127.0.0.1:${LAB_EXECUTOR_HEALTH_PORT:-8787}:8787"
+      - "127.0.0.1:${LAB_EXECUTOR_HEALTH_PORT:-18787}:8787"
     restart: unless-stopped
     init: true
+    healthcheck:
+      test: ["CMD", "python", "/opt/ai-bybit/tcp_healthcheck.py", "--port", "8787"]
+      interval: 5s
+      timeout: 2s
+      retries: 24
+      start_period: 20s
 
   ops-console:
     build:
@@ -85,11 +95,17 @@ services:
       control-plane:
         condition: service_healthy
       executor:
-        condition: service_started
+        condition: service_healthy
     ports:
-      - "127.0.0.1:${LAB_OPS_PORT:-8790}:8790"
+      - "127.0.0.1:${LAB_OPS_PORT:-18790}:8790"
     restart: unless-stopped
     init: true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8790/healthz', timeout=2).read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
 
   predictor-realtime:
     build:

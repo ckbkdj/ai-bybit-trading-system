@@ -8,8 +8,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /opt/ai-bybit
 COPY requirements/linux-py311.lock /opt/ai-bybit/requirements/linux-py311.lock
-RUN python -m pip install --upgrade pip \
-    && python -m pip install --require-hashes -r /opt/ai-bybit/requirements/linux-py311.lock
+RUN python -m pip install --require-hashes -r /opt/ai-bybit/requirements/linux-py311.lock
 
 FROM locked-runtime AS predictor
 RUN groupadd --gid 10001 ai-bybit \
