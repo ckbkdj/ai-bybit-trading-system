@@ -7,6 +7,7 @@ Type=simple
 User=ai-bybit
 WorkingDirectory=/opt/ai-bybit/ai_bot3/ai_bot3
 EnvironmentFile=/etc/ai-bybit/predictor-production-paper.env
+Environment=PYTHONPATH=/opt/ai-bybit:/opt/ai-bybit/ai_bot3/ai_bot3
 ExecStart=/opt/ai-bybit/.venv/bin/python scripts/run_publication_worker.py
 Restart=on-failure
 CPUQuota=25%
