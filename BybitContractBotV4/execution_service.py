@@ -98,11 +98,14 @@ class TicketConsumerService:
 
     def run_once(self, limit: int = 100) -> PollResult:
         delivered = self.flush_receipts()
-        cursor = self.store.consumer_cursor(self.consumer_id)
-        page = self.client.fetch_page(cursor, self.consumer_id, limit)
+        starting_cursor = self.store.consumer_cursor(self.consumer_id)
+        page = self.client.fetch_page(starting_cursor, self.consumer_id, limit)
         items = page.items
         processed = 0
         conflicts = 0
+        cursor_advanced_to = starting_cursor
+        blocked_by_active_claim = False
+
         for item in items:
             lease = deterministic_lease_token(
                 self.consumer_id, item.ticket.ticket_id, self.service_session_id
@@ -111,9 +114,15 @@ class TicketConsumerService:
                 item.ticket.ticket_id, self.consumer_id, lease, 60
             )
             if claim_epoch is None:
+                # A previous process may have claimed the ticket and crashed before
+                # recording it locally.  Advancing the cursor here would lose that
+                # work item permanently.  Stop at the first active lease and retry
+                # from the same cursor after the lease expires or reconciliation
+                # proves the ticket terminal.
                 conflicts += 1
-                self.store.advance_consumer_cursor(self.consumer_id, item.cursor)
-                continue
+                blocked_by_active_claim = True
+                break
+
             self.consumer.process(
                 item.ticket,
                 claim_epoch=claim_epoch,
@@ -123,10 +132,23 @@ class TicketConsumerService:
             try:
                 delivered += self.flush_receipts()
             finally:
-                # Local durable state is authoritative; remote delivery remains in receipt_outbox on failure.
+                # Local durable state is authoritative; remote delivery remains in
+                # receipt_outbox on failure.  This ticket alone is now safe to pass.
                 self.store.advance_consumer_cursor(self.consumer_id, item.cursor)
+                cursor_advanced_to = item.cursor
             processed += 1
-        self.store.advance_consumer_cursor(self.consumer_id, page.next_cursor)
+
+        if not blocked_by_active_claim:
+            # The server may fast-forward over expired/superseded rows that were not
+            # returned in ``items``.  Apply that fast-forward only when no unresolved
+            # claim lies between the starting cursor and the page boundary.
+            self.store.advance_consumer_cursor(self.consumer_id, page.next_cursor)
+            cursor_advanced_to = page.next_cursor
+
         return PollResult(
-            len(items), processed, conflicts, delivered, page.next_cursor
+            len(items),
+            processed,
+            conflicts,
+            delivered,
+            cursor_advanced_to,
         )
