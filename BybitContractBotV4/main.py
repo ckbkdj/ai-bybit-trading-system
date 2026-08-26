@@ -1,7 +1,7 @@
 """Deployable entrypoint for the versioned Bybit execution service.
 
 The ``--preflight`` path validates the production-paper configuration without
-constructing an exchange client or opening any network connection.  Normal
+constructing an exchange client or opening any network connection. Normal
 startup delegates to the existing active service implementation.
 """
 
@@ -9,7 +9,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from collections.abc import Sequence
+from pathlib import Path
+
+
+SERVICE_ROOT = Path(__file__).resolve().parent
+REPOSITORY_ROOT = SERVICE_ROOT.parent
+for candidate in (REPOSITORY_ROOT, SERVICE_ROOT):
+    text = str(candidate)
+    if text not in sys.path:
+        sys.path.insert(0, text)
 
 from runtime_config import TradingMode, TradingSettings
 

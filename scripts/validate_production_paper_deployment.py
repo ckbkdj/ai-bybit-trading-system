@@ -107,6 +107,7 @@ def _validate_static_artifacts() -> dict[str, Any]:
     windows_executor = _read(
         "deploy/executor-production-paper/windows/install-service.ps1"
     )
+    predictor_entry = _read("ai_bot3/ai_bot3/main_forecast.py")
 
     checks = {
         "executor_entrypoint_exists": (EXECUTOR_ROOT / "main.py").is_file(),
@@ -136,6 +137,11 @@ def _validate_static_artifacts() -> dict[str, Any]:
             and "api\\api_server.py" not in windows_predictor
         ),
         "windows_executor_uses_main": '"main.py"' in windows_executor,
+        "predictor_uses_external_runtime_root": (
+            "PREDICTOR_DATA_DIR" in predictor_entry
+            and "os.chdir(root)" in predictor_entry
+            and 'PROJECT_ROOT / "config.yml"' in predictor_entry
+        ),
     }
     failed = sorted(name for name, passed in checks.items() if not passed)
     if failed:
@@ -145,6 +151,9 @@ def _validate_static_artifacts() -> dict[str, Any]:
 
 def _validate_executor_preflight(temp_root: Path) -> dict[str, Any]:
     environment = _base_environment("executor")
+    # The checked-in entrypoint must be usable from its service directory even
+    # when an operator does not manually export PYTHONPATH.
+    environment.pop("PYTHONPATH", None)
     environment.update(
         {
             "EXECUTION_DB_PATH": str(temp_root / "executor" / "execution.sqlite3"),
