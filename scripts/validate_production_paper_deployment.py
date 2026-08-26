@@ -115,9 +115,10 @@ def _validate_static_artifacts() -> dict[str, Any]:
         "executor_systemd_has_repo_pythonpath": (
             "Environment=PYTHONPATH=/opt/ai-bybit:" in executor_unit
         ),
-        "control_plane_uses_versioned_app": (
-            "api.control_plane_main:app" in control_unit
+        "control_plane_uses_minimal_versioned_app": (
+            "api/control_plane_server.py" in control_unit
             and "api/api_server.py" not in control_unit
+            and "api.control_plane_main:app" not in control_unit
         ),
         "predictor_systemd_has_repo_pythonpath": (
             "Environment=PYTHONPATH=/opt/ai-bybit:" in predictor_unit
@@ -129,12 +130,18 @@ def _validate_static_artifacts() -> dict[str, Any]:
             "FORECAST_PUBLICATION_OUTBOX_DB=" in predictor_env
             and "\nFORECAST_PUBLICATION_OUTBOX=" not in predictor_env
         ),
-        "production_predictor_has_no_research_db": (
-            "\nRESEARCH_JOB_DB=" not in predictor_env
+        "production_predictor_has_disabled_research_store": (
+            "\nRESEARCH_JOB_DB=/var/lib/ai-bybit/control-plane/research-disabled.sqlite3"
+            in predictor_env
         ),
-        "windows_predictor_uses_versioned_app": (
-            "api.control_plane_main:app" in windows_predictor
+        "windows_predictor_uses_minimal_versioned_app": (
+            "api\\control_plane_server.py" in windows_predictor
+            and "api.control_plane_main:app" not in windows_predictor
             and "api\\api_server.py" not in windows_predictor
+        ),
+        "windows_predictor_runs_preflight": (
+            "preflight_production_predictor.py" in windows_predictor
+            and "Predictor preflight failed" in windows_predictor
         ),
         "windows_executor_uses_main": '"main.py"' in windows_executor,
         "predictor_uses_external_runtime_root": (
@@ -187,7 +194,7 @@ def _validate_executor_preflight(temp_root: Path) -> dict[str, Any]:
 def _validate_predictor_composition(temp_root: Path) -> dict[str, Any]:
     environment = _base_environment("predictor")
     outbox_path = temp_root / "publication" / "forecast-outbox.sqlite3"
-    research_path = temp_root / "forbidden-research" / "research.sqlite3"
+    research_path = temp_root / "control" / "research-disabled.sqlite3"
     environment.update(
         {
             "PREDICTOR_DATA_DIR": str(temp_root / "predictor"),
@@ -208,10 +215,11 @@ def _validate_predictor_composition(temp_root: Path) -> dict[str, Any]:
 import json
 import os
 from pathlib import Path
-from api.control_plane_main import app
+from api.control_plane_server import app
 from core.result_manager import ResultManager
 
 expected = Path(os.environ["FORECAST_PUBLICATION_OUTBOX_DB"]).resolve()
+research = Path(os.environ["RESEARCH_JOB_DB"]).resolve()
 manager = ResultManager(
     Path(os.environ["VALIDATION_RESULTS_DIR"]),
     tickets_enabled=False,
@@ -220,6 +228,8 @@ payload = {
     "route_count": len(app.routes),
     "publication_outbox": str(manager.publication_outbox_db),
     "canonical_outbox_match": manager.publication_outbox_db == expected,
+    "disabled_research_store": str(research),
+    "disabled_research_store_created": research.is_file(),
 }
 print(json.dumps(payload, sort_keys=True))
 """
@@ -231,8 +241,10 @@ print(json.dumps(payload, sort_keys=True))
     payload = json.loads(output)
     if not payload.get("canonical_outbox_match"):
         raise RuntimeError("predictor and publication worker outbox paths diverged")
-    if research_path.exists():
-        raise RuntimeError("production control plane created a research database")
+    if not payload.get("disabled_research_store_created"):
+        raise RuntimeError("minimal control plane did not initialize its disabled research store")
+    if research_path.parent != Path(environment["CONTROL_PLANE_DB"]).parent:
+        raise RuntimeError("disabled research store must remain inside the control-plane data root")
     return payload
 
 
