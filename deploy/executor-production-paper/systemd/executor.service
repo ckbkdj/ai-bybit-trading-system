@@ -7,6 +7,7 @@ Type=simple
 User=ai-bybit-executor
 WorkingDirectory=/opt/ai-bybit/BybitContractBotV4
 EnvironmentFile=/etc/ai-bybit/executor-production-paper.env
+Environment=PYTHONPATH=/opt/ai-bybit:/opt/ai-bybit/BybitContractBotV4
 ExecStart=/opt/ai-bybit/.venv/bin/python main.py
 Restart=on-failure
 CPUQuota=100%
