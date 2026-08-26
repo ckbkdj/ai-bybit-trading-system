@@ -180,10 +180,13 @@ def main() -> int:
             raise RuntimeError(f"{env_file} is not fail-closed")
         if "BYBIT_TRADING_MODE=shadow" not in content:
             raise RuntimeError(f"{env_file} is not a Shadow example")
+    practical_predictor_env = read("deploy/practical/.env.predictor.example")
+    if "\nRESEARCH_JOB_DB=" in practical_predictor_env:
+        raise RuntimeError("practical production predictor must not define RESEARCH_JOB_DB")
 
     production_env = read("deploy/predictor-production-paper/.env.production-paper.example")
-    if "RESEARCH_JOB_DB=/var/lib/ai-bybit/control-plane/research-disabled.sqlite3" not in production_env:
-        raise RuntimeError("production control plane has no writable disabled-research store")
+    if "\nRESEARCH_JOB_DB=" in production_env:
+        raise RuntimeError("production predictor must not define RESEARCH_JOB_DB")
     control_unit = read("deploy/predictor-production-paper/systemd/control-plane-api.service")
     if "preflight_production_predictor.py" not in control_unit:
         raise RuntimeError("systemd control plane does not run the offline predictor preflight")
@@ -210,6 +213,7 @@ def main() -> int:
         "predictor_services": sorted(predictor["services"]),
         "executor_services": sorted(executor["services"]),
         "shadow_lab_services": sorted(lab["services"]),
+        "production_research_repository": "disabled",
         "vue_console": True,
         "telegram_alerting": True,
         "physical_shadow_acceptance": True,

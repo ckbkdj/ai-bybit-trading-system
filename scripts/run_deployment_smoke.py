@@ -22,7 +22,8 @@ def _assert_entrypoints() -> list[str]:
         EXECUTOR_ROOT / "main.py",
         EXECUTOR_ROOT / "bot_threshold_super_v4_1.py",
         PREDICTOR_ROOT / "main_forecast.py",
-        PREDICTOR_ROOT / "api" / "api_server.py",
+        PREDICTOR_ROOT / "api" / "control_plane_server.py",
+        PREDICTOR_ROOT / "scripts" / "preflight_production_predictor.py",
         PREDICTOR_ROOT / "scripts" / "run_publication_worker.py",
         PREDICTOR_ROOT / "scripts" / "run_bybit_public_pit_collector.py",
         ROOT / "shadow_contracts" / "runtime.py",
@@ -45,6 +46,18 @@ def _assert_entrypoints() -> list[str]:
     if "PYTHONPATH=/opt/ai-bybit" not in executor_unit:
         raise RuntimeError("executor systemd unit cannot import shared contracts")
 
+    control_unit = (
+        ROOT
+        / "deploy"
+        / "predictor-production-paper"
+        / "systemd"
+        / "control-plane-api.service"
+    ).read_text(encoding="utf-8")
+    if "api/control_plane_server.py" not in control_unit:
+        raise RuntimeError("control-plane systemd unit does not use the minimal server")
+    if "preflight_production_predictor.py" not in control_unit:
+        raise RuntimeError("control-plane systemd unit has no offline preflight")
+
     predictor_env = (
         ROOT
         / "deploy"
@@ -60,6 +73,10 @@ def _assert_entrypoints() -> list[str]:
     ]
     if legacy_lines:
         raise RuntimeError("legacy publication outbox variable remains active")
+    if any(
+        line.startswith("RESEARCH_JOB_DB=") for line in predictor_env.splitlines()
+    ):
+        raise RuntimeError("production predictor must not configure a research database")
     return [str(path.relative_to(ROOT)) for path in required]
 
 
@@ -115,10 +132,14 @@ def _run_executor_preflight(temp_root: Path) -> dict:
 
 def _run_predictor_path_and_control_plane_smoke(temp_root: Path) -> dict:
     data_root = temp_root / "predictor"
-    data_root.mkdir(parents=True)
-    outbox_path = data_root / "publication.sqlite3"
-    control_path = data_root / "control.sqlite3"
-    research_path = data_root / "research-disabled.sqlite3"
+    publication_root = temp_root / "publication"
+    control_root = temp_root / "control"
+    market_root = temp_root / "market"
+    for directory in (data_root, publication_root, control_root, market_root):
+        directory.mkdir(parents=True)
+    outbox_path = publication_root / "publication.sqlite3"
+    control_path = control_root / "control.sqlite3"
+    market_path = market_root / "bybit-public.sqlite3"
 
     environment = dict(os.environ)
     environment.update(
@@ -134,7 +155,8 @@ def _run_predictor_path_and_control_plane_smoke(temp_root: Path) -> dict:
             "PREDICTOR_DATA_DIR": str(data_root),
             "FORECAST_PUBLICATION_OUTBOX_DB": str(outbox_path),
             "CONTROL_PLANE_DB": str(control_path),
-            "RESEARCH_JOB_DB": str(research_path),
+            "BYBIT_PUBLIC_PIT_STORE": str(market_path),
+            "CONTROL_PLANE_BIND_HOST": "127.0.0.1",
             "CONTROL_PLANE_API_TOKEN": "global-smoke-token",
             "CONTROL_PLANE_EXECUTOR_TOKENS": json.dumps(
                 {"executor-smoke-01": "executor-smoke-token"}
@@ -143,16 +165,36 @@ def _run_predictor_path_and_control_plane_smoke(temp_root: Path) -> dict:
                 {"executor-smoke-01": "executor-smoke-01"}
             ),
             "CONTROL_PLANE_TRUSTED_REVERSE_PROXY": "true",
+            "TRAINING_ENABLED": "",
+            "BACKFILL_ENABLED": "",
             "MAINNET_ALLOWED": "false",
         }
     )
-    for forbidden in ("BYBIT_API_KEY", "BYBIT_SECRET_KEY", "EXECUTION_DB_PATH"):
+    for forbidden in (
+        "BYBIT_API_KEY",
+        "BYBIT_SECRET_KEY",
+        "EXECUTION_DB_PATH",
+        "RESEARCH_JOB_DB",
+    ):
         environment.pop(forbidden, None)
+
+    preflight = subprocess.run(
+        [sys.executable, "scripts/preflight_production_predictor.py"],
+        cwd=PREDICTOR_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if preflight.returncode != 0:
+        raise RuntimeError(
+            "predictor preflight failed: " + preflight.stdout + preflight.stderr
+        )
+    preflight_payload = json.loads(preflight.stdout.strip().splitlines()[-1])
 
     code = r'''
 import json
 import os
-import tempfile
 from pathlib import Path
 from core.deployment_bootstrap import configure_predictor_runtime_paths
 
@@ -165,19 +207,23 @@ from api.control_plane_api import create_control_plane_router
 root = Path(os.environ["PREDICTOR_DATA_DIR"]).resolve()
 manager = ResultManager(root / "model_results", tickets_enabled=False)
 worker, worker_outbox = build_worker()
-router = create_control_plane_router(Path.cwd())
+router_root = root / "router-root"
+router_root.mkdir()
+router = create_control_plane_router(router_root)
 actual = manager.publication_outbox.db_path.resolve()
 worker_path = worker_outbox.db_path.resolve()
 assert configured == expected
 assert actual == expected
 assert worker_path == expected
 assert len(router.routes) > 0
+assert router.research_repository is None
+assert not (router_root / "data" / "research_jobs.sqlite3").exists()
 print(json.dumps({
     "expected_outbox": str(expected),
     "result_manager_outbox": str(actual),
     "publication_worker_outbox": str(worker_path),
     "control_plane_routes": len(router.routes),
-    "research_store_path": os.environ["RESEARCH_JOB_DB"],
+    "research_repository_disabled": True,
 }, sort_keys=True))
 '''
     completed = subprocess.run(
@@ -194,7 +240,9 @@ print(json.dumps({
             + completed.stdout
             + completed.stderr
         )
-    return json.loads(completed.stdout.strip().splitlines()[-1])
+    payload = json.loads(completed.stdout.strip().splitlines()[-1])
+    payload["preflight"] = preflight_payload
+    return payload
 
 
 def main() -> int:

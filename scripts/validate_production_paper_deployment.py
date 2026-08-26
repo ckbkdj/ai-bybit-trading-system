@@ -1,8 +1,9 @@
-"""Validate that the production-paper artifacts can actually start.
+"""Validate that production-paper artifacts are executable and role-safe.
 
-This is a no-network, no-exchange preflight. It validates entrypoints, role
-boundaries, the canonical publication outbox and the production control-plane
-composition from an isolated temporary data root.
+This command is deliberately offline: it opens no exchange or network socket.
+It verifies the Linux/Windows service contracts, runs the executor's canonical
+preflight, and imports the minimal production control plane from isolated data
+roots. The production predictor must not initialize a research repository.
 """
 
 from __future__ import annotations
@@ -112,6 +113,7 @@ def _validate_static_artifacts() -> dict[str, Any]:
     checks = {
         "executor_entrypoint_exists": (EXECUTOR_ROOT / "main.py").is_file(),
         "executor_systemd_uses_main": "python main.py" in executor_unit,
+        "executor_systemd_runs_preflight": "main.py --preflight" in executor_unit,
         "executor_systemd_has_repo_pythonpath": (
             "Environment=PYTHONPATH=/opt/ai-bybit:" in executor_unit
         ),
@@ -119,6 +121,9 @@ def _validate_static_artifacts() -> dict[str, Any]:
             "api/control_plane_server.py" in control_unit
             and "api/api_server.py" not in control_unit
             and "api.control_plane_main:app" not in control_unit
+        ),
+        "control_plane_runs_preflight": (
+            "preflight_production_predictor.py" in control_unit
         ),
         "predictor_systemd_has_repo_pythonpath": (
             "Environment=PYTHONPATH=/opt/ai-bybit:" in predictor_unit
@@ -130,9 +135,8 @@ def _validate_static_artifacts() -> dict[str, Any]:
             "FORECAST_PUBLICATION_OUTBOX_DB=" in predictor_env
             and "\nFORECAST_PUBLICATION_OUTBOX=" not in predictor_env
         ),
-        "production_predictor_has_disabled_research_store": (
-            "\nRESEARCH_JOB_DB=/var/lib/ai-bybit/control-plane/research-disabled.sqlite3"
-            in predictor_env
+        "production_predictor_has_no_research_db": (
+            "\nRESEARCH_JOB_DB=" not in predictor_env
         ),
         "windows_predictor_uses_minimal_versioned_app": (
             "api\\control_plane_server.py" in windows_predictor
@@ -158,8 +162,7 @@ def _validate_static_artifacts() -> dict[str, Any]:
 
 def _validate_executor_preflight(temp_root: Path) -> dict[str, Any]:
     environment = _base_environment("executor")
-    # The checked-in entrypoint must be usable from its service directory even
-    # when an operator does not manually export PYTHONPATH.
+    # The canonical entrypoint must bootstrap the shared repository path itself.
     environment.pop("PYTHONPATH", None)
     environment.update(
         {
@@ -193,14 +196,28 @@ def _validate_executor_preflight(temp_root: Path) -> dict[str, Any]:
 
 def _validate_predictor_composition(temp_root: Path) -> dict[str, Any]:
     environment = _base_environment("predictor")
-    outbox_path = temp_root / "publication" / "forecast-outbox.sqlite3"
-    research_path = temp_root / "control" / "research-disabled.sqlite3"
+    predictor_root = temp_root / "predictor"
+    publication_root = temp_root / "publication"
+    control_root = temp_root / "control"
+    market_root = temp_root / "market"
+    router_root = temp_root / "isolated-router-root"
+    for directory in (
+        predictor_root,
+        publication_root,
+        control_root,
+        market_root,
+        router_root,
+    ):
+        directory.mkdir(parents=True)
+
+    outbox_path = publication_root / "forecast-outbox.sqlite3"
     environment.update(
         {
-            "PREDICTOR_DATA_DIR": str(temp_root / "predictor"),
+            "PREDICTOR_DATA_DIR": str(predictor_root),
             "FORECAST_PUBLICATION_OUTBOX_DB": str(outbox_path),
-            "CONTROL_PLANE_DB": str(temp_root / "control" / "control.sqlite3"),
-            "RESEARCH_JOB_DB": str(research_path),
+            "CONTROL_PLANE_DB": str(control_root / "control.sqlite3"),
+            "BYBIT_PUBLIC_PIT_STORE": str(market_root / "bybit-public.sqlite3"),
+            "CONTROL_PLANE_BIND_HOST": "127.0.0.1",
             "CONTROL_PLANE_API_TOKEN": "global-control-token",
             "CONTROL_PLANE_EXECUTOR_TOKENS": (
                 '{"executor-paper-01":"executor-token"}'
@@ -208,28 +225,47 @@ def _validate_predictor_composition(temp_root: Path) -> dict[str, Any]:
             "CONTROL_PLANE_CONSUMER_IDENTITIES": (
                 '{"executor-paper-01":"executor-paper-01"}'
             ),
+            "CONTROL_PLANE_TRUSTED_REVERSE_PROXY": "true",
+            "TRAINING_ENABLED": "",
+            "BACKFILL_ENABLED": "",
             "VALIDATION_RESULTS_DIR": str(temp_root / "results"),
+            "VALIDATION_ROUTER_ROOT": str(router_root),
         }
     )
+    environment.pop("RESEARCH_JOB_DB", None)
+
+    preflight_output = _run(
+        [sys.executable, "scripts/preflight_production_predictor.py"],
+        cwd=PREDICTOR_ROOT,
+        env=environment,
+    )
+    preflight = json.loads(preflight_output)
+    if preflight.get("status") != "PASS" or preflight.get("research_enabled") is not False:
+        raise RuntimeError("predictor preflight did not disable research")
+
     code = """
 import json
 import os
 from pathlib import Path
 from api.control_plane_server import app
+from api.control_plane_api import create_control_plane_router
 from core.result_manager import ResultManager
 
 expected = Path(os.environ["FORECAST_PUBLICATION_OUTBOX_DB"]).resolve()
-research = Path(os.environ["RESEARCH_JOB_DB"]).resolve()
 manager = ResultManager(
     Path(os.environ["VALIDATION_RESULTS_DIR"]),
     tickets_enabled=False,
 )
+router_root = Path(os.environ["VALIDATION_ROUTER_ROOT"])
+router = create_control_plane_router(router_root)
+research_path = router_root / "data" / "research_jobs.sqlite3"
 payload = {
     "route_count": len(app.routes),
+    "isolated_route_count": len(router.routes),
     "publication_outbox": str(manager.publication_outbox_db),
     "canonical_outbox_match": manager.publication_outbox_db == expected,
-    "disabled_research_store": str(research),
-    "disabled_research_store_created": research.is_file(),
+    "research_repository_disabled": router.research_repository is None,
+    "research_database_absent": not research_path.exists(),
 }
 print(json.dumps(payload, sort_keys=True))
 """
@@ -241,10 +277,11 @@ print(json.dumps(payload, sort_keys=True))
     payload = json.loads(output)
     if not payload.get("canonical_outbox_match"):
         raise RuntimeError("predictor and publication worker outbox paths diverged")
-    if not payload.get("disabled_research_store_created"):
-        raise RuntimeError("minimal control plane did not initialize its disabled research store")
-    if research_path.parent != Path(environment["CONTROL_PLANE_DB"]).parent:
-        raise RuntimeError("disabled research store must remain inside the control-plane data root")
+    if not payload.get("research_repository_disabled"):
+        raise RuntimeError("production control plane initialized a research repository")
+    if not payload.get("research_database_absent"):
+        raise RuntimeError("production control plane created a research database")
+    payload["preflight"] = preflight
     return payload
 
 

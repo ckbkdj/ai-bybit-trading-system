@@ -45,6 +45,11 @@ def main() -> int:
         "off",
     }:
         errors.append("MAINNET_ALLOWED must remain false")
+    if os.environ.get("RESEARCH_JOB_DB", "").strip():
+        errors.append("production predictor must not define RESEARCH_JOB_DB")
+    for name in ("TRAINING_ENABLED", "BACKFILL_ENABLED"):
+        if os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}:
+            errors.append(f"{name} must remain disabled on the production predictor")
 
     global_token = os.environ.get("CONTROL_PLANE_API_TOKEN", "")
     if _placeholder(global_token):
@@ -80,7 +85,6 @@ def main() -> int:
         for name in (
             "PREDICTOR_DATA_DIR",
             "CONTROL_PLANE_DB",
-            "RESEARCH_JOB_DB",
             "BYBIT_PUBLIC_PIT_STORE",
         )
     }
@@ -120,6 +124,7 @@ def main() -> int:
                 "cluster_id": identity.cluster_id,
                 "deployment_id": identity.deployment_id,
                 "publication_outbox": str(outbox),
+                "research_enabled": False,
                 "mainnet_allowed": False,
             },
             ensure_ascii=False,
