@@ -7,7 +7,8 @@ Type=simple
 User=ai-bybit
 WorkingDirectory=/opt/ai-bybit/ai_bot3/ai_bot3
 EnvironmentFile=/etc/ai-bybit/predictor-production-paper.env
-ExecStart=/opt/ai-bybit/.venv/bin/python api/api_server.py
+Environment=PYTHONPATH=/opt/ai-bybit:/opt/ai-bybit/ai_bot3/ai_bot3
+ExecStart=/opt/ai-bybit/.venv/bin/python -m uvicorn api.control_plane_main:app --host 127.0.0.1 --port 8000
 Restart=on-failure
 CPUQuota=50%
 MemoryMax=1G
