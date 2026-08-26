@@ -25,17 +25,31 @@ from core.service_runtime import load_predictor_runtime  # noqa: E402
 
 
 def _path(name: str, default: Path) -> Path:
-    return Path(os.environ.get(name, str(default))).expanduser().resolve()
+    raw = os.environ.get(name, "").strip()
+    return Path(raw if raw else default).expanduser().resolve()
+
+
+def _publication_outbox_path(default: Path) -> Path:
+    canonical = os.environ.get("FORECAST_PUBLICATION_OUTBOX_DB", "").strip()
+    legacy = os.environ.get("FORECAST_PUBLICATION_OUTBOX", "").strip()
+    if canonical and legacy:
+        canonical_path = Path(canonical).expanduser().resolve()
+        legacy_path = Path(legacy).expanduser().resolve()
+        if canonical_path != legacy_path:
+            raise RuntimeError(
+                "FORECAST_PUBLICATION_OUTBOX_DB conflicts with legacy "
+                "FORECAST_PUBLICATION_OUTBOX"
+            )
+        return canonical_path
+    selected = canonical or legacy
+    return Path(selected if selected else default).expanduser().resolve()
 
 
 def build_worker() -> tuple[PublicationWorker, ForecastPublicationOutbox]:
     load_predictor_runtime()
     data_dir = _path("PREDICTOR_DATA_DIR", PROJECT_ROOT / "data")
     outbox = ForecastPublicationOutbox(
-        _path(
-            "FORECAST_PUBLICATION_OUTBOX_DB",
-            data_dir / "forecast_publication_outbox.sqlite3",
-        ),
+        _publication_outbox_path(data_dir / "forecast_publication_outbox.sqlite3"),
         limits=OutboxLimits(
             max_pending=int(os.environ.get("PUBLICATION_OUTBOX_MAX_PENDING", "100000")),
             max_bytes=int(
