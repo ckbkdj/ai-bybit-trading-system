@@ -1,0 +1,123 @@
+name: ai-bybit-shadow-lab
+
+services:
+  control-plane:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      target: predictor
+    command: ["api/control_plane_server.py"]
+    environment:
+      APP_ENV: development
+      SERVICE_ROLE: predictor
+      EXECUTION_MODE: paper
+      BYBIT_TRADING_MODE: shadow
+      HOST_ID: predictor-lab-01
+      CLUSTER_ID: shadow-lab
+      DEPLOYMENT_ID: shadow-lab-v1
+      CONTROL_PLANE_BIND_HOST: 0.0.0.0
+      CONTROL_PLANE_BIND_PORT: "8000"
+      PREDICTOR_DATA_DIR: /var/lib/ai-bybit/predictor-realtime
+      FORECAST_PUBLICATION_OUTBOX_DB: /var/lib/ai-bybit/publication-worker/outbox.sqlite3
+      CONTROL_PLANE_DB: /var/lib/ai-bybit/control-plane/control.sqlite3
+      RESEARCH_JOB_DB: /var/lib/ai-bybit/control-plane/research-disabled.sqlite3
+      AI_BOT_TICKETS_ENABLED: "true"
+      MAINNET_ALLOWED: "false"
+    volumes:
+      - lab-control:/var/lib/ai-bybit/control-plane
+      - lab-publication:/var/lib/ai-bybit/publication-worker
+    expose: ["8000"]
+    restart: unless-stopped
+    init: true
+    healthcheck:
+      test: ["CMD", "python", "/opt/ai-bybit/tcp_healthcheck.py", "--port", "8000"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+
+  executor:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      target: executor
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["python main.py --preflight && exec python main.py"]
+    environment:
+      APP_ENV: development
+      SERVICE_ROLE: executor
+      EXECUTION_MODE: paper
+      BYBIT_TRADING_MODE: shadow
+      HOST_ID: executor-lab-01
+      CLUSTER_ID: shadow-lab
+      DEPLOYMENT_ID: shadow-lab-v1
+      EXECUTION_DB_PATH: /var/lib/ai-bybit/executor/execution.sqlite3
+      TICKET_API_BASE_URL: http://control-plane:8000
+      TICKET_CONSUMER_ID: executor-lab-01
+      POSITION_OWNER_ID: paper-owner-lab-01
+      SHADOW_ACCOUNT_EQUITY_USDT: "10000"
+      HEALTH_HOST: 0.0.0.0
+      HEALTH_PORT: "8787"
+      BYBIT_ENABLE_LIVE: "false"
+      MAINNET_ALLOWED: "false"
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    volumes:
+      - lab-executor:/var/lib/ai-bybit/executor
+    ports:
+      - "127.0.0.1:${LAB_EXECUTOR_HEALTH_PORT:-8787}:8787"
+    restart: unless-stopped
+    init: true
+
+  ops-console:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      target: ops-console
+    environment:
+      APP_ENV: development
+      OPS_CONSOLE_TOKEN: ${OPS_CONSOLE_TOKEN:-}
+      PREDICTOR_CONTROL_PLANE_URL: http://control-plane:8000
+      EXECUTOR_HEALTH_URL: http://executor:8787
+      MAINNET_ALLOWED: "false"
+      OPS_POLL_SECONDS: "5"
+    depends_on:
+      control-plane:
+        condition: service_healthy
+      executor:
+        condition: service_started
+    ports:
+      - "127.0.0.1:${LAB_OPS_PORT:-8790}:8790"
+    restart: unless-stopped
+    init: true
+
+  predictor-realtime:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      target: predictor
+    profiles: ["full"]
+    command: ["main_forecast.py"]
+    environment:
+      APP_ENV: development
+      SERVICE_ROLE: predictor
+      EXECUTION_MODE: paper
+      BYBIT_TRADING_MODE: shadow
+      HOST_ID: predictor-lab-01
+      CLUSTER_ID: shadow-lab
+      DEPLOYMENT_ID: shadow-lab-v1
+      PREDICTOR_DATA_DIR: /var/lib/ai-bybit/predictor-realtime
+      FORECAST_PUBLICATION_OUTBOX_DB: /var/lib/ai-bybit/publication-worker/outbox.sqlite3
+      CONTROL_PLANE_DB: /var/lib/ai-bybit/control-plane/control.sqlite3
+      MAINNET_ALLOWED: "false"
+    volumes:
+      - lab-predictor:/var/lib/ai-bybit/predictor-realtime
+      - lab-publication:/var/lib/ai-bybit/publication-worker
+      - ${LAB_MODELS_DIR:-./runtime/models}:/opt/ai-bybit/ai_bot3/ai_bot3/models:ro
+      - ${LAB_CONFIG_FILE:-./runtime/config.yml}:/opt/ai-bybit/ai_bot3/ai_bot3/config.yml:ro
+
+volumes:
+  lab-control:
+  lab-publication:
+  lab-executor:
+  lab-predictor:

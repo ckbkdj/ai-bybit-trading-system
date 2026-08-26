@@ -1,0 +1,40 @@
+name: ai-bybit-executor-paper
+
+services:
+  executor:
+    image: ${EXECUTOR_IMAGE:-ai-bybit-executor-paper:${APP_CODE_COMMIT:-local}}
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      target: executor
+    env_file:
+      - ${EXECUTOR_ENV_FILE:-./executor.env}
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["python main.py --preflight && exec python main.py"]
+    environment:
+      HEALTH_HOST: 0.0.0.0
+      HEALTH_PORT: "8787"
+    ports:
+      - "${EXECUTOR_HEALTH_BIND_IP:-127.0.0.1}:${EXECUTOR_HEALTH_PORT:-8787}:8787"
+    volumes:
+      - executor-data:/var/lib/ai-bybit/executor
+      - ${EXECUTOR_PKI_DIR:-./pki/executor}:/etc/ai-bybit/pki:ro
+    restart: unless-stopped
+    stop_grace_period: 45s
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "python", "/opt/ai-bybit/tcp_healthcheck.py", "--port", "8787"]
+      interval: 10s
+      timeout: 3s
+      retries: 9
+      start_period: 45s
+
+volumes:
+  executor-data:

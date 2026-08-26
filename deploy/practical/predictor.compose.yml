@@ -1,0 +1,156 @@
+name: ai-bybit-predictor-paper
+
+x-predictor-runtime: &predictor-runtime
+  image: ${PREDICTOR_IMAGE:-ai-bybit-predictor-paper:${APP_CODE_COMMIT:-local}}
+  build:
+    context: ../..
+    dockerfile: deploy/docker/Dockerfile
+    target: predictor
+  env_file:
+    - ${PREDICTOR_ENV_FILE:-./predictor.env}
+  restart: unless-stopped
+  init: true
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=128m
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  networks:
+    - predictor-internal
+
+services:
+  control-plane-proxy:
+    image: nginx:1.27.5-alpine
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${PREDICTOR_WIREGUARD_BIND_IP:-127.0.0.1}:${CONTROL_PLANE_TLS_PORT:-8443}:8443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ${PREDICTOR_PKI_DIR:-./pki/predictor}:/etc/nginx/pki:ro
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx:rw,noexec,nosuid,size=32m
+      - /var/run:rw,noexec,nosuid,size=8m
+      - /tmp:rw,noexec,nosuid,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    networks:
+      predictor-internal:
+        aliases:
+          - predictor-paper.internal
+
+  control-plane:
+    image: ${PREDICTOR_IMAGE:-ai-bybit-predictor-paper:${APP_CODE_COMMIT:-local}}
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      target: predictor
+    env_file:
+      - ${PREDICTOR_ENV_FILE:-./predictor.env}
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["python scripts/preflight_production_predictor.py && exec python api/control_plane_server.py"]
+    environment:
+      CONTROL_PLANE_BIND_HOST: 127.0.0.1
+      CONTROL_PLANE_BIND_PORT: "8000"
+    network_mode: service:control-plane-proxy
+    depends_on:
+      control-plane-proxy:
+        condition: service_started
+    volumes:
+      - control-plane-data:/var/lib/ai-bybit/control-plane
+      - publication-data:/var/lib/ai-bybit/publication-worker
+    healthcheck:
+      test: ["CMD", "python", "/opt/ai-bybit/tcp_healthcheck.py", "--port", "8000"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
+
+  predictor-realtime:
+    <<: *predictor-runtime
+    profiles: ["full"]
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["python scripts/preflight_production_predictor.py && exec python main_forecast.py"]
+    volumes:
+      - predictor-data:/var/lib/ai-bybit/predictor-realtime
+      - publication-data:/var/lib/ai-bybit/publication-worker
+      - ${PREDICTOR_MODELS_DIR:-./runtime/models}:/opt/ai-bybit/ai_bot3/ai_bot3/models:ro
+      - ${PREDICTOR_CONFIG_FILE:-./runtime/config.yml}:/opt/ai-bybit/ai_bot3/ai_bot3/config.yml:ro
+
+  publication-worker:
+    <<: *predictor-runtime
+    profiles: ["full"]
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["python scripts/preflight_production_predictor.py && exec python scripts/run_publication_worker.py"]
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    volumes:
+      - publication-data:/var/lib/ai-bybit/publication-worker
+      - control-plane-data:/var/lib/ai-bybit/control-plane
+
+  market-collector:
+    <<: *predictor-runtime
+    profiles: ["full"]
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["python scripts/preflight_production_predictor.py && exec python scripts/run_bybit_public_pit_collector.py --database /var/lib/ai-bybit/market-collector/bybit-public.sqlite3"]
+    volumes:
+      - market-data:/var/lib/ai-bybit/market-collector
+
+  ops-console:
+    image: ${OPS_CONSOLE_IMAGE:-ai-bybit-ops-console:${APP_CODE_COMMIT:-local}}
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      target: ops-console
+    profiles: ["ops"]
+    env_file:
+      - ${PREDICTOR_ENV_FILE:-./predictor.env}
+    environment:
+      APP_ENV: production
+      PREDICTOR_CONTROL_PLANE_URL: https://predictor-paper.internal:8443
+      EXECUTOR_HEALTH_URL: ${EXECUTOR_HEALTH_URL:-http://10.70.0.2:8787}
+    ports:
+      - "${OPS_CONSOLE_BIND_IP:-127.0.0.1}:${OPS_CONSOLE_PORT:-8790}:8790"
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    volumes:
+      - ${PREDICTOR_PKI_DIR:-./pki/predictor}:/etc/ai-bybit/pki:ro
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - predictor-internal
+
+networks:
+  predictor-internal:
+    driver: bridge
+
+volumes:
+  predictor-data:
+  publication-data:
+  control-plane-data:
+  market-data:

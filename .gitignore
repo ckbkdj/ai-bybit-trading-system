@@ -9,6 +9,10 @@
 !**/.env.*.example
 ai_bot3/ai_bot3/config.yml
 ai_bot3/ai_bot3/config.yml.bak_*
+deploy/practical/*.env
+deploy/practical/pki/
+deploy/practical/runtime/
+evidence/
 
 # Python / JavaScript build products
 **/__pycache__/
@@ -29,6 +33,8 @@ supply-chain-audit.json
 pip-audit.json
 npm-audit.json
 sbom.cdx.json
+physical-shadow-acceptance.json
+testnet-admission.json
 
 # Large model, market-data and runtime outputs
 ai_bot3/ai_bot3/data/

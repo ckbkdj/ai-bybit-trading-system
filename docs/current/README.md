@@ -1,12 +1,14 @@
 # Current release documentation
 
-Release target: `release/shadow-platform-v3-rc1`.
+Release target: `release/two-node-production-paper-v1`.
 
-The codebase is a complete, maintainable engineering baseline and may continue
-through bounded release hardening. Shadow review is the only authorized stage.
-Testnet needs a separate human task and dedicated credentials. Mainnet remains
-disabled.
+The codebase now contains an executable two-host production-paper deployment
+layer. Shadow practical acceptance is the authorized stage. Testnet execution
+still needs a separate human-authorized task and dedicated credentials. Mainnet
+remains disabled.
 
+- [Practical two-host Shadow deployment](PRACTICAL_DEPLOYMENT.md)
+- [Read-only testnet admission](TESTNET_ADMISSION.md)
 - [Architecture](ARCHITECTURE.md)
 - [Two-node production-paper architecture](TWO_NODE_ARCHITECTURE.md)
 - [Two-node failure matrix](TWO_NODE_FAILURE_MATRIX.md)

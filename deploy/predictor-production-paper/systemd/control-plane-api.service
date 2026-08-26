@@ -1,6 +1,7 @@
 [Unit]
 Description=AI-Bybit control-plane API (loopback behind mTLS proxy)
 After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -8,8 +9,10 @@ User=ai-bybit
 WorkingDirectory=/opt/ai-bybit/ai_bot3/ai_bot3
 EnvironmentFile=/etc/ai-bybit/predictor-production-paper.env
 Environment=PYTHONPATH=/opt/ai-bybit:/opt/ai-bybit/ai_bot3/ai_bot3
-ExecStart=/opt/ai-bybit/.venv/bin/python -m uvicorn api.control_plane_main:app --host 127.0.0.1 --port 8000
+ExecStartPre=/opt/ai-bybit/.venv/bin/python scripts/preflight_production_predictor.py
+ExecStart=/opt/ai-bybit/.venv/bin/python api/control_plane_server.py
 Restart=on-failure
+RestartSec=5
 CPUQuota=50%
 MemoryMax=1G
 Nice=-2

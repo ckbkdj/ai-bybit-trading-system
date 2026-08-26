@@ -9,8 +9,12 @@ on:
       - "BybitContractBotV4/**"
       - "ai_bot3/**"
       - "deploy/**"
+      - "ops_console/**"
       - "shadow_contracts/**"
       - "scripts/run_deployment_smoke.py"
+      - "scripts/physical_shadow_acceptance.py"
+      - "scripts/testnet_admission.py"
+      - "scripts/validate_practical_deployment.py"
       - ".github/workflows/deployment-smoke.yml"
 
 permissions:
@@ -60,6 +64,11 @@ jobs:
         env:
           APP_CODE_COMMIT: ${{ env.EXACT_CODE_SHA }}
         run: python scripts/run_deployment_smoke.py
-      - name: Compile deployment entrypoints
+      - name: Validate practical two-node deployment layer
+        env:
+          APP_CODE_COMMIT: ${{ env.EXACT_CODE_SHA }}
+          APP_ENV: development
+        run: python scripts/validate_practical_deployment.py
+      - name: Compile deployment and acceptance entrypoints
         run: |
-          python -m compileall -q BybitContractBotV4 ai_bot3/ai_bot3 shadow_contracts scripts/run_deployment_smoke.py
+          python -m compileall -q BybitContractBotV4 ai_bot3/ai_bot3 shadow_contracts ops_console scripts/run_deployment_smoke.py scripts/physical_shadow_acceptance.py scripts/testnet_admission.py scripts/validate_practical_deployment.py deploy/docker/tcp_healthcheck.py
