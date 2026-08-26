@@ -51,6 +51,18 @@ def _finish(process: subprocess.Popen, timeout: float = 180) -> tuple[int, str]:
     return int(process.returncode or 0), stdout
 
 
+def _json_output(completed: subprocess.CompletedProcess[str]) -> dict:
+    try:
+        return json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return {
+            "status": "FAIL",
+            "exit_code": completed.returncode,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+        }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path)
@@ -67,6 +79,7 @@ def main() -> int:
             "-m",
             "pytest",
             "ai_bot3/ai_bot3/tests/test_forecast_publication_outbox.py",
+            "ai_bot3/ai_bot3/tests/test_production_paper_runtime.py",
             "ai_bot3/ai_bot3/tests/test_ticket_outbox.py",
             "ai_bot3/ai_bot3/tests/test_resource_governor.py",
             "--basetemp",
@@ -77,6 +90,8 @@ def main() -> int:
             sys.executable,
             "-m",
             "pytest",
+            "BybitContractBotV4/tests/test_production_entrypoint.py",
+            "BybitContractBotV4/tests/test_claim_conflict_recovery.py",
             "BybitContractBotV4/tests/test_two_node_autonomy.py",
             "BybitContractBotV4/tests/test_receipt_outbox_resilience.py",
             "BybitContractBotV4/tests/test_execution_engine.py::ExecutionEngineTests::test_one_hundred_replays_do_not_duplicate_or_move_state_or_cursor_backwards",
@@ -128,7 +143,26 @@ def main() -> int:
             stress_report = json.loads(stress.stdout)
         except json.JSONDecodeError:
             stress_report = {"status": "FAIL", "raw": stress.stdout}
-        passed = predictor_code == executor_code == stress.returncode == 0
+        deployment = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "validate_production_paper_deployment.py"),
+            ],
+            cwd=ROOT,
+            env=_safe_environment("predictor"),
+            capture_output=True,
+            text=True,
+            timeout=90,
+            creationflags=flags,
+        )
+        deployment_report = _json_output(deployment)
+        passed = (
+            predictor_code
+            == executor_code
+            == stress.returncode
+            == deployment.returncode
+            == 0
+        )
         report = {
             "status": "PASS" if passed else "FAIL",
             "execution_mode": "paper",
@@ -157,8 +191,10 @@ def main() -> int:
                 "F_schema_incompatible": executor_code == 0,
                 "G_clock_skew": executor_code == 0,
                 "H_disk_pressure": predictor_code == 0 and stress.returncode == 0,
+                "I_deployable_entrypoints_and_paths": deployment.returncode == 0,
             },
             "resource_stress": stress_report,
+            "deployment_preflight": deployment_report,
             "shared_sqlite": False,
             "background_processes_remaining": int(predictor.poll() is None)
             + int(executor.poll() is None)
