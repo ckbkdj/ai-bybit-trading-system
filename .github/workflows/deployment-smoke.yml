@@ -77,13 +77,13 @@ jobs:
     name: actual container shadow startup
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      APP_CODE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ env.EXACT_CODE_SHA }}
       - name: Verify exact checkout and Docker runtime
-        env:
-          APP_CODE_COMMIT: ${{ env.EXACT_CODE_SHA }}
         run: |
           test "$(git rev-parse HEAD)" = "$APP_CODE_COMMIT"
           docker version

@@ -8,6 +8,7 @@ services:
       target: predictor
     command: ["api/control_plane_server.py"]
     environment:
+      APP_CODE_COMMIT: ${APP_CODE_COMMIT:?APP_CODE_COMMIT must be the exact 40-character Git SHA}
       APP_ENV: development
       SERVICE_ROLE: predictor
       EXECUTION_MODE: paper
@@ -45,6 +46,7 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command: ["python main.py --preflight && exec python main.py"]
     environment:
+      APP_CODE_COMMIT: ${APP_CODE_COMMIT:?APP_CODE_COMMIT must be the exact 40-character Git SHA}
       APP_ENV: development
       SERVICE_ROLE: executor
       EXECUTION_MODE: paper
@@ -85,6 +87,7 @@ services:
       dockerfile: deploy/docker/Dockerfile
       target: ops-console
     environment:
+      APP_CODE_COMMIT: ${APP_CODE_COMMIT:?APP_CODE_COMMIT must be the exact 40-character Git SHA}
       APP_ENV: development
       OPS_CONSOLE_TOKEN: ${OPS_CONSOLE_TOKEN:-}
       PREDICTOR_CONTROL_PLANE_URL: http://control-plane:8000
@@ -115,6 +118,7 @@ services:
     profiles: ["full"]
     command: ["main_forecast.py"]
     environment:
+      APP_CODE_COMMIT: ${APP_CODE_COMMIT:?APP_CODE_COMMIT must be the exact 40-character Git SHA}
       APP_ENV: development
       SERVICE_ROLE: predictor
       EXECUTION_MODE: paper
