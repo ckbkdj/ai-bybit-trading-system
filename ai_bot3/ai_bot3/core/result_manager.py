@@ -161,6 +161,47 @@ def _atomic_json_write(path: Path, payload: Dict[str, Any]) -> None:
             Path(temporary_name).unlink(missing_ok=True)
 
 
+def _configured_path(
+    explicit: Path | str | None,
+    environment_name: str,
+    default: Path,
+) -> Path:
+    if explicit is not None:
+        return Path(explicit).expanduser().resolve()
+    raw = os.environ.get(environment_name, "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return Path(default).expanduser().resolve()
+
+
+def _publication_outbox_path(
+    explicit: Path | str | None,
+    default: Path,
+) -> Path:
+    if explicit is not None:
+        return Path(explicit).expanduser().resolve()
+    canonical = os.environ.get("FORECAST_PUBLICATION_OUTBOX_DB", "").strip()
+    legacy = os.environ.get("FORECAST_PUBLICATION_OUTBOX", "").strip()
+    if canonical and legacy:
+        canonical_path = Path(canonical).expanduser().resolve()
+        legacy_path = Path(legacy).expanduser().resolve()
+        if canonical_path != legacy_path:
+            raise RuntimeError(
+                "FORECAST_PUBLICATION_OUTBOX_DB conflicts with legacy "
+                "FORECAST_PUBLICATION_OUTBOX"
+            )
+        return canonical_path
+    if canonical:
+        return Path(canonical).expanduser().resolve()
+    if legacy:
+        logging.warning(
+            "FORECAST_PUBLICATION_OUTBOX is deprecated; use "
+            "FORECAST_PUBLICATION_OUTBOX_DB"
+        )
+        return Path(legacy).expanduser().resolve()
+    return Path(default).expanduser().resolve()
+
+
 class ResultManager:
     def __init__(
         self,
@@ -175,7 +216,7 @@ class ResultManager:
         profitability_report_path: Path | None = None,
         candidate_release_manifest_path: Path | None = None,
     ):
-        self.results_dir = results_dir
+        self.results_dir = Path(results_dir).expanduser().resolve()
         self.results_dir.mkdir(parents=True, exist_ok=True)
         if tickets_enabled is None:
             tickets_enabled = os.environ.get("AI_BOT_TICKETS_ENABLED", "true").strip().lower() in {
@@ -189,11 +230,25 @@ class ResultManager:
         if self.required_brain_release_stage not in {"candidate", "live"}:
             raise ValueError("required_brain_release_stage must be candidate or live")
         default_db = self.results_dir.parent / "data" / "control_plane.sqlite3"
-        self.control_plane_db = Path(control_plane_db or default_db)
+        self.control_plane_db = _configured_path(
+            control_plane_db,
+            "CONTROL_PLANE_DB",
+            default_db,
+        )
         self._control_plane: ControlPlaneRepository | None = None
-        default_outbox = self.results_dir.parent / "data" / "forecast_publication_outbox.sqlite3"
+        predictor_data_raw = os.environ.get("PREDICTOR_DATA_DIR", "").strip()
+        predictor_data_dir = (
+            Path(predictor_data_raw).expanduser().resolve()
+            if predictor_data_raw
+            else self.results_dir.parent / "data"
+        )
+        default_outbox = predictor_data_dir / "forecast_publication_outbox.sqlite3"
+        self.publication_outbox_db = _publication_outbox_path(
+            publication_outbox_db,
+            default_outbox,
+        )
         self.publication_outbox = ForecastPublicationOutbox(
-            Path(publication_outbox_db or default_outbox)
+            self.publication_outbox_db
         )
         self.publication_worker = PublicationWorker(
             self.publication_outbox, lambda: self.control_plane
