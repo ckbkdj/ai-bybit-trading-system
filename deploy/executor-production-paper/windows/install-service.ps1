@@ -7,10 +7,18 @@ $ErrorActionPreference = "Stop"
 $nssm = (Resolve-Path -LiteralPath $NssmPath).Path
 $python = Join-Path $Root ".venv\Scripts\python.exe"
 $working = Join-Path $Root "BybitContractBotV4"
+$entrypoint = Join-Path $working "main.py"
+if (-not (Test-Path -LiteralPath $python)) {
+    throw "Python runtime not found: $python"
+}
+if (-not (Test-Path -LiteralPath $entrypoint)) {
+    throw "Executor entrypoint not found: $entrypoint"
+}
 $environment = @(
     Get-Content -LiteralPath $EnvFile |
         Where-Object { $_ -and -not $_.StartsWith("#") -and $_.Contains("=") }
 )
+$environment += "PYTHONPATH=$Root;$working"
 $service = "AIBybitExecutorProductionPaper"
 if (Get-Service -Name $service -ErrorAction SilentlyContinue) {
     throw "Service already exists: $service"
