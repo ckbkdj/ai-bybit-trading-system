@@ -86,6 +86,11 @@ def _json_string_map(name: str) -> dict[str, str]:
     return {key.strip(): value.strip() for key, value in payload.items()}
 
 
+def _configured_path(name: str, default: Path) -> Path:
+    raw = os.environ.get(name, "").strip()
+    return Path(raw if raw else default).expanduser().resolve()
+
+
 def validate_control_plane_bind(host: str) -> None:
     runtime = load_predictor_runtime(check_imports=False)
     if (
@@ -103,11 +108,22 @@ def create_control_plane_router(project_root: Path) -> APIRouter:
     runtime = load_predictor_runtime(check_imports=False)
     production = runtime.app_environment is AppEnvironment.PRODUCTION
     data_dir = project_root / "data"
-    control_db = Path(os.environ.get("CONTROL_PLANE_DB", data_dir / "control_plane.sqlite3"))
-    research_db = Path(os.environ.get("RESEARCH_JOB_DB", data_dir / "research_jobs.sqlite3"))
+    control_db = _configured_path(
+        "CONTROL_PLANE_DB", data_dir / "control_plane.sqlite3"
+    )
     contracts_dir = project_root / "contracts" / "schemas"
     control = ControlPlaneRepository(control_db)
-    research = ResearchJobStore(research_db)
+
+    # The production predictor is deliberately not a research node.  Do not even
+    # create/migrate a research SQLite file there; every research route fails
+    # closed before touching a repository.
+    research: ResearchJobStore | None = None
+    if not production:
+        research_db = _configured_path(
+            "RESEARCH_JOB_DB", data_dir / "research_jobs.sqlite3"
+        )
+        research = ResearchJobStore(research_db)
+
     global_token = os.environ.get("CONTROL_PLANE_API_TOKEN", "").strip()
     executor_tokens = _json_string_map("CONTROL_PLANE_EXECUTOR_TOKENS")
     certificate_identities = _json_string_map(
@@ -161,6 +177,14 @@ def create_control_plane_router(project_root: Path) -> APIRouter:
         if not isinstance(auth, AuthContext) or auth.consumer_id != consumer_id:
             raise HTTPException(status_code=403, detail="consumer identity mismatch")
 
+    def require_research() -> ResearchJobStore:
+        if production or research is None:
+            raise HTTPException(
+                status_code=403,
+                detail="research is disabled on predictor production",
+            )
+        return research
+
     router = APIRouter(prefix="/v1", tags=["control-plane"], dependencies=[Depends(authorize)])
 
     def latest_forecast_age_seconds() -> float | None:
@@ -198,6 +222,7 @@ def create_control_plane_router(project_root: Path) -> APIRouter:
             return {
                 "status": "ok",
                 "control_plane_database": "ready",
+                "research_database": "disabled" if production else "ready",
                 "backlog": metrics,
                 "latest_forecast_age_seconds": latest_forecast_age_seconds(),
             }
@@ -332,7 +357,14 @@ def create_control_plane_router(project_root: Path) -> APIRouter:
             ticket_id, request.consumer_id, request.lease_token, request.lease_sec
         )
         if claim_epoch is None:
-            raise HTTPException(status_code=409, detail="ticket claim is unavailable")
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "claimed": False,
+                    "reason": "LEASE_ACTIVE",
+                    "ticket_id": ticket_id,
+                },
+            )
         return {
             "claimed": True,
             "ticket_id": ticket_id,
@@ -399,30 +431,30 @@ def create_control_plane_router(project_root: Path) -> APIRouter:
 
     @router.post("/research/jobs")
     def create_research_job(request: ResearchJobRequest):
-        if production:
-            raise HTTPException(status_code=403, detail="research is disabled on predictor production")
-        job_id = research.create_job(request.event_ids, request.data_cutoff)
-        return research.get(job_id)
+        store = require_research()
+        job_id = store.create_job(request.event_ids, request.data_cutoff)
+        return store.get(job_id)
 
     @router.get("/research/jobs/{job_id}")
     def research_job(job_id: str):
-        item = research.get(job_id)
+        store = require_research()
+        item = store.get(job_id)
         if not item:
             raise HTTPException(status_code=404, detail="research job not found")
         return item
 
     @router.get("/research/jobs/{job_id}/revisions")
     def research_revisions(job_id: str):
-        if not research.get(job_id):
+        store = require_research()
+        if not store.get(job_id):
             raise HTTPException(status_code=404, detail="research job not found")
-        return [item.model_dump(mode="json") for item in research.revisions(job_id)]
+        return [item.model_dump(mode="json") for item in store.revisions(job_id)]
 
     @router.post("/research/jobs/{job_id}/transition")
     def research_transition(job_id: str, request: ResearchTransitionRequest):
-        if production:
-            raise HTTPException(status_code=403, detail="research is disabled on predictor production")
+        store = require_research()
         try:
-            research.transition(
+            store.transition(
                 job_id,
                 request.target,
                 request.checkpoint,
@@ -434,14 +466,13 @@ def create_control_plane_router(project_root: Path) -> APIRouter:
             raise HTTPException(status_code=404, detail="research job not found")
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
-        return research.get(job_id)
+        return store.get(job_id)
 
     @router.post("/research/jobs/{job_id}/revisions")
     def research_revision(job_id: str, vector: EventImpactVector):
-        if production:
-            raise HTTPException(status_code=403, detail="research is disabled on predictor production")
+        store = require_research()
         try:
-            revision = research.save_revision(job_id, vector)
+            revision = store.save_revision(job_id, vector)
         except KeyError:
             raise HTTPException(status_code=404, detail="research job not found")
         except ValueError as exc:
