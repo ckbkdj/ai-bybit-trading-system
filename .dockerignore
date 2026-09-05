@@ -24,3 +24,22 @@ docs/history
 docs/evidence/history
 evidence
 dist
+
+# Docker context is separate from Git tracking; local ignored secrets must not
+# be sent to a builder or copied into images by broad COPY instructions.
+**/*.env
+**/*.key
+**/*.pem
+**/*.p12
+**/*.pfx
+**/*.jks
+**/id_rsa*
+**/id_ed25519*
+**/*.db
+**/*.db-*
+**/*.sqlite*
+**/*.ini
+**/config.yml
+**/config.yml.bak*
+deploy/practical/pki
+deploy/practical/runtime
