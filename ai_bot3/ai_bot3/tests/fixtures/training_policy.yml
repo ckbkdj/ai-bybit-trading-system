@@ -1,0 +1,11 @@
+# Repository-controlled policy fixture used by anti-leakage regression tests.
+# Production config.yml remains machine-local and must satisfy at least these limits.
+general:
+  cache_days: 1095
+
+modes:
+  scalping: ["3m", 525600, 60]
+  mid_short: ["15m", 105120, 60]
+  trend: ["2h", 13140, 60]
+  trend_swing: ["4h", 6570, 60]
+  swing: ["1d", 1095, 60]

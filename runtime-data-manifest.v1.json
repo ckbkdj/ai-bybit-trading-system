@@ -1,0 +1,156 @@
+{
+  "$schema": "./schemas/runtime-data-manifest.v1.schema.json",
+  "schema_version": "runtime-data-manifest.v1",
+  "policy": {
+    "tracked_payloads": false,
+    "missing_required_data": "FAIL_CLOSED",
+    "secrets_source": "external secret store only",
+    "backup_rule": "quiesce writer, checkpoint WAL, copy DB plus WAL/SHM when present, verify integrity before promotion"
+  },
+  "artifacts": [
+    {
+      "logical_name": "prediction_control_plane",
+      "path_env": {"default_path": "ai_bot3/ai_bot3/data/control_plane.sqlite3", "environment": "CONTROL_PLANE_DB"},
+      "required_for": ["shadow_prediction", "testnet_prediction"],
+      "schema_version": "control-plane.v2",
+      "read_only": false,
+      "read_write": true,
+      "backup_required": true,
+      "contains_secrets": false,
+      "minimum_coverage": "fresh DB allowed; existing DB must pass supported-version and checksum gates",
+      "health_check": "PRAGMA integrity_check=ok and schema_migrations max(version)=2"
+    },
+    {
+      "logical_name": "research_job_ledger",
+      "path_env": {"default_path": "ai_bot3/ai_bot3/data/research_jobs.sqlite3", "environment": "RESEARCH_JOB_DB"},
+      "required_for": ["offline_research_queue"],
+      "schema_version": "research-jobs.v1",
+      "read_only": false,
+      "read_write": true,
+      "backup_required": true,
+      "contains_secrets": false,
+      "minimum_coverage": "fresh DB allowed; queued/running jobs require a recoverable checkpoint",
+      "health_check": "PRAGMA integrity_check=ok and no running job lacks a checkpoint"
+    },
+    {
+      "logical_name": "kline_feature_store",
+      "path_env": {"default_path": "ai_bot3/ai_bot3/data/kline_feature_store.profitability-v3-bybit.sqlite3", "environment": "AI_BOT_KLINE_FEATURE_STORE_PATH"},
+      "required_for": ["prediction", "profitability_evaluation"],
+      "schema_version": "kline-feature-store.v1",
+      "read_only": true,
+      "read_write": false,
+      "backup_required": true,
+      "contains_secrets": false,
+      "minimum_coverage": "continuous official Bybit bar grid for every evaluated symbol and fold",
+      "health_check": "feature-store semantic audit passes and source/bar timestamps are monotonic"
+    },
+    {
+      "logical_name": "bybit_development_pit",
+      "path_env": {"default_path": "ai_bot3/ai_bot3/data/bybit_public_pit.sqlite3", "environment": "BYBIT_PUBLIC_PIT_STORE"},
+      "required_for": ["bybit_factor_research", "shadow_prediction"],
+      "schema_version": "bybit-public-pit.v1",
+      "read_only": false,
+      "read_write": true,
+      "backup_required": true,
+      "contains_secrets": false,
+      "minimum_coverage": "all required public streams cover evaluation tickets without gaps or redating",
+      "health_check": "PIT audit reports complete intervals, valid hashes, and no future observations"
+    },
+    {
+      "logical_name": "bybit_lockbox_pit",
+      "path_env": {"default_path": null, "environment": "BYBIT_LOCKBOX_PUBLIC_PIT_STORE"},
+      "required_for": ["once_only_final_oos_evaluation"],
+      "schema_version": "bybit-public-pit.v1",
+      "read_only": true,
+      "read_write": false,
+      "backup_required": true,
+      "contains_secrets": false,
+      "minimum_coverage": "sealed disjoint final-OOS interval; absent until the development gate passes",
+      "health_check": "separate store identity, read-only open, complete PIT audit, unused lockbox receipt"
+    },
+    {
+      "logical_name": "macro_pit",
+      "path_env": {"default_path": "ai_bot3/ai_bot3/data/macro_pit.sqlite3", "environment": "MACRO_PIT_STORE"},
+      "required_for": ["macro_factor_research"],
+      "schema_version": "macro-pit.v1",
+      "read_only": true,
+      "read_write": false,
+      "backup_required": true,
+      "contains_secrets": false,
+      "minimum_coverage": "release and vintage timestamps cover every evaluated ticket boundary",
+      "health_check": "no observation is available before its recorded release/vintage timestamp"
+    },
+    {
+      "logical_name": "flow_pit",
+      "path_env": {"default_path": "ai_bot3/ai_bot3/data/flow_pit.sqlite3", "environment": "FLOW_PIT_STORE"},
+      "required_for": ["flow_factor_research"],
+      "schema_version": "flow-pit.v1",
+      "read_only": true,
+      "read_write": false,
+      "backup_required": true,
+      "contains_secrets": false,
+      "minimum_coverage": "published/available timestamps cover every evaluated ticket boundary",
+      "health_check": "source hashes validate and no future publication is visible"
+    },
+    {
+      "logical_name": "profitability_model_bundle",
+      "path_env": {"default_path": null, "environment": "AI_BOT_PROFITABILITY_MODEL_BUNDLE"},
+      "required_for": ["candidate_prediction", "testnet_prediction"],
+      "schema_version": "strategy-release-bundle.v1",
+      "read_only": true,
+      "read_write": false,
+      "backup_required": true,
+      "contains_secrets": false,
+      "minimum_coverage": "model, scaler, calibration, feature and cost hashes are all present",
+      "health_check": "bundle SHA-256 bindings match the approved candidate manifest"
+    },
+    {
+      "logical_name": "candidate_release_manifest",
+      "path_env": {"default_path": null, "environment": "AI_BOT_CANDIDATE_RELEASE_MANIFEST"},
+      "required_for": ["ticket_emission", "testnet_execution"],
+      "schema_version": "candidate-release.v1",
+      "read_only": true,
+      "read_write": false,
+      "backup_required": true,
+      "contains_secrets": false,
+      "minimum_coverage": "current code/data/model/evidence hashes and an unexpired approval",
+      "health_check": "manifest hash bindings match runtime and profitability gate is not stale"
+    },
+    {
+      "logical_name": "execution_ledger",
+      "path_env": {"default_path": "BybitContractBotV4/execution_state.sqlite3", "environment": "EXECUTION_DB_PATH"},
+      "required_for": ["shadow_execution", "testnet_execution"],
+      "schema_version": "execution-store.v5",
+      "read_only": false,
+      "read_write": true,
+      "backup_required": true,
+      "contains_secrets": false,
+      "minimum_coverage": "fresh Shadow DB allowed; Testnet requires startup reconciliation before orders",
+      "health_check": "PRAGMA integrity_check=ok, schema checksum valid, reconciliation_complete=1 before external orders"
+    },
+    {
+      "logical_name": "internal_ca_bundle",
+      "path_env": {"default_path": null, "environment": "PREDICTION_CA_BUNDLE"},
+      "required_for": ["tls_prediction_api", "tls_ticket_api"],
+      "schema_version": "pem-ca-bundle.v1",
+      "read_only": true,
+      "read_write": false,
+      "backup_required": false,
+      "contains_secrets": false,
+      "minimum_coverage": "complete issuing chain for the configured internal endpoints",
+      "health_check": "TLS verification succeeds without disabling certificate validation"
+    },
+    {
+      "logical_name": "external_trad_panel",
+      "path_env": {"default_path": null, "environment": "TRAD_DATA_SERVICE_ROOT"},
+      "required_for": ["optional_external_factor_research"],
+      "schema_version": "trad-panel-contract.v1",
+      "read_only": true,
+      "read_write": false,
+      "backup_required": false,
+      "contains_secrets": false,
+      "minimum_coverage": "manifest-declared assets and timestamps cover each requested decision time",
+      "health_check": "panel manifest and per-file SHA-256 validation pass"
+    }
+  ]
+}

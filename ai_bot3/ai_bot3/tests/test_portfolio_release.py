@@ -4,7 +4,7 @@ import hashlib
 import json
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -12,8 +12,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from adapters.legacy_forecast_adapter import LegacyForecastAdapter
-from core.decision.portfolio_intent import PortfolioIntentBuilder
+from core.decision.portfolio_intent import PortfolioIntentBuilder, PortfolioIntentPolicy
 from core.decision.ticket_builder import TicketBuilder
+from core.decision.ticket_policy import TicketPolicyConfig
 from core.release.strategy_bundle import (
     StrategyReleaseLoader,
     StrategyReleaseVerificationError,
@@ -77,6 +78,84 @@ def test_multi_horizon_signal_book_nets_once_and_ticket_references_decision():
     assert ticket.intent.side == "BUY"
     assert ticket.guards.execution_market == "bybit"
     assert ticket.guards.forecast_market == "binance"
+    assert ticket.created_at == intent.created_at
+    assert ticket.expires_at <= intent.valid_until
+    assert intent.risk_budget_pct == 0.0025
+    assert ticket.intent.risk_budget_pct == 0.0025
+    assert ticket.intent.leverage_cap == 2.0
+
+
+def test_research_ticket_policies_cannot_relax_capital_preservation_limits():
+    for factory, keyword, unsafe in (
+        (PortfolioIntentPolicy, "risk_budget_pct", 0.0025001),
+        (TicketPolicyConfig, "risk_budget_pct", 0.0025001),
+        (TicketPolicyConfig, "leverage_cap", 2.0001),
+    ):
+        try:
+            factory(**{keyword: unsafe})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{factory.__name__} accepted unsafe {keyword}")
+
+
+def test_one_horizon_event_block_vetoes_the_whole_portfolio():
+    near = _forecast("scalping", "up", 0.01)
+    far = _forecast("swing", "up", 0.008)
+    for event_regime in ("blackout", "reduce_only"):
+        blocked = far.model_copy(
+            update={
+                "regime": far.regime.model_copy(
+                    update={"event_regime": event_regime}
+                )
+            }
+        )
+        intent = PortfolioIntentBuilder().build(
+            [near, blocked],
+            strategy_release_id=RELEASE_ID,
+            decision_version=2,
+            now=datetime(2026, 8, 21, 8, 1, tzinfo=timezone.utc),
+        )
+        assert intent is None
+
+
+def test_expired_event_block_does_not_veto_fresh_normal_horizons():
+    current = datetime(2026, 8, 21, 8, 1, tzinfo=timezone.utc)
+    scalping = _forecast("scalping", "up", 0.01)
+    mid_short = _forecast("mid_short", "up", 0.009)
+    old_event = _forecast("swing", "down", -0.02)
+    old_event = old_event.model_copy(
+        update={
+            "time": old_event.time.model_copy(
+                update={"forecast_target_at": current - timedelta(seconds=1)}
+            ),
+            "regime": old_event.regime.model_copy(
+                update={"event_regime": "blackout"}
+            ),
+        }
+    )
+
+    intent = PortfolioIntentBuilder().build(
+        [scalping, mid_short, old_event],
+        strategy_release_id=RELEASE_ID,
+        decision_version=3,
+        now=current,
+    )
+
+    assert intent is not None
+    assert {item.horizon_sec for item in intent.contributions} == {180, 900}
+
+
+def test_expired_horizons_cannot_create_a_new_portfolio_intent():
+    scalping = _forecast("scalping", "up", 0.01)
+    mid_short = _forecast("mid_short", "up", 0.009)
+    intent = PortfolioIntentBuilder().build(
+        [scalping, mid_short],
+        strategy_release_id=RELEASE_ID,
+        decision_version=4,
+        now=datetime(2026, 8, 21, 8, 20, tzinfo=timezone.utc),
+    )
+    assert intent is None
 
 
 def test_strategy_release_loader_hashes_manifest_and_every_artifact():

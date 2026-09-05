@@ -19,12 +19,30 @@ class HealthServer:
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
-                if self.path != "/health":
+                if self.path not in {
+                    "/health",
+                    "/v1/health/live",
+                    "/v1/health/ready",
+                    "/v1/health/dependencies",
+                }:
                     self.send_response(404)
                     self.end_headers()
                     return
-                payload = json.dumps(snapshot(), ensure_ascii=False).encode("utf-8")
-                self.send_response(200)
+                state = snapshot()
+                if self.path == "/v1/health/live":
+                    response = {"status": "alive"}
+                    status_code = 200
+                elif self.path == "/v1/health/ready":
+                    response = {"status": "ready" if state.get("ready") else "not_ready"}
+                    status_code = 200 if state.get("ready") else 503
+                elif self.path == "/v1/health/dependencies":
+                    response = state
+                    status_code = 200 if state.get("ready") else 503
+                else:
+                    response = state
+                    status_code = 200
+                payload = json.dumps(response, ensure_ascii=False).encode("utf-8")
+                self.send_response(status_code)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()

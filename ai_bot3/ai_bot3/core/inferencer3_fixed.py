@@ -47,6 +47,10 @@ from .kline_feature_store import (
     select_persisted_features,
 )
 from .model_monitoring import factor_group_scores, scaled_feature_ood_score, source_is_reliable
+from .models.profitability_runtime import (
+    generate_profitability_alpha_prediction,
+    price_frame_cutoff,
+)
 
 
 def _now_iso() -> str:
@@ -368,6 +372,7 @@ def run_keras_inference_in_process(prepared_data: Dict[str, Any]) -> Dict[str, A
         "openai_prediction": prepared_data.get("openai_prediction"),
         "online_calibration": prepared_data.get("online_calibration"),
         "data_sources_generated_at": prepared_data.get("data_sources_generated_at") or {},
+        "external_panel_context": prepared_data.get("external_panel_context"),
         # 行情数据源溯源（来自 df.attrs，由 data_fetch.get_ohlcv 写入）
         "market_data_source": prepared_data.get("market_data_source"),
         "data_source_status": prepared_data.get("data_source_status"),
@@ -449,6 +454,28 @@ def run_keras_inference_in_process(prepared_data: Dict[str, Any]) -> Dict[str, A
             result["confidence"] = max(float(result.get("confidence") or 0.0), float(brain_pred.get("confidence") or 0.0))
     except Exception as exc:
         result["brain_prediction"] = {"status": "error", "direction": "flat", "actionable": False, "error": str(exc)}
+    result["alpha_prediction"] = generate_profitability_alpha_prediction(
+        (
+            prepared_data.get("alpha_price_frame")
+            if prepared_data.get("alpha_price_frame") is not None
+            else pd.DataFrame()
+        ),
+        symbol=sym,
+        mode=mode,
+        input_price_source=prepared_data.get("alpha_price_source"),
+        external_panel_context=prepared_data.get("external_panel_context"),
+    )
+    if (
+        result["alpha_prediction"].get("status") != "ok"
+        and prepared_data.get("alpha_price_error")
+    ):
+        result["alpha_prediction"]["price_source_error"] = prepared_data.get(
+            "alpha_price_error"
+        )
+    # Brain remains visible as a rejected comparison baseline.  Only the new
+    # profitability Alpha may mark a production result actionable.
+    result["trade_actionable"] = bool(result["alpha_prediction"].get("actionable"))
+    result["external_panel_context"] = extras["external_panel_context"]
     result["data_sources_generated_at"] = extras["data_sources_generated_at"]
     # 把行情溯源字段固化进 JSON 结果，便于 API/前端展示与陈旧检测。
     for k in (
@@ -611,6 +638,25 @@ class InferencerDataPreparer:
         if df.empty or len(df) < self.window:
             return None
 
+        alpha_price_frame = pd.DataFrame()
+        alpha_price_error: str | None = None
+        if os.environ.get("AI_BOT_PROFITABILITY_MODEL_BUNDLE"):
+            try:
+                alpha_price_frame = await asyncio.wait_for(
+                    self.fetcher.get_bybit_ohlcv(
+                        self.sym,
+                        self.tf_code,
+                        max(self.fetch_limit, 360),
+                    ),
+                    timeout=OHLCV_FETCH_TIMEOUT,
+                )
+            except Exception as exc:
+                alpha_price_error = f"{type(exc).__name__}: {exc}"
+                self.log.error(
+                    "Bybit Alpha 行情不可用；旧模型仅展示，新 Alpha 失败关闭: %s",
+                    alpha_price_error,
+                )
+
         try:
             with open(self.scaler_path, "rb") as f:
                 bundle = pickle.load(f)
@@ -690,12 +736,35 @@ class InferencerDataPreparer:
         except Exception as exc:
             self.log.warning("模型训练元数据不可读，LSTM 仅作为未验证展示输出: %s", exc)
 
+        try:
+            # The external PIT panel must be queried at the exact cutoff used
+            # by the new Alpha.  The legacy Binance frame may close at a
+            # different instant and is only a display/baseline input here.
+            panel_price_frame = (
+                alpha_price_frame if not alpha_price_frame.empty else df
+            )
+            panel_as_of = price_frame_cutoff(panel_price_frame)
+            external_panel_context = self.fetcher.get_external_panel_context(
+                as_of=panel_as_of
+            )
+        except Exception as exc:
+            external_panel_context = {
+                "status": "outage",
+                "source": "trad_data_service.canonical_panel",
+                "data": None,
+                "warnings": [],
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
         return {
             "sym": self.sym,
             "tf_code": self.tf_code,
             "mode": self.mode,
             "cfg": self.cfg,
             "brain_df": df.tail(max(self.window + 32, 360)).copy(),
+            "alpha_price_frame": alpha_price_frame.tail(1_000).copy(),
+            "alpha_price_source": alpha_price_frame.attrs.get("data_source"),
+            "alpha_price_error": alpha_price_error,
             "model_path_str": str(self.model_path),
             "scaler_path_str": str(self.scaler_path),
             "X_seq": X_seq,
@@ -717,6 +786,7 @@ class InferencerDataPreparer:
             "online_calibration": None,
             "loaded_model_metadata": loaded_model_metadata,
             "data_sources_generated_at": self._collect_source_times(),
+            "external_panel_context": external_panel_context,
             # 行情数据源溯源（由 data_fetch.get_ohlcv 写入 df.attrs）
             "market_data_source": df.attrs.get("data_source"),
             "data_source_status": df.attrs.get("source_status"),

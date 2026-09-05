@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "runtime-data-manifest.v1.schema.json",
+  "type": "object",
+  "required": ["schema_version", "policy", "artifacts"],
+  "properties": {
+    "$schema": {"type": "string"},
+    "schema_version": {"const": "runtime-data-manifest.v1"},
+    "policy": {"type": "object"},
+    "artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "logical_name", "path_env", "required_for", "schema_version",
+          "read_only", "read_write", "backup_required", "contains_secrets",
+          "minimum_coverage", "health_check"
+        ],
+        "properties": {
+          "logical_name": {"type": "string", "minLength": 1},
+          "path_env": {
+            "type": "object",
+            "required": ["default_path", "environment"],
+            "properties": {
+              "default_path": {"type": ["string", "null"]},
+              "environment": {"type": ["string", "null"]}
+            },
+            "additionalProperties": false
+          },
+          "required_for": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+          "schema_version": {"type": "string", "minLength": 1},
+          "read_only": {"type": "boolean"},
+          "read_write": {"type": "boolean"},
+          "backup_required": {"type": "boolean"},
+          "contains_secrets": {"type": "boolean"},
+          "minimum_coverage": {"type": "string", "minLength": 1},
+          "health_check": {"type": "string", "minLength": 1}
+        },
+        "allOf": [
+          {"not": {"properties": {"read_only": {"const": true}, "read_write": {"const": true}}, "required": ["read_only", "read_write"]}},
+          {"not": {"properties": {"read_only": {"const": false}, "read_write": {"const": false}}, "required": ["read_only", "read_write"]}}
+        ]
+      }
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,12 @@
+groups:
+  - name: ai-bybit-executor-testnet
+    rules:
+      - alert: TestnetExecutorUnexpectedlyRunning
+        expr: ai_bybit_executor_up{execution_mode="testnet"} == 1
+        for: 1m
+      - alert: TestnetExecutorClockSkew
+        expr: abs(ai_bybit_control_plane_clock_skew_seconds) > 2
+        for: 1m
+      - alert: TestnetReceiptDeadLetter
+        expr: ai_bybit_receipt_dead_letter_count > 0
+        for: 1m

@@ -1,0 +1,23 @@
+[Unit]
+Description=AI-Bybit durable forecast publication worker
+After=network-online.target
+
+[Service]
+Type=simple
+User=ai-bybit
+WorkingDirectory=/opt/ai-bybit/ai_bot3/ai_bot3
+EnvironmentFile=/etc/ai-bybit/predictor-production-paper.env
+Environment=PYTHONPATH=/opt/ai-bybit:/opt/ai-bybit/ai_bot3/ai_bot3
+ExecStart=/opt/ai-bybit/.venv/bin/python scripts/run_publication_worker.py
+Restart=on-failure
+CPUQuota=25%
+MemoryMax=512M
+Nice=0
+IOWeight=600
+TasksMax=64
+ReadWritePaths=/var/lib/ai-bybit/publication-worker /var/lib/ai-bybit/control-plane
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

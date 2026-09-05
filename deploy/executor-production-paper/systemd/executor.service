@@ -1,0 +1,24 @@
+[Unit]
+Description=AI-Bybit autonomous executor (production paper)
+After=network-online.target
+
+[Service]
+Type=simple
+User=ai-bybit-executor
+WorkingDirectory=/opt/ai-bybit/BybitContractBotV4
+EnvironmentFile=/etc/ai-bybit/executor-production-paper.env
+Environment=PYTHONPATH=/opt/ai-bybit:/opt/ai-bybit/BybitContractBotV4
+ExecStartPre=/opt/ai-bybit/.venv/bin/python main.py --preflight
+ExecStart=/opt/ai-bybit/.venv/bin/python main.py
+Restart=on-failure
+CPUQuota=100%
+MemoryMax=2G
+Nice=-3
+IOWeight=800
+TasksMax=128
+ReadWritePaths=/var/lib/ai-bybit/executor
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

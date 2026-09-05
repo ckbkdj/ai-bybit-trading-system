@@ -1,0 +1,5 @@
+# Testnet executor client reference; server proxy must still bind only WireGuard.
+TICKET_API_BASE_URL=https://predictor-testnet.internal:8443
+CONTROL_PLANE_MTLS_CERT=/etc/ai-bybit/pki/executor-testnet-01.crt
+CONTROL_PLANE_MTLS_KEY=/etc/ai-bybit/pki/executor-testnet-01.key
+PREDICTION_CA_BUNDLE=/etc/ai-bybit/pki/control-plane-ca.crt

@@ -6,6 +6,14 @@ from enum import Enum
 from pathlib import Path
 from typing import Mapping
 
+from shadow_contracts.runtime import (
+    AppEnvironment,
+    ExecutionMode,
+    RuntimeConfigurationError,
+    RuntimeIdentity,
+    ServiceRole,
+)
+
 
 class SettingsError(RuntimeError):
     """Raised when runtime configuration could permit an unsafe launch."""
@@ -37,6 +45,12 @@ def _truthy(value: str | None) -> bool:
 @dataclass(frozen=True)
 class TradingSettings:
     root: Path
+    app_environment: AppEnvironment
+    service_role: ServiceRole
+    execution_mode: ExecutionMode
+    host_id: str
+    cluster_id: str
+    deployment_id: str
     mode: TradingMode
     api_key: str
     secret_key: str
@@ -54,9 +68,16 @@ class TradingSettings:
     ticket_api_base_url: str
     ticket_api_token: str
     ticket_consumer_id: str
+    control_plane_client_cert: str
+    control_plane_client_key: str
+    control_plane_cert_identity: str
+    executor_version: str
+    max_control_plane_clock_drift_seconds: float
     ticket_poll_seconds: float
     execution_db_path: str
+    max_risk_per_trade_pct: float
     max_daily_loss_pct: float
+    max_weekly_loss_pct: float
     max_equity_drawdown_pct: float
     max_gross_leverage: float
     max_correlated_exposure_pct: float
@@ -83,18 +104,24 @@ class TradingSettings:
         service_root = (root or Path(__file__).resolve().parent).resolve()
         file_values = _read_env_file(service_root / ".env.local")
         process_values = dict(os.environ if environ is None else environ)
+        merged_values = {**file_values, **process_values}
 
         def value(key: str, default: str = "") -> str:
             # Process-level values intentionally override the local env file.
             return str(process_values.get(key, file_values.get(key, default))).strip()
 
-        raw_mode = value("BYBIT_TRADING_MODE", TradingMode.SHADOW.value).lower()
         try:
-            mode = TradingMode(raw_mode)
-        except ValueError as exc:
-            raise SettingsError(
-                f"BYBIT_TRADING_MODE must be one of: {', '.join(m.value for m in TradingMode)}"
-            ) from exc
+            identity = RuntimeIdentity.load(
+                merged_values,
+                expected_role=ServiceRole.EXECUTOR,
+            )
+        except RuntimeConfigurationError as exc:
+            raise SettingsError(str(exc)) from exc
+        mode = {
+            ExecutionMode.PAPER: TradingMode.SHADOW,
+            ExecutionMode.TESTNET: TradingMode.TESTNET,
+            ExecutionMode.LIVE: TradingMode.LIVE,
+        }[identity.execution_mode]
 
         api_key = value("BYBIT_API_KEY")
         secret_key = value("BYBIT_SECRET_KEY")
@@ -114,23 +141,43 @@ class TradingSettings:
             timeout = float(value("PREDICTION_TIMEOUT_SECONDS", "10"))
             max_age = int(value("PREDICTION_MAX_AGE_SECONDS", "600"))
             ticket_poll = float(value("TICKET_POLL_SECONDS", "2"))
-            max_daily_loss = float(value("MAX_DAILY_LOSS_PCT", "0.02"))
-            max_equity_drawdown = float(value("MAX_EQUITY_DRAWDOWN_PCT", "0.10"))
+            max_risk_per_trade = float(value("MAX_RISK_PER_TRADE_PCT", "0.0025"))
+            max_daily_loss = float(value("MAX_DAILY_LOSS_PCT", "0.005"))
+            max_weekly_loss = float(value("MAX_WEEKLY_LOSS_PCT", "0.015"))
+            max_equity_drawdown = float(value("MAX_EQUITY_DRAWDOWN_PCT", "0.03"))
             max_gross_leverage = float(value("MAX_GROSS_LEVERAGE", "2"))
             max_correlated = float(value("MAX_CORRELATED_EXPOSURE_PCT", "0.35"))
             max_margin_utilization = float(value("MAX_MARGIN_UTILIZATION", "0.70"))
             max_consecutive_losses = int(value("MAX_CONSECUTIVE_LOSSES", "4"))
             max_clock_drift = float(value("MAX_EXCHANGE_CLOCK_DRIFT_SECONDS", "2"))
+            max_control_plane_clock_drift = float(
+                value(
+                    "MAX_CONTROL_PLANE_CLOCK_DRIFT_SECONDS",
+                    "5" if identity.execution_mode is ExecutionMode.PAPER else "2",
+                )
+            )
             health_port = int(value("HEALTH_PORT", "8787"))
         except ValueError as exc:
             raise SettingsError("numeric runtime settings contain an invalid value") from exc
         if shadow_equity <= 0 or timeout <= 0 or max_age <= 0 or ticket_poll <= 0:
             raise SettingsError("shadow equity, prediction timeout and max age must be positive")
-        if not 0 < max_daily_loss <= 1 or not 0 < max_equity_drawdown <= 1 or max_gross_leverage <= 0:
-            raise SettingsError("risk loss/leverage limits contain invalid values")
+        if not 0 < max_risk_per_trade <= 0.0025:
+            raise SettingsError("MAX_RISK_PER_TRADE_PCT cannot exceed 0.0025")
+        if not 0 < max_daily_loss <= 0.005:
+            raise SettingsError("MAX_DAILY_LOSS_PCT cannot exceed 0.005")
+        if not 0 < max_weekly_loss <= 0.015:
+            raise SettingsError("MAX_WEEKLY_LOSS_PCT cannot exceed 0.015")
+        if not 0 < max_equity_drawdown <= 0.03:
+            raise SettingsError("MAX_EQUITY_DRAWDOWN_PCT cannot exceed 0.03")
+        if not 0 < max_gross_leverage <= 2:
+            raise SettingsError("MAX_GROSS_LEVERAGE cannot exceed 2")
         if not 0 < max_correlated <= 1 or not 0 < max_margin_utilization <= 1:
             raise SettingsError("risk exposure/margin limits must be in (0, 1]")
-        if max_consecutive_losses <= 0 or max_clock_drift <= 0:
+        if (
+            max_consecutive_losses <= 0
+            or max_clock_drift <= 0
+            or max_control_plane_clock_drift <= 0
+        ):
             raise SettingsError("loss streak and clock drift limits must be positive")
         if not 1 <= health_port <= 65535:
             raise SettingsError("HEALTH_PORT is invalid")
@@ -138,14 +185,58 @@ class TradingSettings:
         route = value("PREDICTION_API_ROUTE", "/results/{symbol}")
         if "{symbol}" not in route:
             raise SettingsError("PREDICTION_API_ROUTE must contain {symbol}")
-        position_mode = value("BYBIT_POSITION_MODE", "hedge").lower()
+        # The active ledger is intentionally net-position based.  Until orders,
+        # fills, snapshots and ownership checks are keyed by positionIdx/leg,
+        # two simultaneous hedge legs cannot be represented without ambiguity.
+        position_mode = value("BYBIT_POSITION_MODE", "one_way").lower()
         if position_mode not in {"hedge", "one_way"}:
             raise SettingsError("BYBIT_POSITION_MODE must be hedge or one_way")
+        if mode in {TradingMode.TESTNET, TradingMode.LIVE} and position_mode == "hedge":
+            raise SettingsError(
+                f"{mode.value} hedge mode is blocked until the execution ledger is positionIdx-aware"
+            )
         dedicated_subaccount = _truthy(value("BYBIT_DEDICATED_SUBACCOUNT", "false"))
         position_owner_id = value("POSITION_OWNER_ID", "shadow-primary-owner")
         allow_manual_orders = _truthy(value("BYBIT_ALLOW_MANUAL_ORDERS", "false"))
         approved_strategy_release_id = value("APPROVED_STRATEGY_RELEASE_ID")
         app_code_commit = value("APP_CODE_COMMIT")
+        ticket_consumer_id = value("TICKET_CONSUMER_ID", "bybit-v4-primary")
+        ticket_api_base_url = value(
+            "TICKET_API_BASE_URL",
+            value("PREDICTION_API_BASE_URL", "https://crypto_api.hk.ie520.com"),
+        ).rstrip("/")
+        ticket_api_token = value(
+            "CONTROL_PLANE_API_TOKEN",
+            value("TICKET_API_TOKEN", value("PREDICTION_API_TOKEN")),
+        )
+        control_plane_client_cert = value("CONTROL_PLANE_MTLS_CERT")
+        control_plane_client_key = value("CONTROL_PLANE_MTLS_KEY")
+        control_plane_cert_identity = value(
+            "CONTROL_PLANE_CERT_IDENTITY", ticket_consumer_id
+        )
+        executor_version = value("EXECUTOR_VERSION", "1.0.0")
+        if identity.app_environment is AppEnvironment.PRODUCTION:
+            missing_security = [
+                name
+                for name, configured in (
+                    ("CONTROL_PLANE_API_TOKEN", ticket_api_token),
+                    ("CONTROL_PLANE_MTLS_CERT", control_plane_client_cert),
+                    ("CONTROL_PLANE_MTLS_KEY", control_plane_client_key),
+                    ("PREDICTION_CA_BUNDLE", value("PREDICTION_CA_BUNDLE")),
+                )
+                if not configured
+            ]
+            if missing_security:
+                raise SettingsError(
+                    "production executor security is incomplete: "
+                    + ", ".join(missing_security)
+                )
+            if not ticket_api_base_url.lower().startswith("https://"):
+                raise SettingsError("production executor requires an HTTPS control plane")
+            if control_plane_cert_identity != ticket_consumer_id:
+                raise SettingsError(
+                    "CONTROL_PLANE_CERT_IDENTITY must equal TICKET_CONSUMER_ID"
+                )
         if mode in {TradingMode.TESTNET, TradingMode.LIVE}:
             if not dedicated_subaccount:
                 raise SettingsError(
@@ -166,6 +257,12 @@ class TradingSettings:
 
         return cls(
             root=service_root,
+            app_environment=identity.app_environment,
+            service_role=identity.service_role,
+            execution_mode=identity.execution_mode,
+            host_id=identity.host_id,
+            cluster_id=identity.cluster_id,
+            deployment_id=identity.deployment_id,
             mode=mode,
             api_key=api_key,
             secret_key=secret_key,
@@ -182,17 +279,21 @@ class TradingSettings:
             prediction_tls_verify=_truthy(value("PREDICTION_TLS_VERIFY", "true")),
             prediction_ca_bundle=value("PREDICTION_CA_BUNDLE"),
             lark_webhook_url=value("LARK_WEBHOOK_URL"),
-            ticket_api_base_url=value(
-                "TICKET_API_BASE_URL",
-                value("PREDICTION_API_BASE_URL", "https://crypto_api.hk.ie520.com"),
-            ).rstrip("/"),
-            ticket_api_token=value("TICKET_API_TOKEN", value("PREDICTION_API_TOKEN")),
-            ticket_consumer_id=value("TICKET_CONSUMER_ID", "bybit-v4-primary"),
+            ticket_api_base_url=ticket_api_base_url,
+            ticket_api_token=ticket_api_token,
+            ticket_consumer_id=ticket_consumer_id,
+            control_plane_client_cert=control_plane_client_cert,
+            control_plane_client_key=control_plane_client_key,
+            control_plane_cert_identity=control_plane_cert_identity,
+            executor_version=executor_version,
+            max_control_plane_clock_drift_seconds=max_control_plane_clock_drift,
             ticket_poll_seconds=ticket_poll,
             execution_db_path=value(
                 "EXECUTION_DB_PATH", str(service_root / "execution_state.sqlite3")
             ),
+            max_risk_per_trade_pct=max_risk_per_trade,
             max_daily_loss_pct=max_daily_loss,
+            max_weekly_loss_pct=max_weekly_loss,
             max_equity_drawdown_pct=max_equity_drawdown,
             max_gross_leverage=max_gross_leverage,
             max_correlated_exposure_pct=max_correlated,
@@ -225,6 +326,12 @@ class TradingSettings:
         if self.prediction_ca_bundle:
             return self.prediction_ca_bundle
         return self.prediction_tls_verify
+
+    @property
+    def requests_client_cert(self) -> tuple[str, str] | None:
+        if self.control_plane_client_cert and self.control_plane_client_key:
+            return self.control_plane_client_cert, self.control_plane_client_key
+        return None
 
     def prediction_url(self, symbol: str) -> str:
         normalized = symbol.strip().upper()

@@ -1,0 +1,18 @@
+groups:
+  - name: ai-bybit-predictor-paper
+    rules:
+      - alert: PredictorForecastStale
+        expr: ai_bybit_latest_forecast_age_seconds > 180
+        for: 5m
+      - alert: PublicationOutboxGrowing
+        expr: ai_bybit_publication_outbox_depth > 1000
+        for: 10m
+      - alert: PredictorDiskBackfillGate
+        expr: ai_bybit_disk_used_percent >= 80
+        for: 2m
+      - alert: PredictorDiskResearchGate
+        expr: ai_bybit_disk_used_percent >= 90
+        for: 1m
+      - alert: ControlPlaneNotReady
+        expr: ai_bybit_control_plane_ready != 1
+        for: 2m

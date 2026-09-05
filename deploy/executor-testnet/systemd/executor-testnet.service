@@ -1,0 +1,23 @@
+[Unit]
+Description=AI-Bybit dedicated testnet executor (human-gated artifact)
+After=network-online.target
+ConditionPathExists=/etc/ai-bybit/TESTNET_HUMAN_APPROVED
+
+[Service]
+Type=simple
+User=ai-bybit-executor
+WorkingDirectory=/opt/ai-bybit/BybitContractBotV4
+EnvironmentFile=/etc/ai-bybit/executor-testnet.env
+ExecStart=/opt/ai-bybit/.venv/bin/python main.py
+Restart=on-failure
+CPUQuota=100%
+MemoryMax=2G
+Nice=-3
+IOWeight=800
+TasksMax=128
+ReadWritePaths=/var/lib/ai-bybit/executor-testnet
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

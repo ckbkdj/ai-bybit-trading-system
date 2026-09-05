@@ -16,10 +16,22 @@ class PortfolioIntentPolicy:
     min_data_quality: float = 0.90
     max_range_guard_score: float = 0.35
     max_target_exposure_pct: float = 0.08
-    risk_budget_pct: float = 0.003
+    risk_budget_pct: float = 0.0025
     max_turnover_pct: float = 0.08
     decision_deadband: float = 0.12
     ttl_sec: int = 300
+
+    def __post_init__(self) -> None:
+        if not 0 < self.risk_budget_pct <= 0.0025:
+            raise ValueError("risk_budget_pct cannot exceed the 0.25% hard limit")
+        if not 0 < self.max_target_exposure_pct <= 1:
+            raise ValueError("max_target_exposure_pct must be in (0, 1]")
+        if not 0 < self.max_turnover_pct <= 1:
+            raise ValueError("max_turnover_pct must be in (0, 1]")
+        if self.min_horizons < 2:
+            raise ValueError("portfolio decisions require at least two horizons")
+        if self.ttl_sec <= 0:
+            raise ValueError("ttl_sec must be positive")
 
     def weight_for(self, horizon_sec: int) -> float:
         configured = dict(self.horizon_weights or {})
@@ -30,12 +42,16 @@ class PortfolioIntentPolicy:
 
 
 class SignalBook:
-    """Select the newest, eligible forecast for every horizon of one symbol/release."""
+    """Select the newest forecast for every horizon of one symbol/release."""
 
     def __init__(self, forecasts: Iterable[ForecastEnvelope], *, now: datetime | None = None):
         current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        candidates = tuple(forecasts)
+        symbols = {item.instrument.symbol for item in candidates}
+        if len(symbols) > 1:
+            raise ValueError("one SignalBook cannot mix symbols")
         selected: dict[int, ForecastEnvelope] = {}
-        for forecast in forecasts:
+        for forecast in candidates:
             if forecast.time.created_at > current + timedelta(seconds=5):
                 continue
             previous = selected.get(forecast.time.horizon_sec)
@@ -61,7 +77,26 @@ class PortfolioIntentBuilder:
     ) -> PortfolioIntent | None:
         current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
         book = SignalBook(forecasts, now=current).forecasts
-        eligible = [item for item in book if self._eligible(item, strategy_release_id)]
+        release_book = [
+            item for item in book if item.lineage.strategy_release_id == strategy_release_id
+        ]
+
+        # An active, healthy event gate is a portfolio-level veto, not another
+        # directional vote.  Its forecast target is also its hard expiry: an old
+        # blackout must not block the symbol forever after the event view expires.
+        if any(
+            item.time.forecast_target_at > current
+            and item.quality.source_status == "ok"
+            and item.regime.event_regime in {"blackout", "reduce_only"}
+            for item in release_book
+        ):
+            return None
+
+        eligible = [
+            item
+            for item in release_book
+            if self._eligible(item, current=current)
+        ]
         if len(eligible) < self.policy.min_horizons:
             return None
         symbols = {item.instrument.symbol for item in eligible}
@@ -103,9 +138,12 @@ class PortfolioIntentBuilder:
                 )
             )
         created_at = max(item.time.created_at for item in eligible)
-        valid_until = min(created_at + timedelta(seconds=self.policy.ttl_sec), min(
-            item.time.forecast_target_at for item in eligible
-        ))
+        valid_until = min(
+            created_at + timedelta(seconds=self.policy.ttl_sec),
+            min(item.time.forecast_target_at for item in eligible),
+        )
+        if valid_until <= current:
+            return None
         decision_id = deterministic_id(
             "pd",
             strategy_release_id,
@@ -128,13 +166,13 @@ class PortfolioIntentBuilder:
             contributions=contributions,
         )
 
-    def _eligible(self, forecast: ForecastEnvelope, strategy_release_id: str) -> bool:
+    def _eligible(self, forecast: ForecastEnvelope, *, current: datetime) -> bool:
         return (
-            forecast.lineage.strategy_release_id == strategy_release_id
+            forecast.time.forecast_target_at > current
             and forecast.quality.source_status == "ok"
             and forecast.quality.calibration_status == "valid"
             and forecast.quality.data_quality >= self.policy.min_data_quality
             and forecast.quality.range_guard_score <= self.policy.max_range_guard_score
             and forecast.distribution.expected_return_bps is not None
-            and forecast.regime.event_regime not in {"blackout", "reduce_only"}
+            and forecast.regime.event_regime == "normal"
         )

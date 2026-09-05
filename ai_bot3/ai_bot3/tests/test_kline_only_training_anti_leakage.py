@@ -13,8 +13,9 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def test_config_uses_about_three_year_kline_limits():
-    cfg = yaml.safe_load((ROOT / "config.yml").read_text(encoding="utf-8"))
+def test_repository_training_policy_uses_about_three_year_kline_limits():
+    policy_path = ROOT / "tests" / "fixtures" / "training_policy.yml"
+    cfg = yaml.safe_load(policy_path.read_text(encoding="utf-8"))
     assert int(cfg["general"]["cache_days"]) >= 1095
     expected = {
         "scalping": ("3m", 365 * 3 * 24 * 20),
@@ -58,7 +59,6 @@ def test_brain_kline_features_have_identical_lag_in_training_and_inference():
     try:
         from core.brain_model import build_brain_features
     except ModuleNotFoundError as exc:
-        import pytest
         pytest.skip(f"brain_model optional dep missing: {exc.name}")
 
     idx = pd.date_range("2024-01-01", periods=90, freq="h")

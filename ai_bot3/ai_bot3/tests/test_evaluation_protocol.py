@@ -80,6 +80,11 @@ class EvaluationProtocolTests(unittest.TestCase):
                 "commodity.gold.v1": [
                     {"net_return": 0.03}, {"net_return": 0.01}, {"net_return": -0.02}
                 ],
+                "weak.noisy.v1": [
+                    {"net_return": 0.015},
+                    {"net_return": 0.025},
+                    {"net_return": -0.0119},
+                ],
             },
             primary_metric="net_return",
             higher_is_better=True,
@@ -88,7 +93,21 @@ class EvaluationProtocolTests(unittest.TestCase):
         )
         by_group = {item.factor_group: item for item in results}
         self.assertTrue(by_group["crypto.derivatives.v1"].retained)
+        self.assertGreater(
+            by_group["crypto.derivatives.v1"].bootstrap_lower_mean_improvement,
+            0.002,
+        )
         self.assertFalse(by_group["commodity.gold.v1"].retained)
+        self.assertLessEqual(
+            by_group["commodity.gold.v1"].bootstrap_lower_mean_improvement,
+            0.002,
+        )
+        # Mean, 2/3-fold ratio and worst-fold rules alone would retain this arm;
+        # the paired bootstrap lower bound correctly rejects its uncertainty.
+        self.assertGreater(by_group["weak.noisy.v1"].mean_improvement, 0.002)
+        self.assertEqual(by_group["weak.noisy.v1"].improved_fold_ratio, 2 / 3)
+        self.assertGreaterEqual(by_group["weak.noisy.v1"].worst_fold_improvement, -0.002)
+        self.assertFalse(by_group["weak.noisy.v1"].retained)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,14 @@
+table inet ai_bybit_executor_testnet {
+  chain input {
+    type filter hook input priority 0;
+    ct state established,related accept
+    iifname "lo" accept
+    iifname "wg0" ip saddr 10.71.0.1 tcp dport 8787 accept
+  }
+  chain output {
+    type filter hook output priority 0;
+    ct state established,related accept
+    oifname "lo" accept
+    oifname "wg0" ip daddr 10.71.0.1 tcp dport 8443 accept
+  }
+}

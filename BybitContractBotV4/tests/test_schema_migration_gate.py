@@ -43,6 +43,27 @@ class ExecutionSchemaMigrationTests(unittest.TestCase):
             self.assertTrue(row["schema_checksum"])
             self.assertTrue(row["code_commit"])
 
+    def test_execution_store_upgrades_and_backfills_legacy_migration_ledger(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy-execution.sqlite3"
+            with closing(sqlite3.connect(path)) as connection:
+                connection.execute(
+                    """CREATE TABLE schema_migrations(
+                       version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL)"""
+                )
+                connection.execute(
+                    "INSERT INTO schema_migrations(version,applied_at) VALUES (1, 'legacy')"
+                )
+                connection.commit()
+            store = ExecutionStore(path)
+            with closing(store.connect()) as connection:
+                rows = connection.execute(
+                    "SELECT * FROM schema_migrations ORDER BY version"
+                ).fetchall()
+            self.assertEqual(rows[-1]["version"], SCHEMA_VERSION)
+            self.assertTrue(all(row["migration_id"] and row["code_commit"] for row in rows))
+            self.assertTrue(all(len(row["schema_checksum"]) == 64 for row in rows))
+
     def test_execution_store_refuses_checksum_drift(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "execution.sqlite3"

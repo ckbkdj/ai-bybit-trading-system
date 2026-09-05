@@ -1,0 +1,23 @@
+[Unit]
+Description=AI-Bybit real-time predictor (production paper)
+After=network-online.target
+
+[Service]
+Type=simple
+User=ai-bybit
+WorkingDirectory=/opt/ai-bybit/ai_bot3/ai_bot3
+EnvironmentFile=/etc/ai-bybit/predictor-production-paper.env
+Environment=PYTHONPATH=/opt/ai-bybit:/opt/ai-bybit/ai_bot3/ai_bot3
+ExecStart=/opt/ai-bybit/.venv/bin/python main_forecast.py
+Restart=on-failure
+CPUQuota=150%
+MemoryMax=4G
+Nice=-5
+IOWeight=900
+TasksMax=128
+ReadWritePaths=/var/lib/ai-bybit/predictor-realtime /var/lib/ai-bybit/publication-worker
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

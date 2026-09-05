@@ -34,6 +34,26 @@ def test_control_plane_records_version_checksum_and_commit(tmp_path):
     assert row["code_commit"]
 
 
+def test_control_plane_upgrades_and_backfills_legacy_migration_ledger(tmp_path):
+    path = tmp_path / "legacy-control.sqlite3"
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute(
+            "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO schema_migrations(version,applied_at) VALUES (1, 'legacy')"
+        )
+        connection.commit()
+    repository = ControlPlaneRepository(path)
+    with repository.connect() as connection:
+        rows = connection.execute(
+            "SELECT * FROM schema_migrations ORDER BY version"
+        ).fetchall()
+    assert rows[-1]["version"] == SCHEMA_VERSION
+    assert all(row["migration_id"] and row["code_commit"] for row in rows)
+    assert all(len(row["schema_checksum"]) == 64 for row in rows)
+
+
 def test_control_plane_refuses_checksum_drift(tmp_path):
     path = tmp_path / "drift-control.sqlite3"
     repository = ControlPlaneRepository(path)

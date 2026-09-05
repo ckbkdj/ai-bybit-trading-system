@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import sqlite3
 import threading
 from contextlib import closing, contextmanager
@@ -14,13 +13,14 @@ from contracts.execution_receipt_v1 import ExecutionReceipt
 from contracts.forecast_v1 import ForecastEnvelope
 from contracts.operation_ticket_v1 import OperationTicket
 from contracts.portfolio_intent_v1 import PortfolioIntent
+from shadow_contracts.repository import resolve_code_commit
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SCHEMA_CHECKSUM = hashlib.sha256(
-    b"control-plane:v2:portfolio-intents:claim-epoch:immutable-outbox"
+    b"control-plane:v3:consumer-eligibility:latest-decision:consumer-ownership"
 ).hexdigest()
-CODE_COMMIT = os.environ.get("APP_CODE_COMMIT", "workspace-uncommitted")
+CODE_COMMIT = resolve_code_commit(Path(__file__).resolve().parents[3])
 
 
 def _utc_now() -> datetime:
@@ -76,7 +76,10 @@ class ControlPlaneRepository:
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS schema_migrations (
                     version INTEGER PRIMARY KEY,
-                    applied_at TEXT NOT NULL
+                    applied_at TEXT NOT NULL,
+                    migration_id TEXT NOT NULL,
+                    code_commit TEXT NOT NULL,
+                    schema_checksum TEXT NOT NULL
                 )"""
             )
             current = connection.execute(
@@ -98,6 +101,25 @@ class ControlPlaneRepository:
                     connection.execute(
                         f"ALTER TABLE schema_migrations ADD COLUMN {name} {declaration}"
                     )
+            for row in connection.execute(
+                "SELECT version,migration_id,code_commit,schema_checksum FROM schema_migrations"
+            ).fetchall():
+                version = int(row["version"])
+                checksum = (
+                    SCHEMA_CHECKSUM
+                    if version == SCHEMA_VERSION
+                    else hashlib.sha256(
+                        f"control-plane:legacy-import:v{version}".encode("utf-8")
+                    ).hexdigest()
+                )
+                connection.execute(
+                    """UPDATE schema_migrations
+                       SET migration_id=COALESCE(migration_id, ?),
+                           code_commit=COALESCE(code_commit, ?),
+                           schema_checksum=COALESCE(schema_checksum, ?)
+                       WHERE version=?""",
+                    (f"control-plane-legacy-v{version}", CODE_COMMIT, checksum, version),
+                )
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -120,6 +142,8 @@ class ControlPlaneRepository:
                     forecast_revision INTEGER NOT NULL,
                     supersedes_ticket_id TEXT,
                     symbol TEXT NOT NULL,
+                    decision_version INTEGER NOT NULL DEFAULT 0,
+                    allowed_consumer_id TEXT,
                     created_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
@@ -181,8 +205,29 @@ class ControlPlaneRepository:
                 );
                 CREATE INDEX IF NOT EXISTS idx_control_ticket_events
                     ON ticket_events(ticket_id, sequence);
+                CREATE TABLE IF NOT EXISTS consumer_ownership (
+                    consumer_id TEXT PRIMARY KEY,
+                    instance_id TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    lease_expires_at TEXT NOT NULL,
+                    ownership_epoch INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
+            ticket_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(operation_tickets)")
+            }
+            if "decision_version" not in ticket_columns:
+                connection.execute(
+                    """ALTER TABLE operation_tickets ADD COLUMN decision_version INTEGER
+                       NOT NULL DEFAULT 0"""
+                )
+            if "allowed_consumer_id" not in ticket_columns:
+                connection.execute(
+                    "ALTER TABLE operation_tickets ADD COLUMN allowed_consumer_id TEXT"
+                )
             claim_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(ticket_claims)")
             }
@@ -197,7 +242,7 @@ class ControlPlaneRepository:
                 (
                     SCHEMA_VERSION,
                     _iso(_utc_now()),
-                    "control-plane-v2",
+                    "control-plane-v3",
                     CODE_COMMIT,
                     SCHEMA_CHECKSUM,
                 ),
@@ -214,6 +259,7 @@ class ControlPlaneRepository:
         forecast: ForecastEnvelope,
         ticket: OperationTicket | None,
         portfolio_intent: PortfolioIntent | None = None,
+        allowed_consumer_id: str | None = None,
     ) -> bool:
         forecast_data = forecast.model_dump(mode="json")
         forecast_json, forecast_hash = _canonical(forecast_data)
@@ -280,14 +326,17 @@ class ControlPlaneRepository:
             cursor = connection.execute(
                 """INSERT INTO operation_tickets(
                     ticket_id, forecast_id, forecast_revision, supersedes_ticket_id, symbol,
+                    decision_version, allowed_consumer_id,
                     created_at, expires_at, payload_json, payload_sha256
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     ticket.ticket_id,
                     ticket.forecast_id,
                     ticket.forecast_revision,
                     ticket.supersedes_ticket_id,
                     ticket.instrument.symbol,
+                    portfolio_intent.decision_version if portfolio_intent is not None else 0,
+                    allowed_consumer_id,
                     _iso(ticket.created_at),
                     _iso(ticket.expires_at),
                     ticket_json,
@@ -359,6 +408,159 @@ class ControlPlaneRepository:
         ]
         cursor = int(rows[-1]["sequence"]) if rows else max(0, int(after_cursor))
         return tickets, cursor
+
+    def eligible_ticket_page(
+        self,
+        after_cursor: int,
+        consumer_id: str,
+        *,
+        limit: int = 100,
+        scan_limit: int = 50_000,
+        now: datetime | None = None,
+    ) -> tuple[list[tuple[int, OperationTicket]], int, dict[str, int]]:
+        """Fast-forward stale backlog and return only the latest live decision per symbol."""
+
+        point = (now or _utc_now()).astimezone(timezone.utc)
+        safe_limit = max(1, min(int(limit), 500))
+        safe_scan_limit = max(safe_limit, min(int(scan_limit), 100_000))
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                """SELECT sequence, symbol, decision_version, expires_at,
+                          allowed_consumer_id, payload_json
+                   FROM operation_tickets WHERE sequence>? ORDER BY sequence ASC LIMIT ?""",
+                (max(0, int(after_cursor)), safe_scan_limit),
+            ).fetchall()
+            latest_rows = connection.execute(
+                """SELECT t.symbol, t.decision_version, MAX(t.sequence) AS sequence
+                   FROM operation_tickets t
+                   JOIN (
+                       SELECT symbol, MAX(decision_version) AS decision_version
+                       FROM operation_tickets WHERE expires_at>? GROUP BY symbol
+                   ) latest
+                     ON latest.symbol=t.symbol
+                    AND latest.decision_version=t.decision_version
+                   WHERE t.expires_at>?
+                   GROUP BY t.symbol, t.decision_version""",
+                (_iso(point), _iso(point)),
+            ).fetchall()
+        latest_by_symbol = {
+            str(row["symbol"]): (int(row["decision_version"]), int(row["sequence"]))
+            for row in latest_rows
+        }
+        eligible: list[tuple[int, OperationTicket]] = []
+        expired = superseded = ineligible = 0
+        for row in rows:
+            if row["allowed_consumer_id"] and row["allowed_consumer_id"] != consumer_id:
+                ineligible += 1
+                continue
+            expires_at = datetime.fromisoformat(
+                str(row["expires_at"]).replace("Z", "+00:00")
+            ).astimezone(timezone.utc)
+            if expires_at <= point:
+                expired += 1
+                continue
+            if latest_by_symbol.get(str(row["symbol"])) != (
+                int(row["decision_version"]),
+                int(row["sequence"]),
+            ):
+                superseded += 1
+                continue
+            eligible.append(
+                (
+                    int(row["sequence"]),
+                    OperationTicket.model_validate_json(row["payload_json"]),
+                )
+            )
+        selected = eligible[:safe_limit]
+        scanned_to = int(rows[-1]["sequence"]) if rows else max(0, int(after_cursor))
+        next_cursor = (
+            int(selected[-1][0])
+            if len(eligible) > safe_limit
+            else scanned_to
+        )
+        return selected, next_cursor, {
+            "scanned": len(rows),
+            "expired_skipped": expired,
+            "superseded_skipped": superseded,
+            "consumer_ineligible_skipped": ineligible,
+        }
+
+    def activate_consumer(
+        self,
+        consumer_id: str,
+        instance_id: str,
+        account_id: str,
+        *,
+        lease_sec: int = 60,
+        now: datetime | None = None,
+    ) -> int | None:
+        point = (now or _utc_now()).astimezone(timezone.utc)
+        expiry = point + timedelta(seconds=max(5, min(int(lease_sec), 3600)))
+        with self.transaction(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT * FROM consumer_ownership WHERE consumer_id=?",
+                (consumer_id,),
+            ).fetchone()
+            if row:
+                active = datetime.fromisoformat(
+                    str(row["lease_expires_at"]).replace("Z", "+00:00")
+                ).astimezone(timezone.utc) > point
+                same_owner = (
+                    row["instance_id"] == instance_id and row["account_id"] == account_id
+                )
+                if active and not same_owner:
+                    return None
+                epoch = int(row["ownership_epoch"] or 0) + (0 if same_owner else 1)
+            else:
+                epoch = 1
+            connection.execute(
+                """INSERT INTO consumer_ownership(
+                    consumer_id,instance_id,account_id,lease_expires_at,ownership_epoch,updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(consumer_id) DO UPDATE SET
+                    instance_id=excluded.instance_id,
+                    account_id=excluded.account_id,
+                    lease_expires_at=excluded.lease_expires_at,
+                    ownership_epoch=excluded.ownership_epoch,
+                    updated_at=excluded.updated_at""",
+                (consumer_id, instance_id, account_id, _iso(expiry), epoch, _iso(point)),
+            )
+            return epoch
+
+    def backlog_metrics(self, *, now: datetime | None = None) -> dict[str, int]:
+        point = (now or _utc_now()).astimezone(timezone.utc)
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                """SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN expires_at<=? THEN 1 ELSE 0 END) AS expired,
+                    SUM(CASE WHEN expires_at>? THEN 1 ELSE 0 END) AS unexpired
+                   FROM operation_tickets""",
+                (_iso(point), _iso(point)),
+            ).fetchone()
+        return {
+            "ticket_total": int(row["total"] or 0),
+            "ticket_expired": int(row["expired"] or 0),
+            "ticket_unexpired": int(row["unexpired"] or 0),
+        }
+
+    def compact_delivery_outbox(
+        self,
+        *,
+        through_cursor: int,
+        expired_before: datetime,
+    ) -> int:
+        """Compact only acknowledged/expired delivery rows; immutable tickets remain."""
+
+        with self.transaction(immediate=True) as connection:
+            cursor = connection.execute(
+                """DELETE FROM ticket_delivery_outbox
+                   WHERE sequence<=? AND ticket_id IN (
+                       SELECT ticket_id FROM operation_tickets WHERE expires_at<=?
+                   )""",
+                (max(0, int(through_cursor)), _iso(expired_before)),
+            )
+            return int(cursor.rowcount or 0)
 
     def get_ticket(self, ticket_id: str) -> Optional[OperationTicket]:
         with closing(self.connect()) as connection:

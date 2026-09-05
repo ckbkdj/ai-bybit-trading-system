@@ -10,21 +10,26 @@ from pathlib import Path
 TRADE_ROOT = Path(__file__).resolve().parents[1] / "BybitContractBotV4"
 sys.path.insert(0, str(TRADE_ROOT))
 
-from bybit import BybitClient
 from bybit_executor import BybitExecutor
+from durable_execution_store import DurableExecutionStore
+from exchange_gateway import ExchangeGateway
 from execution_reporter import ExecutionReporter
 from risk_guard import AccountSnapshot, MarketSnapshot, PortfolioSnapshot, SystemHealth
 from sizing import InstrumentRules
 from ticket_client import TicketHttpClient, deterministic_lease_token
 from ticket_consumer import TicketConsumer
-from ticket_store import ExecutionStore
+from ticket_validator import TicketValidator
 
 
 class ShadowContext:
     def market(self, ticket):
         return MarketSnapshot(
-            ticket.instrument.symbol, 100000, 99995, 100005,
-            ticket.guards.observed_market_regime, datetime.now(timezone.utc),
+            ticket.instrument.symbol,
+            100000,
+            99995,
+            100005,
+            ticket.guards.observed_market_regime,
+            datetime.now(timezone.utc),
             cross_exchange_basis_bps=0,
         )
 
@@ -39,8 +44,11 @@ class ShadowContext:
 
     def instrument_rules(self, ticket):
         return InstrumentRules(
-            ticket.instrument.symbol, Decimal("0.001"), Decimal("0.001"),
-            Decimal("0.1"), Decimal("5"),
+            ticket.instrument.symbol,
+            Decimal("0.001"),
+            Decimal("0.001"),
+            Decimal("0.1"),
+            Decimal("5"),
         )
 
 
@@ -54,31 +62,56 @@ def main(base_url: str, db_path: str) -> int:
     claim_epoch = client.claim(item.ticket.ticket_id, "shadow-e2e", lease)
     if claim_epoch is None:
         raise RuntimeError("remote claim failed")
-    store = ExecutionStore(Path(db_path))
-    exchange = BybitClient(mode="shadow")
+
+    store = DurableExecutionStore(Path(db_path))
+    exchange = ExchangeGateway(mode="shadow", position_mode="one_way")
     consumer = TicketConsumer(
         consumer_id="shadow-e2e",
         store=store,
         context=ShadowContext(),
         executor=BybitExecutor(exchange, store),
+        validator=TicketValidator(item.ticket.strategy_release_id),
     )
     state = consumer.process(
-        item.ticket, claim_epoch=claim_epoch, lease_token=lease
+        item.ticket,
+        claim_epoch=claim_epoch,
+        lease_token=lease,
     )
     receipt = ExecutionReporter(store, "shadow-e2e", "shadow").build(item.ticket.ticket_id)
     if not client.post_receipt(receipt):
         raise RuntimeError("receipt delivery failed")
+
+    submitted_order = exchange.exchange.orders[0] if exchange.exchange.orders else {}
+    submitted_params = submitted_order.get("params") or {}
     output = {
         "ticket_id": item.ticket.ticket_id,
+        "strategy_release_id": item.ticket.strategy_release_id,
+        "portfolio_decision_id": item.ticket.portfolio_decision_id,
         "state": state.value,
         "shadow_order_count": len(exchange.exchange.orders),
         "cursor": item.cursor,
         "receipt_id": receipt.receipt_id,
         "reason_code": store.ticket_record(item.ticket.ticket_id).get("reason_code"),
         "reason_detail": store.ticket_record(item.ticket.ticket_id).get("reason_detail"),
+        "active_exchange_boundary": type(exchange).__name__,
+        "active_store_boundary": type(store).__name__,
+        "position_idx": submitted_params.get("positionIdx"),
+        "reduce_only": submitted_params.get("reduceOnly"),
+        "attached_stop_loss": submitted_params.get("stopLoss"),
+        "order_link_id": submitted_params.get("orderLinkId"),
     }
     print(json.dumps(output, sort_keys=True))
-    return 0 if output["state"] == "SUBMITTED" and output["shadow_order_count"] == 1 else 2
+    required = (
+        output["state"] == "SUBMITTED"
+        and output["shadow_order_count"] == 1
+        and output["active_exchange_boundary"] == "ExchangeGateway"
+        and output["active_store_boundary"] == "DurableExecutionStore"
+        and output["position_idx"] == 0
+        and output["reduce_only"] is False
+        and output["attached_stop_loss"] is not None
+        and bool(output["order_link_id"])
+    )
+    return 0 if required else 2
 
 
 if __name__ == "__main__":

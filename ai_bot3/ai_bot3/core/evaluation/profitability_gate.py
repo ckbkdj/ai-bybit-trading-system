@@ -4,6 +4,7 @@ import json
 import math
 from collections import defaultdict
 from dataclasses import asdict, dataclass
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
@@ -14,14 +15,53 @@ import numpy as np
 class ProfitabilityThresholds:
     minimum_net_return: float = 0.0
     minimum_profit_factor: float = 1.20
+    minimum_fee_adjusted_win_rate: float = 0.52
+    minimum_deflated_sharpe_probability: float = 0.95
+    maximum_cscv_pbo: float = 0.05
     maximum_drawdown: float = 0.03
     minimum_bootstrap_expectancy: float = 0.0
-    maximum_2x_cost_loss: float = 0.005
+    minimum_two_x_cost_net_return: float = 0.0
     minimum_positive_fold_ratio: float = 0.60
     maximum_concentration_share: float = 0.50
-    minimum_trades: int = 30
+    minimum_portfolio_trades: int = 100
+    minimum_horizon_trades: int = 30
+    minimum_independent_return_clusters: int = 20
     bootstrap_samples: int = 2000
     bootstrap_seed: int = 20260823
+
+    def __post_init__(self) -> None:
+        if self.minimum_net_return < 0:
+            raise ValueError("minimum_net_return cannot be below zero")
+        if self.minimum_profit_factor < 1.20:
+            raise ValueError("minimum_profit_factor cannot be below 1.20")
+        if self.minimum_fee_adjusted_win_rate < 0.52:
+            raise ValueError("minimum_fee_adjusted_win_rate cannot be below 52%")
+        if self.minimum_deflated_sharpe_probability < 0.95:
+            raise ValueError(
+                "minimum_deflated_sharpe_probability cannot be below 95%"
+            )
+        if not 0 <= self.maximum_cscv_pbo <= 0.05:
+            raise ValueError("maximum_cscv_pbo cannot exceed 5%")
+        if not 0 < self.maximum_drawdown <= 0.03:
+            raise ValueError("maximum_drawdown cannot exceed 3%")
+        if self.minimum_bootstrap_expectancy < 0:
+            raise ValueError("minimum_bootstrap_expectancy cannot be below zero")
+        if self.minimum_two_x_cost_net_return < 0:
+            raise ValueError("minimum_two_x_cost_net_return cannot be below zero")
+        if not 0.60 <= self.minimum_positive_fold_ratio <= 1:
+            raise ValueError("minimum_positive_fold_ratio cannot be below 60%")
+        if not 0 < self.maximum_concentration_share <= 0.50:
+            raise ValueError("maximum_concentration_share cannot exceed 50%")
+        if self.minimum_portfolio_trades < 100:
+            raise ValueError("minimum_portfolio_trades cannot be below 100")
+        if self.minimum_horizon_trades < 30:
+            raise ValueError("minimum_horizon_trades cannot be below 30")
+        if self.minimum_independent_return_clusters < 20:
+            raise ValueError(
+                "minimum_independent_return_clusters cannot be below 20"
+            )
+        if self.bootstrap_samples < 2000:
+            raise ValueError("bootstrap_samples cannot be below 2000")
 
 
 @dataclass(frozen=True)
@@ -80,14 +120,98 @@ def _bootstrap_lower_expectancy(
     return float(np.quantile(means, 0.05))
 
 
+def _utc_day(value: object) -> date | None:
+    if isinstance(value, datetime):
+        observed_at = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            observed_at = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if observed_at.tzinfo is None:
+        return None
+    return observed_at.astimezone(timezone.utc).date()
+
+
+def _daily_portfolio_returns(
+    trades: Sequence[object],
+    *,
+    initial_equity_usdt: float,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Collapse correlated/overlapping trades into UTC portfolio-day clusters.
+
+    A trade-level bootstrap would overstate the effective sample size when
+    several symbols are entered together or their holding paths overlap.  The
+    daily series aggregates realized net PnL and inserts zero-return calendar
+    days, then the existing moving-block bootstrap preserves short-range serial
+    dependence between those clusters.
+    """
+
+    if initial_equity_usdt <= 0:
+        return np.asarray([], dtype=float), {
+            "complete": False,
+            "reason": "non_positive_initial_equity",
+            "cluster_count": 0,
+        }
+    pnl_by_day: dict[date, float] = defaultdict(float)
+    missing_timestamp_count = 0
+    for trade in trades:
+        observed_day = _utc_day(
+            _value(trade, "exit_at", _value(trade, "decision_at"))
+        )
+        if observed_day is None:
+            missing_timestamp_count += 1
+            continue
+        pnl_by_day[observed_day] += float(_value(trade, "net_pnl", 0.0))
+    if missing_timestamp_count or not pnl_by_day:
+        return np.asarray([], dtype=float), {
+            "complete": False,
+            "reason": (
+                "missing_or_non_utc_trade_timestamps"
+                if missing_timestamp_count
+                else "no_dated_trades"
+            ),
+            "cluster_count": 0,
+            "missing_timestamp_count": missing_timestamp_count,
+        }
+    first_day = min(pnl_by_day)
+    last_day = max(pnl_by_day)
+    cluster_count = (last_day - first_day).days + 1
+    returns = np.asarray(
+        [
+            pnl_by_day.get(first_day + timedelta(days=offset), 0.0)
+            / initial_equity_usdt
+            for offset in range(cluster_count)
+        ],
+        dtype=float,
+    )
+    return returns, {
+        "complete": True,
+        "method": "utc_calendar_day_portfolio_net_return_moving_block_bootstrap",
+        "cluster_count": cluster_count,
+        "active_cluster_count": len(pnl_by_day),
+        "first_cluster": first_day.isoformat(),
+        "last_cluster": last_day.isoformat(),
+        "zero_return_clusters_included": cluster_count - len(pnl_by_day),
+        "missing_timestamp_count": 0,
+    }
+
+
 def _concentration(trades: Sequence[object], key: str) -> tuple[float, str | None]:
     pnl: dict[str, float] = defaultdict(float)
     for trade in trades:
-        pnl[str(_value(trade, key, "unknown"))] += max(0.0, float(_value(trade, "net_pnl", 0.0)))
-    total = sum(pnl.values())
+        pnl[str(_value(trade, key, "unknown"))] += float(
+            _value(trade, "net_pnl", 0.0)
+        )
+    positive_contributions = {
+        group: max(0.0, value) for group, value in pnl.items()
+    }
+    total = sum(positive_contributions.values())
     if total <= 0:
         return 1.0, None
-    group, value = max(pnl.items(), key=lambda item: item[1])
+    group, value = max(positive_contributions.items(), key=lambda item: item[1])
     return value / total, group
 
 
@@ -97,14 +221,25 @@ def evaluate_profitability_gate(
     *,
     initial_equity_usdt: float,
     two_x_cost_net_return: float,
-    execution_evidence_complete: bool = True,
-    factor_ablation_complete: bool = True,
+    mark_to_market_max_drawdown: float | None = None,
+    mark_to_market_evidence_complete: bool = False,
+    execution_evidence_complete: bool = False,
+    factor_ablation_complete: bool = False,
+    statistical_overfit_evidence: Mapping[str, object] | None = None,
+    calibration_coverage_evidence: Mapping[str, object] | None = None,
+    gate_scope: str = "portfolio",
     thresholds: ProfitabilityThresholds | None = None,
 ) -> ProfitabilityGateResult:
     cfg = thresholds or ProfitabilityThresholds()
+    if gate_scope not in {"portfolio", "horizon"}:
+        raise ValueError("gate_scope must be portfolio or horizon")
+    minimum_trades = (
+        cfg.minimum_portfolio_trades
+        if gate_scope == "portfolio"
+        else cfg.minimum_horizon_trades
+    )
     trades = list(lockbox_trades)
     pnls = [float(_value(trade, "net_pnl", 0.0)) for trade in trades]
-    returns = np.asarray([float(_value(trade, "net_return", 0.0)) for trade in trades], dtype=float)
     final_equity = initial_equity_usdt + sum(pnls)
     net_return = final_equity / initial_equity_usdt - 1.0 if initial_equity_usdt > 0 else -1.0
     profit = sum(value for value in pnls if value > 0)
@@ -118,11 +253,49 @@ def evaluate_profitability_gate(
     profit_factor_actual: float | str = (
         "Infinity" if profit > 0 and loss == 0 else float(profit_factor or 0.0)
     )
-    drawdown = _maximum_drawdown(pnls, initial_equity_usdt)
-    bootstrap_lower = _bootstrap_lower_expectancy(
-        returns,
-        samples=cfg.bootstrap_samples,
-        seed=cfg.bootstrap_seed,
+    fee_adjusted_win_rate = (
+        sum(value > 0 for value in pnls) / len(pnls) if pnls else 0.0
+    )
+    statistical_evidence = dict(statistical_overfit_evidence or {})
+    statistical_complete = bool(statistical_evidence.get("complete"))
+    deflated_sharpe_probability = statistical_evidence.get(
+        "deflated_sharpe_probability"
+    )
+    cscv_pbo = statistical_evidence.get("probability_of_backtest_overfitting")
+    calibration_evidence = dict(calibration_coverage_evidence or {})
+    calibration_complete = bool(calibration_evidence.get("complete"))
+    calibration_passed = bool(
+        calibration_complete and calibration_evidence.get("passed")
+    )
+    realized_only_drawdown = _maximum_drawdown(pnls, initial_equity_usdt)
+    mark_to_market_drawdown = (
+        float(mark_to_market_max_drawdown)
+        if mark_to_market_max_drawdown is not None
+        else None
+    )
+    drawdown_passed = (
+        bool(mark_to_market_evidence_complete)
+        and mark_to_market_drawdown is not None
+        and 0.0 <= mark_to_market_drawdown <= cfg.maximum_drawdown
+    )
+    clustered_returns, cluster_evidence = _daily_portfolio_returns(
+        trades,
+        initial_equity_usdt=initial_equity_usdt,
+    )
+    # Zero-return calendar days remain in the moving-block bootstrap so an
+    # inactive policy cannot hide its opportunity cost.  They are not,
+    # however, independent realized trading evidence for the minimum-sample
+    # gate.  Count only active portfolio days there.
+    independent_cluster_count = int(cluster_evidence.get("active_cluster_count", 0))
+    bootstrap_lower = (
+        _bootstrap_lower_expectancy(
+            clustered_returns,
+            samples=cfg.bootstrap_samples,
+            seed=cfg.bootstrap_seed,
+        )
+        if bool(cluster_evidence.get("complete"))
+        and independent_cluster_count >= cfg.minimum_independent_return_clusters
+        else None
     )
     fold_returns = [float(fold.get("net_return", 0.0)) for fold in walk_forward_folds]
     positive_fold_ratio = (
@@ -143,20 +316,83 @@ def evaluate_profitability_gate(
             "actual": bool(factor_ablation_complete),
             "required": True,
         },
-        "minimum_trades": {"passed": len(trades) >= cfg.minimum_trades, "actual": len(trades), "threshold": cfg.minimum_trades},
+        "return_quantile_calibration": {
+            "passed": calibration_passed,
+            "actual": calibration_evidence.get("status", "MISSING"),
+            "required": "PASSED",
+            "evidence_complete": calibration_complete,
+            "failed_group_count": calibration_evidence.get(
+                "failed_group_count"
+            ),
+            "record_count": calibration_evidence.get("record_count"),
+            "unique_decision_timestamp_count": calibration_evidence.get(
+                "unique_decision_timestamp_count"
+            ),
+            "method": calibration_evidence.get("method"),
+        },
+        "deflated_sharpe_ratio": {
+            "passed": statistical_complete
+            and deflated_sharpe_probability is not None
+            and float(deflated_sharpe_probability)
+            >= cfg.minimum_deflated_sharpe_probability,
+            "actual": deflated_sharpe_probability,
+            "threshold": cfg.minimum_deflated_sharpe_probability,
+            "evidence_complete": statistical_complete,
+            "number_of_trials": statistical_evidence.get("number_of_trials"),
+            "return_unit": statistical_evidence.get("return_unit"),
+        },
+        "cscv_probability_of_backtest_overfitting": {
+            "passed": statistical_complete
+            and cscv_pbo is not None
+            and float(cscv_pbo) <= cfg.maximum_cscv_pbo,
+            "actual": cscv_pbo,
+            "maximum": cfg.maximum_cscv_pbo,
+            "evidence_complete": statistical_complete,
+            "strategy_count": statistical_evidence.get("strategy_count"),
+            "combination_count": statistical_evidence.get("combination_count"),
+        },
+        "minimum_trades": {
+            "passed": len(trades) >= minimum_trades,
+            "actual": len(trades),
+            "threshold": minimum_trades,
+            "scope": gate_scope,
+        },
+        "independent_return_clusters": {
+            "passed": bool(cluster_evidence.get("complete"))
+            and independent_cluster_count >= cfg.minimum_independent_return_clusters,
+            "actual": independent_cluster_count,
+            "threshold": cfg.minimum_independent_return_clusters,
+            "evidence": cluster_evidence,
+        },
         "lockbox_net_return": {"passed": net_return > cfg.minimum_net_return, "actual": net_return, "threshold": cfg.minimum_net_return},
         "profit_factor": {"passed": profit_factor_passed, "actual": profit_factor_actual, "threshold": cfg.minimum_profit_factor},
-        "max_drawdown": {"passed": drawdown <= cfg.maximum_drawdown, "actual": drawdown, "threshold": cfg.maximum_drawdown},
+        "fee_adjusted_win_rate": {
+            "passed": fee_adjusted_win_rate >= cfg.minimum_fee_adjusted_win_rate,
+            "actual": fee_adjusted_win_rate,
+            "threshold": cfg.minimum_fee_adjusted_win_rate,
+            "basis": "positive net_pnl after all modeled costs",
+        },
+        "mark_to_market_drawdown": {
+            "passed": drawdown_passed,
+            "actual": mark_to_market_drawdown,
+            "threshold": cfg.maximum_drawdown,
+            "evidence_complete": bool(mark_to_market_evidence_complete),
+            "required_method": "portfolio_mark_to_market_at_every_market_observation",
+        },
         "bootstrap_lower_expectancy": {
             "passed": bootstrap_lower is not None and bootstrap_lower > cfg.minimum_bootstrap_expectancy,
             "actual": bootstrap_lower,
             "threshold": cfg.minimum_bootstrap_expectancy,
             "confidence": 0.95,
+            "unit": "utc_calendar_day_portfolio_net_return",
+            "dependence_control": "moving_block_bootstrap_over_daily_portfolio_clusters",
+            "cluster_count": independent_cluster_count,
+            "calendar_cluster_count": int(cluster_evidence.get("cluster_count", 0)),
         },
         "two_x_cost_stress": {
-            "passed": two_x_cost_net_return >= -cfg.maximum_2x_cost_loss,
+            "passed": two_x_cost_net_return >= cfg.minimum_two_x_cost_net_return,
             "actual": two_x_cost_net_return,
-            "minimum": -cfg.maximum_2x_cost_loss,
+            "minimum": cfg.minimum_two_x_cost_net_return,
         },
         "positive_walk_forward_folds": {
             "passed": positive_fold_ratio >= cfg.minimum_positive_fold_ratio,
@@ -187,12 +423,51 @@ def evaluate_profitability_gate(
             "trade_count": len(trades),
             "net_return": net_return,
             "profit_factor": profit_factor_actual,
-            "max_drawdown": drawdown,
+            "fee_adjusted_win_rate": fee_adjusted_win_rate,
+            "deflated_sharpe_probability": deflated_sharpe_probability,
+            "cscv_probability_of_backtest_overfitting": cscv_pbo,
+            "return_quantile_calibration_status": calibration_evidence.get(
+                "status", "MISSING"
+            ),
+            "max_drawdown": mark_to_market_drawdown,
+            "realized_close_only_drawdown": realized_only_drawdown,
             "bootstrap_lower_expectancy": bootstrap_lower,
+            "bootstrap_expectancy_unit": "utc_calendar_day_portfolio_net_return",
+            "independent_return_cluster_count": independent_cluster_count,
+            "independent_return_cluster_evidence": cluster_evidence,
             "two_x_cost_net_return": two_x_cost_net_return,
             "positive_walk_forward_fold_ratio": positive_fold_ratio,
             "maximum_return_concentration_share": maximum_share,
         },
+        blockers=blockers,
+    )
+
+
+def evaluate_development_gate(
+    development_oos_trades: Iterable[object],
+    walk_forward_folds: Sequence[Mapping[str, object]],
+    **kwargs: object,
+) -> ProfitabilityGateResult:
+    """Apply the full economic gate before any final lockbox may be opened."""
+
+    result = evaluate_profitability_gate(
+        development_oos_trades,
+        walk_forward_folds,
+        **kwargs,
+    )
+    checks = dict(result.checks)
+    checks["development_oos_net_return"] = checks.pop("lockbox_net_return")
+    blockers = tuple(
+        "development_oos_net_return" if blocker == "lockbox_net_return" else blocker
+        for blocker in result.blockers
+    )
+    return ProfitabilityGateResult(
+        profitability_gate=result.profitability_gate,
+        stage="development_validated" if result.passed else "rejected",
+        candidate_count=0,
+        live_count=0,
+        checks=checks,
+        metrics={**result.metrics, "evaluation_scope": "development_oos"},
         blockers=blockers,
     )
 
@@ -207,6 +482,7 @@ def write_profitability_report(path: Path, result: ProfitabilityGateResult) -> N
 __all__: Sequence[str] = (
     "ProfitabilityGateResult",
     "ProfitabilityThresholds",
+    "evaluate_development_gate",
     "evaluate_profitability_gate",
     "write_profitability_report",
 )

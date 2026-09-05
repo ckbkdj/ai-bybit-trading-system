@@ -1,0 +1,624 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import sys
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from core.features.profitability_technical import TECHNICAL_FEATURE_COLUMNS
+from core.models.profitability_runtime import (
+    generate_profitability_alpha_prediction,
+    price_frame_cutoff,
+)
+from core.models.two_stage import TwoStageAlphaModel, TwoStageConfig
+from core.training.bybit_pit_panel import BybitPITFeatureSource
+from core.providers.bybit_public_pit import BybitPublicPITStore
+from core.providers.coinmetrics_stablecoin_pit import (
+    CoinMetricsStablecoinPITStore,
+    HTTPPayload,
+    backfill_coinmetrics_stablecoin_pit,
+)
+from core.providers.fred_alfred_pit import FredAlfredPITStore
+
+
+FEATURES = (
+    "symbol",
+    "horizon_sec",
+    "side",
+    "liquidity",
+    "volatility",
+    "session",
+    "regime",
+) + TECHNICAL_FEATURE_COLUMNS
+
+
+def _training_frame() -> pd.DataFrame:
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    rows = []
+    for index in range(120):
+        decision_at = start + timedelta(days=index)
+        signal = float(np.sin(index / 7.0))
+        direction = "up" if signal > 0.1 else "down" if signal < -0.1 else "flat"
+        for side in ("BUY", "SELL"):
+            aligned = (side == "BUY" and direction == "up") or (
+                side == "SELL" and direction == "down"
+            )
+            row = {
+                "symbol": "BTCUSDT",
+                "horizon_sec": 180,
+                "side": side,
+                "liquidity": 1_000_000.0 + index,
+                "volatility": 0.002 + abs(signal) * 0.001,
+                "session": "asia",
+                "regime": "normal",
+                "net_return": 0.002 if aligned else -0.001,
+                "mae": 0.0008,
+                "mfe": 0.0015,
+                "direction_label": direction,
+                "decision_at": decision_at,
+                "label_available_at": decision_at + timedelta(hours=1),
+            }
+            row.update({name: signal * (position + 1) / 100 for position, name in enumerate(TECHNICAL_FEATURE_COLUMNS)})
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _market_frame(start: datetime | None = None) -> pd.DataFrame:
+    start = start or datetime(2026, 1, 1, tzinfo=timezone.utc)
+    rows = []
+    for index in range(100):
+        price = 100.0 + 0.02 * index + np.sin(index / 8.0)
+        rows.append(
+            {
+                "open": price,
+                "high": price * 1.002,
+                "low": price * 0.998,
+                "close": price * 1.0002,
+                "volume": 1_000.0 + index,
+            }
+        )
+    return pd.DataFrame(
+        rows,
+        index=pd.date_range(start, periods=len(rows), freq="3min"),
+    )
+
+
+def test_price_frame_cutoff_uses_the_alpha_timestamp_contract():
+    market = _market_frame()
+    close_times = pd.date_range(
+        "2026-02-01T00:03:00Z", periods=len(market), freq="3min"
+    )
+    market["close_at"] = close_times
+
+    assert price_frame_cutoff(market) == close_times[-1].to_pydatetime()
+
+
+def _runtime_macro_store(tmp_path: Path, decision_at: datetime) -> Path:
+    database = tmp_path / "macro.sqlite3"
+    raw = tmp_path / "fred-response.json"
+    body = b'{"observations":[]}'
+    raw.write_bytes(body)
+    received_at = decision_at + timedelta(hours=1)
+    available_at = decision_at - timedelta(minutes=30)
+    store = FredAlfredPITStore(database)
+    with store.connect() as connection:
+        connection.execute(
+            """INSERT INTO fred_alfred_responses(
+                   response_id,series_id,output_type,request_descriptor,
+                   requested_at,received_at,http_status,content_length,
+                   content_sha256,row_count,raw_response_path
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "runtime-vix-response", "VIXCLS", 4,
+                json.dumps({"series_id": "VIXCLS", "output_type": 4}),
+                (received_at - timedelta(seconds=1)).isoformat(),
+                received_at.isoformat(), 200, len(body),
+                hashlib.sha256(body).hexdigest(), 0, str(raw.resolve()),
+            ),
+        )
+        connection.execute(
+            """INSERT INTO macro_pit_observations(
+                   observation_id,name,value,unit,event_time,available_at,
+                   ingested_at,source,series_id,observation_date,vintage_date
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "runtime-vix", "vix_level", 18.5, "index_points",
+                (available_at - timedelta(hours=1)).isoformat(),
+                available_at.isoformat(), received_at.isoformat(),
+                "fred.alfred.initial_release", "VIXCLS",
+                available_at.date().isoformat(), available_at.date().isoformat(),
+            ),
+        )
+        connection.commit()
+    return database
+
+
+def _runtime_flow_store(tmp_path: Path) -> Path:
+    database = tmp_path / "flows.sqlite3"
+    fetched = datetime(2026, 1, 20, tzinfo=timezone.utc)
+    rows = []
+    for offset in range(12):
+        observed = date(2026, 1, 1) + timedelta(days=offset)
+        rows.extend(
+            (
+                {"asset": "usdc", "time": observed.isoformat() + "T00:00:00Z",
+                 "SplyCur": str(50_000_000_000 + offset * 10_000_000)},
+                {"asset": "usdt", "time": observed.isoformat() + "T00:00:00Z",
+                 "SplyCur": str(100_000_000_000 + offset * 20_000_000)},
+            )
+        )
+    body = json.dumps({"data": rows}, separators=(",", ":")).encode()
+
+    def requester(_url: str, _timeout_sec: float) -> HTTPPayload:
+        return HTTPPayload(
+            body=body,
+            requested_at=fetched - timedelta(seconds=1),
+            received_at=fetched,
+            http_status=200,
+        )
+
+    backfill_coinmetrics_stablecoin_pit(
+        CoinMetricsStablecoinPITStore(database),
+        cache_dir=tmp_path / "flow-raw",
+        observation_start=date(2026, 1, 1),
+        observation_end=date(2026, 1, 12),
+        requester=requester,
+    )
+    return database
+
+
+def _bundle(tmp_path: Path, extra_features: tuple[str, ...] = ()) -> Path:
+    training = _training_frame()
+    for position, name in enumerate(extra_features, start=1):
+        training[name] = np.sin(np.arange(len(training)) / (position + 3.0))
+    formal_features = FEATURES + extra_features
+    model = TwoStageAlphaModel(
+        TwoStageConfig(
+            direction_iterations=30,
+            meta_iterations=30,
+            minimum_expectancy_clusters=5,
+        )
+    ).fit(training, formal_features)
+    model_path = tmp_path / "horizon_180.json"
+    model.save(model_path)
+    model_sha = hashlib.sha256(model_path.read_bytes()).hexdigest()
+    bundle = tmp_path / "model_bundle.json"
+    bundle.write_text(
+        json.dumps(
+            {
+                "schema_version": "profitability-model-bundle.v2",
+                "trial_id": "shadow_trial",
+                "model_family": "profitability_two_stage",
+                "release_stage": "rejected",
+                "profitability_gate": "FAILED",
+                "models": {"180": model_path.name},
+                "model_sha256": {"180": model_sha},
+                "formal_feature_columns": list(formal_features),
+                "retained_factor_groups": [],
+                "lockbox_fingerprint": None,
+                "lockbox_consumed": False,
+                "code_commit": "1" * 40,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return bundle
+
+
+def test_rejected_shadow_bundle_runs_real_alpha_but_cannot_be_actionable(tmp_path):
+    bundle = _bundle(tmp_path)
+    alpha = generate_profitability_alpha_prediction(
+        _market_frame(),
+        symbol="BTCUSDT",
+        mode="scalping",
+        model_bundle_path=bundle,
+    )
+
+    assert alpha["status"] == "ok", alpha.get("reason")
+    assert alpha["model_family"] == "profitability_two_stage"
+    assert alpha["model_bundle_id"] == "shadow_trial"
+    assert alpha["release_stage"] == "rejected"
+    assert alpha["profitability_gate"] == "FAILED"
+    assert alpha["actionable"] is False
+    assert alpha["decision"] in {"TRADE", "NO_TRADE"}
+    assert alpha["feature_evidence"]["feature_snapshot_sha256"]
+
+
+def test_runtime_cannot_re_date_stale_price_frame_with_a_later_cutoff(tmp_path):
+    market = _market_frame()
+    observed = market.index[-1].to_pydatetime()
+    bundle = _bundle(tmp_path)
+
+    exact = generate_profitability_alpha_prediction(
+        market,
+        symbol="BTCUSDT",
+        mode="scalping",
+        latest_decision_at=observed,
+        model_bundle_path=bundle,
+    )
+    re_dated = generate_profitability_alpha_prediction(
+        market,
+        symbol="BTCUSDT",
+        mode="scalping",
+        latest_decision_at=observed + timedelta(minutes=3),
+        model_bundle_path=bundle,
+    )
+
+    assert exact["status"] == "ok", exact.get("reason")
+    assert re_dated["status"] == "blocked"
+    assert "cannot re-date stale price data" in re_dated["reason"]
+    assert re_dated["actionable"] is False
+
+
+def test_runtime_rechecks_price_continuity_and_ohlcv_contract(tmp_path):
+    bundle = _bundle(tmp_path)
+    market = _market_frame()
+    discontinuous = market.drop(market.index[-10]).copy()
+    invalid_ohlcv = market.copy()
+    invalid_ohlcv.loc[invalid_ohlcv.index[-1], "high"] = (
+        invalid_ohlcv.loc[invalid_ohlcv.index[-1], "close"] * 0.5
+    )
+
+    gap_result = generate_profitability_alpha_prediction(
+        discontinuous,
+        symbol="BTCUSDT",
+        mode="scalping",
+        model_bundle_path=bundle,
+    )
+    ohlcv_result = generate_profitability_alpha_prediction(
+        invalid_ohlcv,
+        symbol="BTCUSDT",
+        mode="scalping",
+        model_bundle_path=bundle,
+    )
+
+    assert gap_result["status"] == "blocked"
+    assert "discontinuous" in gap_result["reason"]
+    assert ohlcv_result["status"] == "blocked"
+    assert "OHLCV market-data contract" in ohlcv_result["reason"]
+
+
+def test_candidate_runtime_rejects_an_old_price_frame_at_model_boundary(tmp_path):
+    bundle = _bundle(tmp_path)
+    payload = json.loads(bundle.read_text(encoding="utf-8"))
+    payload.update(
+        {
+            "kline_source": "bybit",
+            "release_stage": "candidate",
+            "profitability_gate": "PASSED",
+            "approved_horizons": [180],
+        }
+    )
+    bundle.write_text(json.dumps(payload), encoding="utf-8")
+
+    alpha = generate_profitability_alpha_prediction(
+        _market_frame(datetime(2025, 1, 1, tzinfo=timezone.utc)),
+        symbol="BTCUSDT",
+        mode="scalping",
+        input_price_source="bybit_linear_last_trade_kline",
+        model_bundle_path=bundle,
+    )
+
+    assert alpha["status"] == "blocked"
+    assert "stale or future-dated" in alpha["reason"]
+    assert alpha["actionable"] is False
+
+
+def test_bybit_trained_bundle_rejects_cross_venue_runtime_prices(tmp_path):
+    bundle = _bundle(tmp_path)
+    payload = json.loads(bundle.read_text(encoding="utf-8"))
+    payload["kline_source"] = "bybit"
+    bundle.write_text(json.dumps(payload), encoding="utf-8")
+    market = _market_frame()
+
+    mismatched = generate_profitability_alpha_prediction(
+        market,
+        symbol="BTCUSDT",
+        mode="scalping",
+        input_price_source="binance_futures",
+        model_bundle_path=bundle,
+    )
+    verified = generate_profitability_alpha_prediction(
+        market,
+        symbol="BTCUSDT",
+        mode="scalping",
+        input_price_source="bybit_linear_last_trade_kline",
+        model_bundle_path=bundle,
+    )
+
+    assert mismatched["status"] == "blocked"
+    assert "requires a fresh Bybit" in mismatched["reason"]
+    assert verified["status"] == "ok"
+    evidence = verified["feature_evidence"]["price_path"]
+    assert evidence["status"] == "verified"
+    assert evidence["training_kline_source"] == "bybit"
+    assert evidence["runtime_price_source"] == "bybit_linear_last_trade_kline"
+    assert evidence["same_venue"] is True
+    assert evidence["continuous"] is True
+    assert evidence["ohlcv_contract_valid"] is True
+    assert evidence["interval_sec"] == 180
+    assert evidence["observed_bar_count"] == len(market)
+    assert evidence["last_price"] == market["close"].iloc[-1]
+    assert verified["feature_evidence"]["runtime_contract_verified"] is True
+    assert 0.0 <= verified["range_guard_score"] <= 1.0
+    assert verified["range_guard_details"]["method"] == "standardized_3_5_sigma"
+
+
+def _external_context(decision_at: datetime, *, status: str = "ok", age_days: int = 1):
+    return {
+        "status": status,
+        "source": "trad_data_service.canonical_panel",
+        "data": {
+            "available_at": (decision_at - timedelta(days=age_days)).isoformat(),
+            "hash_verified": True,
+            "latest_pass_run_id": "pass-run",
+            "canonical_sha_from_receipt": "a" * 64,
+            "revision_control": {
+                "baseline_sha256": "b" * 64,
+                "receipt_predecessor_hash_verified": True,
+                "append_only_revision_verified": True,
+                "scoped_base_price_audit_status": "PASS",
+                "external_derived_columns_trusted": False,
+            },
+            "features": {"cross_asset_spy_ret_1d": 0.01},
+        },
+    }
+
+
+def test_runtime_requires_fresh_healthy_external_panel_only_when_in_contract(tmp_path):
+    market = _market_frame()
+    decision_at = market.index[-1].to_pydatetime()
+    baseline_bundle = _bundle(tmp_path / "baseline")
+    ignored = generate_profitability_alpha_prediction(
+        market,
+        symbol="BTCUSDT",
+        mode="scalping",
+        model_bundle_path=baseline_bundle,
+        external_panel_context=_external_context(decision_at, status="degraded", age_days=30),
+    )
+    assert ignored["status"] == "ok"
+    assert ignored["feature_evidence"]["external_panel"]["status"] == "not_required"
+
+    external_bundle = _bundle(tmp_path / "external", ("spy_return",))
+    healthy = generate_profitability_alpha_prediction(
+        market,
+        symbol="BTCUSDT",
+        mode="scalping",
+        model_bundle_path=external_bundle,
+        external_panel_context=_external_context(decision_at),
+    )
+    assert healthy["status"] == "ok", healthy.get("reason")
+    assert healthy["feature_evidence"]["external_panel"]["age_seconds"] == 86400.0
+
+    degraded = generate_profitability_alpha_prediction(
+        market,
+        symbol="BTCUSDT",
+        mode="scalping",
+        model_bundle_path=external_bundle,
+        external_panel_context=_external_context(decision_at, status="degraded"),
+    )
+    assert degraded["status"] == "blocked"
+    assert "status is not healthy" in degraded["reason"]
+
+    stale = generate_profitability_alpha_prediction(
+        market,
+        symbol="BTCUSDT",
+        mode="scalping",
+        model_bundle_path=external_bundle,
+        external_panel_context=_external_context(decision_at, age_days=8),
+    )
+    assert stale["status"] == "blocked"
+    assert "external panel is stale" in stale["reason"]
+
+    unversioned_context = _external_context(decision_at)
+    del unversioned_context["data"]["revision_control"]
+    unversioned = generate_profitability_alpha_prediction(
+        market,
+        symbol="BTCUSDT",
+        mode="scalping",
+        model_bundle_path=external_bundle,
+        external_panel_context=unversioned_context,
+    )
+    assert unversioned["status"] == "blocked"
+    assert "revision-control evidence is missing" in unversioned["reason"]
+
+
+def test_runtime_fails_closed_when_horizon_model_is_modified(tmp_path):
+    bundle = _bundle(tmp_path)
+    model_path = tmp_path / "horizon_180.json"
+    model_path.write_text(model_path.read_text(encoding="utf-8") + " ", encoding="utf-8")
+    alpha = generate_profitability_alpha_prediction(
+        _market_frame(),
+        symbol="BTCUSDT",
+        mode="scalping",
+        model_bundle_path=bundle,
+    )
+
+    assert alpha["status"] == "blocked"
+    assert alpha["release_stage"] == "rejected"
+    assert alpha["actionable"] is False
+    assert "hash mismatch" in alpha["reason"]
+
+
+def test_candidate_bundle_cannot_authorize_an_unapproved_horizon(tmp_path):
+    bundle = _bundle(tmp_path)
+    payload = json.loads(bundle.read_text(encoding="utf-8"))
+    model_path = payload["models"].pop("180")
+    model_hash = payload["model_sha256"].pop("180")
+    payload.update(
+        {
+            "release_stage": "candidate",
+            "profitability_gate": "PASSED",
+            "approved_horizons": [900],
+            "models": {"900": model_path},
+            "model_sha256": {"900": model_hash},
+        }
+    )
+    bundle.write_text(json.dumps(payload), encoding="utf-8")
+
+    alpha = generate_profitability_alpha_prediction(
+        _market_frame(),
+        symbol="BTCUSDT",
+        mode="scalping",
+        model_bundle_path=bundle,
+    )
+
+    assert alpha["status"] == "blocked"
+    assert "requested horizon is not approved" in alpha["reason"]
+
+
+def test_runtime_uses_fresh_symbol_specific_bybit_pit_features(tmp_path):
+    bundle = _bundle(tmp_path, ("orderbook_spread_bps",))
+    market = _market_frame()
+    decision_at = market.index[-1].to_pydatetime()
+
+    without_store = generate_profitability_alpha_prediction(
+        market,
+        symbol="BTCUSDT",
+        mode="scalping",
+        model_bundle_path=bundle,
+    )
+    assert without_store["status"] == "blocked"
+    assert "PIT store is required" in without_store["reason"]
+
+    database = tmp_path / "bybit.sqlite3"
+    store = BybitPublicPITStore(database)
+    received_at = decision_at - timedelta(seconds=1)
+    store.append_feature(
+        event_id="runtime-book",
+        symbol="BTCUSDT",
+        name="orderbook_spread_bps",
+        value=2.5,
+        unit="bps",
+        event_time=received_at - timedelta(milliseconds=100),
+        received_at=received_at,
+        source="bybit.public.orderbook",
+        quality=1.0,
+    )
+    alpha = generate_profitability_alpha_prediction(
+        market,
+        symbol="BTCUSDT",
+        mode="scalping",
+        model_bundle_path=bundle,
+        bybit_pit_store_path=database,
+    )
+
+    assert alpha["status"] == "ok"
+    evidence = alpha["feature_evidence"]["bybit_public_pit"]
+    assert evidence["status"] == "verified"
+    assert evidence["symbol"] == "BTCUSDT"
+    assert evidence["available_features"] == ["orderbook_spread_bps"]
+
+    wrong_symbol = generate_profitability_alpha_prediction(
+        market,
+        symbol="ETHUSDT",
+        mode="scalping",
+        model_bundle_path=bundle,
+        bybit_pit_store_path=database,
+    )
+    assert wrong_symbol["status"] == "blocked"
+    assert "fresh symbol-specific" in wrong_symbol["reason"]
+
+
+def test_runtime_replay_can_freeze_bybit_observation_watermarks(tmp_path):
+    database = tmp_path / "frozen-bybit.sqlite3"
+    store = BybitPublicPITStore(database)
+    decision_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    store.append_feature(
+        event_id="first-book",
+        symbol="BTCUSDT",
+        name="orderbook_spread_bps",
+        value=2.5,
+        unit="bps",
+        event_time=decision_at - timedelta(seconds=2),
+        received_at=decision_at - timedelta(seconds=1),
+        source="bybit.public.orderbook",
+        quality=1.0,
+    )
+    source = BybitPITFeatureSource(database)
+    maximum_sequence, maximum_invalidation_rowid = source.snapshot_watermarks()
+    store.append_feature(
+        event_id="late-imported-book",
+        symbol="BTCUSDT",
+        name="orderbook_spread_bps",
+        value=9.5,
+        unit="bps",
+        event_time=decision_at - timedelta(milliseconds=500),
+        received_at=decision_at - timedelta(milliseconds=250),
+        source="bybit.public.orderbook",
+        quality=1.0,
+    )
+    store.flush()
+
+    frozen, evidence = source.latest(
+        "BTCUSDT",
+        ["orderbook_spread_bps"],
+        decision_at=decision_at,
+        maximum_sequence=maximum_sequence,
+        maximum_invalidation_rowid=maximum_invalidation_rowid,
+    )
+    current, _ = source.latest(
+        "BTCUSDT", ["orderbook_spread_bps"], decision_at=decision_at
+    )
+
+    assert frozen["orderbook_spread_bps"] == 2.5
+    assert current["orderbook_spread_bps"] == 9.5
+    assert evidence["snapshot_maximum_sequence"] == maximum_sequence
+
+
+def test_runtime_loads_verified_macro_and_flow_pit_features(tmp_path):
+    bundle = _bundle(
+        tmp_path,
+        ("vix_level", "stablecoin_net_issuance_1d_usd"),
+    )
+    market = _market_frame(datetime(2026, 1, 10, tzinfo=timezone.utc))
+    decision_at = market.index[-1].to_pydatetime()
+    macro_store = _runtime_macro_store(tmp_path, decision_at)
+    flow_store = _runtime_flow_store(tmp_path)
+
+    without_macro = generate_profitability_alpha_prediction(
+        market,
+        symbol="BTCUSDT",
+        mode="scalping",
+        model_bundle_path=bundle,
+    )
+    assert without_macro["status"] == "blocked"
+    assert "macro PIT store is required" in without_macro["reason"]
+
+    without_flow = generate_profitability_alpha_prediction(
+        market,
+        symbol="BTCUSDT",
+        mode="scalping",
+        model_bundle_path=bundle,
+        macro_pit_store_path=macro_store,
+    )
+    assert without_flow["status"] == "blocked"
+    assert "flow PIT store is required" in without_flow["reason"]
+
+    alpha = generate_profitability_alpha_prediction(
+        market,
+        symbol="BTCUSDT",
+        mode="scalping",
+        model_bundle_path=bundle,
+        macro_pit_store_path=macro_store,
+        flow_pit_store_path=flow_store,
+    )
+    assert alpha["status"] == "ok", alpha.get("reason")
+    evidence = alpha["feature_evidence"]
+    assert evidence["macro_pit"]["status"] == "verified"
+    assert evidence["flow_pit"]["status"] == "verified"
+    assert evidence["macro_pit"]["raw_response_hashes_verified"] is True
+    assert evidence["flow_pit"]["raw_response_hashes_verified"] is True
+    for source in ("macro_pit", "flow_pit"):
+        assert all(
+            pd.Timestamp(value) <= pd.Timestamp(evidence["decision_at"])
+            for value in evidence[source]["available_at"].values()
+        )

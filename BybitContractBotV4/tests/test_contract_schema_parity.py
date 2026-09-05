@@ -15,6 +15,14 @@ from contracts.operation_ticket_v1 import OperationTicket
 
 
 class ContractSchemaParityTests(unittest.TestCase):
+    def test_execution_imports_use_the_shared_contract_package(self):
+        self.assertEqual(
+            OperationTicket.__module__, "shadow_contracts.operation_ticket_v1"
+        )
+        self.assertEqual(
+            ExecutionReceipt.__module__, "shadow_contracts.execution_receipt_v1"
+        )
+
     def assert_schema_matches_prediction_source(self, filename, model):
         path = (
             WORKSPACE

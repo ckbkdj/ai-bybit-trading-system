@@ -47,7 +47,12 @@ class BybitRuntimeContext:
             book = self.public_exchange.fetch_order_book(ticket.instrument.symbol, limit=5)
             bid = float(book["bids"][0][0]) if book.get("bids") else 0
             ask = float(book["asks"][0][0]) if book.get("asks") else 0
-        regime = self.regime_provider(ticket.instrument.symbol) if self.regime_provider else "unknown"
+        risk_increasing = ticket.intent.action in {"OPEN", "INCREASE", "REPLACE"}
+        regime = (
+            self.regime_provider(ticket.instrument.symbol)
+            if risk_increasing and self.regime_provider
+            else str(ticket.guards.observed_market_regime or "risk_reduction")
+        )
         basis = None
         if ticket.entry and ticket.entry.reference_price > 0:
             basis = abs(last - ticket.entry.reference_price) / ticket.entry.reference_price * 10_000
@@ -81,6 +86,7 @@ class BybitRuntimeContext:
         used = numeric(account.get("totalInitialMargin"), usdt.get("used") or max(0, equity - free))
         unrealised = numeric(account.get("totalPerpUPL"), 0)
         runtime = self.store.risk_runtime()
+        metrics: dict[str, object] = {"realised_pnl_week": 0.0}
         metrics_healthy = self.mode == "shadow"
         metrics_provider = getattr(self.account_client, "get_daily_risk_metrics", None)
         if callable(metrics_provider):
@@ -104,6 +110,7 @@ class BybitRuntimeContext:
             margin_used_usdt=used,
             realised_pnl_today=float(runtime.get("realised_pnl") or 0),
             unrealised_pnl=unrealised,
+            realised_pnl_week=float(metrics.get("realised_pnl_week") or 0),
             consecutive_losses=int(runtime.get("consecutive_losses") or 0),
             cooldown_until=cooldown,
             equity_high_water_usdt=high_water,
@@ -164,7 +171,12 @@ class BybitRuntimeContext:
             drift = server_ms / 1000 - time.time()
         except Exception:
             drift = float("inf")
-        data_healthy = bool(self.data_health_provider and self.data_health_provider())
+        risk_increasing = ticket.intent.action in {"OPEN", "INCREASE", "REPLACE"}
+        data_healthy = bool(
+            risk_increasing
+            and self.data_health_provider
+            and self.data_health_provider()
+        )
         websocket = bool(self.private_stream and self.private_stream.health_confirmed())
         runtime = self.store.system_runtime()
         return SystemHealth(

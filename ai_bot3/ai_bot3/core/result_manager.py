@@ -1,22 +1,53 @@
 # 这个类负责保存每个模型的独立预测结果，并能聚合所有最新结果
 import json
 import logging
+import math
 import os
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import asyncio
 
 from adapters.legacy_forecast_adapter import LegacyForecastAdapter
+from contracts.horizons import MAX_CANDIDATE_KLINE_AGE_SEC, horizon_for_mode
 from core.control_plane import ControlPlaneRepository
 from core.decision.ticket_builder import TicketBuilder
+from core.publication_outbox import ForecastPublicationOutbox, PublicationWorker
 from core.release.profitability_release import verify_candidate_authorization
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat()
+
+
+def _finite_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _aware_utc(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        text = value.strip()
+        if text.endswith(("Z", "z")):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(timezone.utc)
 
 
 # 预测结果中需要保留的扩展字段（向后兼容；缺失时回退默认值，不会导致前端崩溃）
@@ -130,12 +161,54 @@ def _atomic_json_write(path: Path, payload: Dict[str, Any]) -> None:
             Path(temporary_name).unlink(missing_ok=True)
 
 
+def _configured_path(
+    explicit: Path | str | None,
+    environment_name: str,
+    default: Path,
+) -> Path:
+    if explicit is not None:
+        return Path(explicit).expanduser().resolve()
+    raw = os.environ.get(environment_name, "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return Path(default).expanduser().resolve()
+
+
+def _publication_outbox_path(
+    explicit: Path | str | None,
+    default: Path,
+) -> Path:
+    if explicit is not None:
+        return Path(explicit).expanduser().resolve()
+    canonical = os.environ.get("FORECAST_PUBLICATION_OUTBOX_DB", "").strip()
+    legacy = os.environ.get("FORECAST_PUBLICATION_OUTBOX", "").strip()
+    if canonical and legacy:
+        canonical_path = Path(canonical).expanduser().resolve()
+        legacy_path = Path(legacy).expanduser().resolve()
+        if canonical_path != legacy_path:
+            raise RuntimeError(
+                "FORECAST_PUBLICATION_OUTBOX_DB conflicts with legacy "
+                "FORECAST_PUBLICATION_OUTBOX"
+            )
+        return canonical_path
+    if canonical:
+        return Path(canonical).expanduser().resolve()
+    if legacy:
+        logging.warning(
+            "FORECAST_PUBLICATION_OUTBOX is deprecated; use "
+            "FORECAST_PUBLICATION_OUTBOX_DB"
+        )
+        return Path(legacy).expanduser().resolve()
+    return Path(default).expanduser().resolve()
+
+
 class ResultManager:
     def __init__(
         self,
         results_dir: Path,
         *,
         control_plane_db: Path | None = None,
+        publication_outbox_db: Path | None = None,
         tickets_enabled: bool | None = None,
         required_brain_release_stage: str | None = None,
         strategy_release_bundle=None,
@@ -143,7 +216,7 @@ class ResultManager:
         profitability_report_path: Path | None = None,
         candidate_release_manifest_path: Path | None = None,
     ):
-        self.results_dir = results_dir
+        self.results_dir = Path(results_dir).expanduser().resolve()
         self.results_dir.mkdir(parents=True, exist_ok=True)
         if tickets_enabled is None:
             tickets_enabled = os.environ.get("AI_BOT_TICKETS_ENABLED", "true").strip().lower() in {
@@ -157,7 +230,29 @@ class ResultManager:
         if self.required_brain_release_stage not in {"candidate", "live"}:
             raise ValueError("required_brain_release_stage must be candidate or live")
         default_db = self.results_dir.parent / "data" / "control_plane.sqlite3"
-        self.control_plane = ControlPlaneRepository(control_plane_db or default_db)
+        self.control_plane_db = _configured_path(
+            control_plane_db,
+            "CONTROL_PLANE_DB",
+            default_db,
+        )
+        self._control_plane: ControlPlaneRepository | None = None
+        predictor_data_raw = os.environ.get("PREDICTOR_DATA_DIR", "").strip()
+        predictor_data_dir = (
+            Path(predictor_data_raw).expanduser().resolve()
+            if predictor_data_raw
+            else self.results_dir.parent / "data"
+        )
+        default_outbox = predictor_data_dir / "forecast_publication_outbox.sqlite3"
+        self.publication_outbox_db = _publication_outbox_path(
+            publication_outbox_db,
+            default_outbox,
+        )
+        self.publication_outbox = ForecastPublicationOutbox(
+            self.publication_outbox_db
+        )
+        self.publication_worker = PublicationWorker(
+            self.publication_outbox, lambda: self.control_plane
+        )
         self.forecast_adapter = LegacyForecastAdapter()
         self.ticket_builder = TicketBuilder()
         from core.decision.portfolio_intent import PortfolioIntentBuilder
@@ -185,19 +280,49 @@ class ResultManager:
         self.candidate_release_manifest_path = (
             Path(manifest_path_value) if manifest_path_value else None
         )
-        self.profitability_authorized, self.profitability_authorization_reason = (
-            verify_candidate_authorization(
-                self.profitability_report_path,
-                self.candidate_release_manifest_path,
-            )
-        )
+        self.profitability_authorized = False
+        self.profitability_authorization_reason = "not_verified"
         self.profitability_manifest = None
-        if self.profitability_authorized and self.candidate_release_manifest_path:
-            self.profitability_manifest = json.loads(
-                self.candidate_release_manifest_path.read_text(encoding="utf-8")
-            )
+        self._refresh_profitability_authorization()
 
-    def _brain_authorized_for_ticket(self, prediction: Dict[str, Any]) -> bool:
+    @property
+    def control_plane(self) -> ControlPlaneRepository:
+        if self._control_plane is None:
+            self._control_plane = ControlPlaneRepository(self.control_plane_db)
+        return self._control_plane
+
+    def publish_pending(self, *, limit: int = 100) -> dict[str, int]:
+        """Test/maintenance hook; production runs this in the publisher process."""
+
+        return self.publication_worker.run_once(limit=limit)
+
+    def _refresh_profitability_authorization(self) -> bool:
+        """Revalidate mutable release evidence before every candidate ticket."""
+
+        authorized, reason = verify_candidate_authorization(
+            self.profitability_report_path,
+            self.candidate_release_manifest_path,
+        )
+        manifest = None
+        if authorized and self.candidate_release_manifest_path is not None:
+            try:
+                loaded = json.loads(
+                    self.candidate_release_manifest_path.read_text(encoding="utf-8")
+                )
+                if not isinstance(loaded, dict):
+                    raise ValueError("candidate manifest must be a JSON object")
+                manifest = loaded
+            except Exception:
+                authorized = False
+                reason = "profitability_release_json_invalid"
+        self.profitability_authorized = authorized
+        self.profitability_authorization_reason = reason
+        self.profitability_manifest = manifest
+        return authorized
+
+    def _brain_authorized_for_ticket(
+        self, prediction: Dict[str, Any], mode: str
+    ) -> bool:
         # Name retained for compatibility; authorization now belongs to the
         # two-stage profitability model. Brain is always a rejected baseline.
         if self.required_brain_release_stage == "live":
@@ -213,9 +338,106 @@ class ResultManager:
             return False
         if str(alpha.get("profitability_gate")) != "PASSED":
             return False
-        if float(alpha.get("lower_bound_net_edge_bps") or 0.0) <= 0:
+        try:
+            expected_horizon = horizon_for_mode(mode)
+            if int(alpha.get("horizon_sec")) != expected_horizon:
+                return False
+        except (OverflowError, TypeError, ValueError):
             return False
-        if not self.profitability_authorized or not self.profitability_manifest:
+        lower_edge = _finite_float(alpha.get("lower_bound_net_edge_bps"))
+        if lower_edge is None or lower_edge <= 0:
+            return False
+        range_guard_score = _finite_float(alpha.get("range_guard_score"))
+        if (
+            range_guard_score is None
+            or range_guard_score < 0
+            or range_guard_score
+            > self.portfolio_intent_builder.policy.max_range_guard_score
+        ):
+            return False
+        feature_evidence = alpha.get("feature_evidence")
+        price_path = (
+            feature_evidence.get("price_path")
+            if isinstance(feature_evidence, dict)
+            else None
+        )
+        try:
+            observed_bar_count = int(price_path.get("observed_bar_count"))
+            interval_sec = int(price_path.get("interval_sec"))
+        except (AttributeError, OverflowError, TypeError, ValueError):
+            return False
+        age_seconds = _finite_float(price_path.get("age_seconds"))
+        maximum_age_seconds = _finite_float(
+            price_path.get("maximum_age_seconds")
+        )
+        last_price = _finite_float(price_path.get("last_price"))
+        first_observed_at = _aware_utc(price_path.get("first_observed_at"))
+        last_observed_at = _aware_utc(price_path.get("last_observed_at"))
+        generated_at = _aware_utc(prediction.get("generated_at"))
+        saved_at = _aware_utc(prediction.get("saved_at"))
+        expected_maximum_age = float(
+            MAX_CANDIDATE_KLINE_AGE_SEC[expected_horizon]
+        )
+        observed_age_seconds = (
+            (saved_at - last_observed_at).total_seconds()
+            if saved_at is not None and last_observed_at is not None
+            else None
+        )
+        observed_span_seconds = (
+            (last_observed_at - first_observed_at).total_seconds()
+            if first_observed_at is not None and last_observed_at is not None
+            else None
+        )
+        expected_span_seconds = float((observed_bar_count - 1) * interval_sec)
+        if (
+            not isinstance(price_path, dict)
+            or price_path.get("status") != "verified"
+            or price_path.get("training_kline_source") != "bybit"
+            or price_path.get("runtime_price_source")
+            != "bybit_linear_last_trade_kline"
+            or price_path.get("same_venue") is not True
+            or price_path.get("continuous") is not True
+            or price_path.get("ohlcv_contract_valid") is not True
+            or observed_bar_count < 49
+            or interval_sec != expected_horizon
+            or price_path.get("candidate_freshness_verified") is not True
+            or age_seconds is None
+            or maximum_age_seconds is None
+            or last_price is None
+            or last_price <= 0
+            or first_observed_at is None
+            or last_observed_at is None
+            or generated_at is None
+            or saved_at is None
+            or age_seconds < 0
+            or maximum_age_seconds <= 0
+            or age_seconds > maximum_age_seconds
+            or observed_age_seconds is None
+            or observed_age_seconds < 0
+            or observed_age_seconds > expected_maximum_age
+            or observed_age_seconds
+            > self.ticket_builder.policy.config.max_feature_age_sec
+            or observed_span_seconds is None
+            or not math.isclose(
+                observed_span_seconds,
+                expected_span_seconds,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+            or last_observed_at > generated_at + timedelta(seconds=5)
+            or generated_at > saved_at + timedelta(seconds=5)
+            or not math.isclose(
+                maximum_age_seconds,
+                expected_maximum_age,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+        ):
+            return False
+        if (
+            not self._refresh_profitability_authorization()
+            or not self.profitability_manifest
+        ):
             return False
         if str(alpha.get("release_id")) != str(self.profitability_manifest.get("release_id")):
             return False
@@ -250,28 +472,38 @@ class ResultManager:
             normalized["training_metadata"] = meta
         file_path = self._get_file_path(symbol, mode)
         await asyncio.to_thread(_atomic_json_write, file_path, normalized)
+        ticket_authorized = bool(
+            self.tickets_enabled
+            and self._brain_authorized_for_ticket(normalized, mode)
+        )
+        forecast = self.forecast_adapter.adapt(
+            symbol,
+            mode,
+            normalized,
+            execution_authorized=ticket_authorized,
+        )
+        ticket = None
+        portfolio_intent = None
         try:
-            forecast = self.forecast_adapter.adapt(symbol, mode, normalized)
-            await asyncio.to_thread(self.control_plane.publish, forecast, None)
-            ticket = None
-            portfolio_intent = None
-            if self.tickets_enabled and self._brain_authorized_for_ticket(normalized):
-                reference_price = (
-                    normalized.get("current_price")
-                    or normalized.get("kline_last_price")
-                    or normalized.get("last")
+            if ticket_authorized:
+                reference_price = _finite_float(
+                    normalized["alpha_prediction"]["feature_evidence"][
+                        "price_path"
+                    ]["last_price"]
                 )
-                try:
-                    reference_price = float(reference_price)
-                except (TypeError, ValueError):
-                    reference_price = 0.0
-                if reference_price > 0:
+                if reference_price is not None and reference_price > 0:
                     release_id = self.strategy_release_bundle.strategy_release_id
                     forecasts = await asyncio.to_thread(
                         self.control_plane.active_forecasts,
                         symbol,
                         strategy_release_id=release_id,
                     )
+                    if all(
+                        (item.forecast_id, item.revision)
+                        != (forecast.forecast_id, forecast.revision)
+                        for item in forecasts
+                    ):
+                        forecasts = [*forecasts, forecast]
                     decision_version = await asyncio.to_thread(
                         self.control_plane.next_portfolio_decision_version, symbol
                     )
@@ -304,13 +536,23 @@ class ResultManager:
                             reference_price=reference_price,
                             required_position_version=position_version,
                         )
-            if ticket and portfolio_intent:
-                await asyncio.to_thread(
-                    self.control_plane.publish, forecast, ticket, portfolio_intent
-                )
         except Exception as exc:
-            # The legacy prediction remains available, but ticket generation is fail-closed.
-            logging.exception("预测契约/操作票落盘失败，已禁止该结果进入执行通道: %s", exc)
+            # Forecast publication remains durable; only ticket creation fails closed.
+            ticket = None
+            portfolio_intent = None
+            logging.exception("操作票生成失败，Forecast 仍进入持久发布队列: %s", exc)
+        try:
+            await asyncio.to_thread(
+                self.publication_outbox.enqueue,
+                forecast,
+                ticket,
+                portfolio_intent,
+            )
+        except Exception:
+            # The visible prediction file exists, but callers must observe that its
+            # publication contract was not made durable. Never silently drop it.
+            logging.critical("Forecast publication outbox enqueue failed", exc_info=True)
+            raise
         logging.info(f"已保存 {symbol} 在 {mode} 时间粒度下的预测结果到 {file_path}")
 
     def save_training_metadata(self, symbol: str, mode: str, metadata: Dict[str, Any]) -> None:

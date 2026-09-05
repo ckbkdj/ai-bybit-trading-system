@@ -1,0 +1,116 @@
+{
+  "schema_version": "shadow-platform-runtime-data.v1",
+  "baseline_commit": "f4a424fc06643e7af40478be5fc2c4d935a8491b",
+  "policy": {
+    "tracked_in_git": false,
+    "credentials_in_git": false,
+    "ordinary_clone_contains_runtime_data": false,
+    "missing_data_behavior": "fail closed or initialize empty service state as declared per artifact",
+    "integrity": "immutable research inputs require producer manifests and SHA-256 evidence"
+  },
+  "artifacts": [
+    {
+      "id": "prediction-control-plane",
+      "path": "ai_bot3/ai_bot3/data/control_plane.sqlite3",
+      "environment": "CONTROL_PLANE_DB",
+      "owner": "prediction service",
+      "mutability": "mutable durable state",
+      "clone_behavior": "created empty on first service start"
+    },
+    {
+      "id": "research-jobs",
+      "path": "ai_bot3/ai_bot3/data/research_jobs.sqlite3",
+      "environment": "RESEARCH_JOB_DB",
+      "owner": "prediction research queue",
+      "mutability": "mutable durable state",
+      "clone_behavior": "created empty on first service start"
+    },
+    {
+      "id": "kline-feature-store",
+      "path": "ai_bot3/ai_bot3/data/kline_feature_store.profitability-v3-bybit.sqlite3",
+      "environment": "AI_BOT_KLINE_FEATURE_STORE_PATH",
+      "owner": "profitability research and prediction",
+      "mutability": "versioned research snapshot",
+      "clone_behavior": "must be restored or rebuilt before profitability evaluation",
+      "integrity_evidence": "official-source request/archive manifests, raw response hashes, and continuous-grid audit"
+    },
+    {
+      "id": "bybit-development-pit",
+      "path": "ai_bot3/ai_bot3/data/bybit_public_pit.sqlite3",
+      "environment": "BYBIT_PUBLIC_PIT_STORE",
+      "owner": "Bybit public PIT collector and profitability research",
+      "mutability": "append-only while collecting, frozen before evaluation",
+      "clone_behavior": "optional for service startup; required for Bybit PIT factor evaluation",
+      "integrity_evidence": "capture/archive/API manifests plus raw payload length and SHA-256"
+    },
+    {
+      "id": "bybit-lockbox-pit",
+      "path": "external sealed location",
+      "environment": "BYBIT_LOCKBOX_PUBLIC_PIT_STORE",
+      "owner": "once-only lockbox evaluation",
+      "mutability": "sealed read-only snapshot",
+      "clone_behavior": "must remain absent until the development gate passes",
+      "integrity_evidence": "separate store identity and once-only lockbox receipt"
+    },
+    {
+      "id": "macro-pit",
+      "path": "ai_bot3/ai_bot3/data/macro_pit.sqlite3",
+      "environment": "MACRO_PIT_STORE",
+      "owner": "macro PIT collectors and profitability research",
+      "mutability": "append-only versioned observations",
+      "clone_behavior": "optional for service startup; missing factors fail closed",
+      "integrity_evidence": "source release/vintage timestamps and retained response hashes"
+    },
+    {
+      "id": "flow-pit",
+      "path": "ai_bot3/ai_bot3/data/flow_pit.sqlite3",
+      "environment": "FLOW_PIT_STORE",
+      "owner": "flow PIT collectors and profitability research",
+      "mutability": "append-only versioned observations",
+      "clone_behavior": "optional for service startup; missing factors fail closed",
+      "integrity_evidence": "published/available timestamps and retained source hashes"
+    },
+    {
+      "id": "research-trial-ledger",
+      "path": "ai_bot3/ai_bot3/data/research_trials.sqlite3",
+      "environment": null,
+      "owner": "profitability rebuild",
+      "mutability": "append-only experiment ledger",
+      "clone_behavior": "created empty by the profitability CLI"
+    },
+    {
+      "id": "profitability-model-bundle",
+      "path": "ai_bot3/ai_bot3/models/profitability/",
+      "environment": "AI_BOT_PROFITABILITY_MODEL_BUNDLE",
+      "owner": "profitability rebuild and prediction runtime",
+      "mutability": "immutable released artifact",
+      "clone_behavior": "missing bundle leaves alpha unauthorized",
+      "integrity_evidence": "candidate manifest and StrategyReleaseBundle SHA-256 bindings"
+    },
+    {
+      "id": "evaluation-output",
+      "path": "ai_bot3/ai_bot3/model_results/evaluation/",
+      "environment": "AI_BOT_PROFITABILITY_REPORT",
+      "owner": "research/evaluation CLIs",
+      "mutability": "regenerated machine output",
+      "clone_behavior": "created on demand and ignored by Git"
+    },
+    {
+      "id": "execution-ledger",
+      "path": "BybitContractBotV4/execution_state.sqlite3",
+      "environment": "EXECUTION_DB_PATH",
+      "owner": "Bybit execution service",
+      "mutability": "mutable durable state",
+      "clone_behavior": "created empty in shadow mode; external modes require reconciliation"
+    },
+    {
+      "id": "external-trad-panel",
+      "path": "external read-only directory",
+      "environment": "TRAD_DATA_SERVICE_ROOT",
+      "owner": "external PIT data service",
+      "mutability": "versioned read-only input",
+      "clone_behavior": "optional; absent panels cannot satisfy external factor gates",
+      "integrity_evidence": "panel manifest and optional per-file SHA-256 verification"
+    }
+  ]
+}
